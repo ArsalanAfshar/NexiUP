@@ -1,5 +1,12 @@
-## NexiUP Telegram webhook gateway — Cloudflare Worker configuration.
-## No secrets belong in this file. Set them with `wrangler secret put <NAME>`.
+# ============================================================================
+#  NexiUP — Telegram webhook gateway (Cloudflare Worker)
+#
+#  NO SECRETS BELONG IN THIS FILE. It is committed to git.
+#  Secrets are set once with:
+#      wrangler secret put APPS_SCRIPT_SECRET
+#      wrangler secret put TELEGRAM_WEBHOOK_SECRET
+#  Both values are printed by setup() in the Apps Script editor.
+# ============================================================================
 
 name = "nexiup-telegram-gateway"
 main = "src/index.js"
@@ -8,20 +15,20 @@ compatibility_date = "2024-11-01"
 # Gives you a URL like https://nexiup-telegram-gateway.<your-subdomain>.workers.dev
 workers_dev = true
 
-# Workers Logs (Cloudflare dashboard -> your Worker -> Logs) + `wrangler tail`.
-# Required for both to actually receive console.log/warn/error output.
+# Enables console.log/warn/error output in `wrangler tail` and in the
+# Cloudflare dashboard (your Worker → Logs). Required for troubleshooting.
 [observability]
 enabled = true
 head_sampling_rate = 1
 
-# Non-secret configuration only. APPS_SCRIPT_URL is not sensitive by itself
-# (it is useless without APPS_SCRIPT_SECRET), but if you prefer to keep it
-# fully private too, remove it from here and set it with
-# `wrangler secret put APPS_SCRIPT_URL` instead — the code does not care
-# whether a binding arrives via [vars] or as a secret.
 [vars]
+# The Apps Script Web App URL. MUST be the production deployment and MUST end
+# in /exec (a /dev URL requires a Google login and will never work).
+# Replace the placeholder, or override it with:
+#     wrangler deploy --var APPS_SCRIPT_URL:https://...
+# This value is not secret on its own — it is useless without APPS_SCRIPT_SECRET.
 APPS_SCRIPT_URL = "https://script.google.com/macros/s/REPLACE_WITH_YOUR_DEPLOYMENT_ID/exec"
 
-# The following MUST be set as encrypted secrets, never written here:
-#   wrangler secret put APPS_SCRIPT_SECRET
-#   wrangler secret put TELEGRAM_WEBHOOK_SECRET
+# Leave this OUT of production. Setting it to "true" disables verification of
+# the Telegram secret header and is intended only for local `wrangler dev`.
+# ALLOW_UNVERIFIED = "false"

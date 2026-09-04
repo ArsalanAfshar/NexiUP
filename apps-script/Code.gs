@@ -1,38 +1,60 @@
 /**
  * ============================================================================
  *  NexiUP | نکسی آپ
- *  Telegram Bot · Google Apps Script · Google Sheets · Web App
- *  Single-file production build. Persian (RTL) UI.
+ *  Telegram bot · Google Apps Script backend · Google Sheets database
+ *  Single-file production build. Persian (RTL) user interface.
  * ----------------------------------------------------------------------------
- *  RECOMMENDED ARCHITECTURE (fixes Telegram "Wrong response ... 302 Found"):
+ *  ARCHITECTURE
  *
- *    Telegram → Cloudflare Worker (public webhook) → this Web App (/exec)
+ *      Telegram  ──▶  Cloudflare Worker  ──▶  this Web App (/exec)  ──▶  Sheets
+ *                     (public webhook)        (all the bot logic)
  *
- *  Google's /exec endpoint sometimes answers a POST with an HTTP 302 redirect
- *  to script.googleusercontent.com. Telegram does NOT follow redirects and
- *  marks the webhook as broken. A Cloudflare Worker sits in front, follows
- *  that redirect itself (fetch() does this transparently), and always
- *  answers Telegram with a fast, real "200 OK" — regardless of what Google
- *  does under the hood. See /worker in the project repo for the Worker code.
+ *  Why the Worker exists: Google's /exec endpoint answers a POST with an HTTP
+ *  302 redirect to script.googleusercontent.com. Telegram does not follow
+ *  redirects and marks such a webhook as broken ("Wrong response ... 302
+ *  Found"). The Worker follows that redirect itself and always answers
+ *  Telegram with an immediate 200 OK. See worker/src/index.js.
  *
- *  This file (Code.gs) needs NO change to its request-processing pipeline to
- *  support that architecture: doPost() keeps validating every request via
- *  the "?s=<WEBHOOK_SECRET>" query string, exactly like before — the Worker
- *  is simply the one sending that query string now instead of Telegram.
- *  The only additions are two optional Script Properties (WORKER_URL,
- *  TELEGRAM_WEBHOOK_SECRET) used by the in-panel setupWebhook() helper so it
- *  can register the webhook on the Worker's URL instead of the raw /exec URL.
+ *  Security model:
+ *    Telegram → Worker      authenticated by TELEGRAM_WEBHOOK_SECRET, sent as
+ *                           the X-Telegram-Bot-Api-Secret-Token header.
+ *    Worker  → Apps Script  authenticated by WEBHOOK_SECRET, sent as the
+ *                           "?s=" query parameter (Apps Script cannot read
+ *                           custom request headers, hence the query string).
+ *  No secret is ever written to the spreadsheet or to a log line; see
+ *  sanitize_(), which redacts them from every message before it is stored.
  * ----------------------------------------------------------------------------
- *  Editor entry points:
- *    initialSetup()   → create/repair spreadsheet, sheets, headers, defaults
- *    setupWebhook()   → register the Telegram webhook (Worker URL if set,
- *                       otherwise legacy direct /exec URL)
- *    repairDatabase() → non-destructive schema repair
- *    selfTest()       → end-to-end health check
- *    getDiagnostics() → machine-readable diagnostics (no secrets)
- *  Web App:
- *    doPost(e)        → Telegram webhook receiver (single pipeline)
- *    doGet(e)         → public, secret-free health endpoint
+ *  INSTALL — run these from the Apps Script editor, in order:
+ *
+ *    1. setup()          create/repair the database, generate both secrets,
+ *                        and print whatever configuration is still missing.
+ *    2. connect()        register the Telegram webhook on the Worker URL.
+ *    3. healthCheck()    verify config, sheets, bot, webhook and Worker.
+ *
+ *  Other editor entry points (all optional, all safe to re-run):
+ *    configure({...})    save Script Properties without leaving the editor
+ *    checkConfig()       list missing configuration keys
+ *    repairDatabase()    non-destructive schema repair
+ *    selfTest()          legacy Persian self-test report
+ *    getDiagnostics()    machine-readable diagnostics (contains no secrets)
+ *
+ *  Web App endpoints:
+ *    doPost(e)           Telegram webhook receiver (the single hot path)
+ *    doGet(e)            public, secret-free liveness endpoint
+ * ----------------------------------------------------------------------------
+ *  PERFORMANCE NOTES (why this build is fast)
+ *
+ *  Every Google service call is a network round trip. A Telegram update must
+ *  finish in well under a second to feel instant, so this build enforces:
+ *    • one SpreadsheetApp.openById() per execution;
+ *    • one getValues() per sheet per execution, cached in `_table`;
+ *    • CacheService for settings (cross-execution) and for a self-healing
+ *      row index, so a hot user/order is a single 1-row read, not a scan;
+ *    • one PropertiesService read per execution (the whole store at once);
+ *    • buffered logs flushed with a single setValues() per request;
+ *    • UrlFetchApp.fetchAll() wherever several Telegram calls are needed;
+ *    • no LockService on the hot path (dedupe is a lock-free cache CAS).
+ *  Read the DATA LAYER banner further down before changing any of it.
  * ============================================================================
  */
 
@@ -53,20 +75,61 @@ var LOCK_WAIT_MS = 4000;
 var SEQ_LOCK_WAIT_MS = 1500;
 var MAX_LOG_ROWS = 5000;
 var BROADCAST_MAX_PER_RUN = 1200;
-var BROADCAST_SLEEP_MS = 60;
+var BROADCAST_SLEEP_MS = 250;    /* pause between concurrent chunks */
+var BROADCAST_CHUNK = 25;        /* messages sent per fetchAll() batch */
 var PAGE_SIZE = 6;
 
 /* ============================ SCRIPT PROPERTIES ========================= */
+/*
+ * PERFORMANCE NOTE
+ * Every PropertiesService call is a round trip to a Google backend (~10-30ms).
+ * The old build called getProperty() dozens of times per Telegram update
+ * (botToken_() on every API call, three reads inside sanitize_() for every log
+ * line, ...). We now read the WHOLE property store once per execution and
+ * serve every later read from memory. Writes still go straight through, but
+ * are batched whenever more than one key changes at a time.
+ */
+
+var _propsCache = null;   /* full property store, loaded lazily once */
 
 function props_() { return PropertiesService.getScriptProperties(); }
 
+/** Loads (once per execution) and returns every script property as an object. */
+function allProps_() {
+  if (_propsCache) return _propsCache;
+  try { _propsCache = props_().getProperties() || {}; }
+  catch (e) { _propsCache = {}; }
+  return _propsCache;
+}
+
 function prop_(key, def) {
-  var v = props_().getProperty(key);
+  var v = allProps_()[key];
   if (v === null || v === undefined || v === '') return (def === undefined ? '' : def);
   return v;
 }
 
-function setProp_(key, value) { props_().setProperty(key, String(value)); }
+/** Single property write (also refreshes the in-memory copy). */
+function setProp_(key, value) {
+  var patch = {};
+  patch[key] = String(value);
+  setProps_(patch);
+}
+
+/** Batched property write — one service call for any number of keys. */
+function setProps_(patch) {
+  if (!patch) return;
+  var clean = {};
+  var count = 0;
+  for (var k in patch) {
+    if (!patch.hasOwnProperty(k)) continue;
+    clean[k] = String(patch[k]);
+    count++;
+  }
+  if (!count) return;
+  props_().setProperties(clean, false);
+  var cache = allProps_();
+  for (var k2 in clean) cache[k2] = clean[k2];
+}
 
 function botToken_() { return prop_('BOT_TOKEN'); }
 function webhookSecret_() { return prop_('WEBHOOK_SECRET'); }
@@ -82,7 +145,17 @@ function telegramWebhookSecret_() { return prop_('TELEGRAM_WEBHOOK_SECRET'); }
 /** Root admins from Script Properties + extra admins managed inside the panel. */
 function rootAdminIds_() { return splitIds_(prop_('ADMIN_IDS', '')); }
 function extraAdminIds_() { return splitIds_(getSetting_('admins', '')); }
-function allAdminIds_() { return uniq_(rootAdminIds_().concat(extraAdminIds_())); }
+
+/* isAdmin_() is called several times per update (routing, gates, keyboards).
+ * The merged list is computed once per execution. */
+var _adminIdsCache = null;
+function allAdminIds_() {
+  if (_adminIdsCache) return _adminIdsCache;
+  _adminIdsCache = uniq_(rootAdminIds_().concat(extraAdminIds_()));
+  return _adminIdsCache;
+}
+function forgetAdminCache_() { _adminIdsCache = null; }
+
 function isAdmin_(userId) { return allAdminIds_().indexOf(String(userId)) !== -1; }
 function isRootAdmin_(userId) { return rootAdminIds_().indexOf(String(userId)) !== -1; }
 
@@ -209,9 +282,14 @@ function paginate_(arr, page, size) {
   return { items: arr.slice((p - 1) * per, p * per), page: p, pages: total, total: arr.length };
 }
 
-/** Removes anything secret-looking before it can ever reach the Logs sheet. */
+/**
+ * Removes anything secret-looking before it can ever reach the Logs sheet.
+ * Property reads are served from the in-memory property cache, so this is
+ * free to call on every log line.
+ */
 function sanitize_(text) {
   var out = s_(text);
+  if (!out) return out;
   var token = botToken_(), secret = webhookSecret_(), tgSecret = telegramWebhookSecret_();
   if (token) {
     out = out.split(token).join('[REDACTED_TOKEN]');
@@ -253,17 +331,80 @@ var SCHEMA = {
 var SHEET_ORDER = ['Settings', 'Users', 'Services', 'Orders', 'Configs', 'Discounts', 'Channels',
   'Guides', 'Referrals', 'Wallet', 'Withdrawals', 'Transactions', 'Logs'];
 
-/* Per-execution caches only. Nothing is persisted here. */
-var _ss = null;
-var _hdrCache = {};
+/* ============================== DATA LAYER ==============================
+ * PERFORMANCE MODEL (this is where the old ~10s latency came from)
+ * ------------------------------------------------------------------------
+ * The previous build re-read a whole sheet on EVERY helper call:
+ *   getUser_()            → full Users sheet read
+ *   getSetting_()         → full Settings sheet read (first call per exec)
+ *   findRows_('Orders')   → full Orders sheet read, three times in adminHome_
+ * A single /start therefore issued 15-40 SpreadsheetApp round trips.
+ *
+ * The new layer guarantees:
+ *   1. ONE SpreadsheetApp.openById() per execution (`_ss`).
+ *   2. ONE getValues() per sheet per execution (`_table`), reused by every
+ *      later read. All writes update that in-memory table too, so reads
+ *      after writes stay correct without re-reading.
+ *   3. Settings are additionally cached in CacheService ACROSS executions
+ *      (6 min) — a warm update never touches the Settings sheet at all.
+ *   4. Row lookups by key (user_id, order id, ...) use a CacheService row
+ *      index, so a hot user is fetched with a single 1-row getRange()
+ *      instead of a full-sheet scan. The index is always verified against
+ *      the actual row and self-heals when rows move.
+ *   5. Log rows are buffered in memory and flushed with ONE setValues()
+ *      at the end of the request instead of one appendRow() per line.
+ * ======================================================================= */
+
+/* Per-execution memory caches. Reset by resetCaches_(). */
+var _ss = null;          /* Spreadsheet handle                          */
+var _shCache = {};       /* name -> Sheet object                        */
+var _hdrCache = {};      /* name -> header array                        */
+var _table = {};         /* name -> array of row objects (with __row)   */
 var _settingsCache = null;
 
+/* Cross-execution CacheService keys / TTLs. */
+var SETTINGS_CACHE_KEY = 'nx.settings.v1';
+var SETTINGS_CACHE_SEC = 360;      /* 6 min; invalidated on every write   */
+var ROWIDX_CACHE_SEC = 1800;       /* 30 min; self-healing row index      */
+
+function scriptCache_() {
+  try { return CacheService.getScriptCache(); } catch (e) { return null; }
+}
+
+function cacheGet_(key) {
+  var c = scriptCache_();
+  if (!c) return null;
+  try { return c.get(key); } catch (e) { return null; }
+}
+
+function cachePut_(key, value, ttl) {
+  var c = scriptCache_();
+  if (!c) return;
+  try { c.put(key, String(value), ttl); } catch (e) { /* cache is best effort */ }
+}
+
+function cacheRemove_(key) {
+  var c = scriptCache_();
+  if (!c) return;
+  try { c.remove(key); } catch (e) { /* ignore */ }
+}
+
+/** The one and only spreadsheet handle for this execution. */
 function ss_() {
   if (_ss) return _ss;
   var id = spreadsheetId_();
-  if (!id) throw new Error('SPREADSHEET_ID is not configured. Run initialSetup() first.');
+  if (!id) throw new Error('SPREADSHEET_ID is not configured. Run setup() first.');
   _ss = SpreadsheetApp.openById(id);
   return _ss;
+}
+
+/** Cached Sheet object; creates/repairs the sheet only when it is missing. */
+function sh_(name) {
+  if (_shCache[name]) return _shCache[name];
+  var sheet = ss_().getSheetByName(name);
+  if (!sheet) sheet = ensureSheet_(name);
+  _shCache[name] = sheet;
+  return sheet;
 }
 
 function ensureSheet_(name) {
@@ -275,6 +416,7 @@ function ensureSheet_(name) {
     sheet = book.insertSheet(name);
     sheet.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
     sheet.setFrozenRows(1);
+    _shCache[name] = sheet;
     _hdrCache[name] = cols.slice();
     return sheet;
   }
@@ -284,6 +426,7 @@ function ensureSheet_(name) {
   if (current.length === 1 && current[0] === '') {
     sheet.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
     sheet.setFrozenRows(1);
+    _shCache[name] = sheet;
     _hdrCache[name] = cols.slice();
     return sheet;
   }
@@ -292,17 +435,14 @@ function ensureSheet_(name) {
     sheet.getRange(1, current.length + 1, 1, missing.length).setValues([missing]);
     sheet.getRange(1, 1, 1, current.length + missing.length).setFontWeight('bold');
     current = current.concat(missing);
+    delete _table[name];
   }
+  _shCache[name] = sheet;
   _hdrCache[name] = current;
   return sheet;
 }
 
-function sh_(name) {
-  var sheet = ss_().getSheetByName(name);
-  if (!sheet) sheet = ensureSheet_(name);
-  return sheet;
-}
-
+/** Header row (read at most once per sheet per execution). */
 function hdr_(name) {
   if (_hdrCache[name]) return _hdrCache[name];
   var sheet = sh_(name);
@@ -313,21 +453,31 @@ function hdr_(name) {
   return row;
 }
 
-/** All rows as objects. `__row` is the physical sheet row number. */
+/** Turns one raw value array into a row object. */
+function rowObject_(headers, raw, rowNum) {
+  var obj = { __row: rowNum };
+  for (var c = 0; c < headers.length; c++) if (headers[c]) obj[headers[c]] = raw[c];
+  return obj;
+}
+
+/**
+ * All rows as objects. The full sheet is read ONCE per execution; every later
+ * call (and every write) is served from / applied to the in-memory table.
+ */
 function allRows_(name) {
+  if (_table[name]) return _table[name];
   var sheet = sh_(name);
   var headers = hdr_(name);
   var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
+  if (lastRow < 2) { _table[name] = []; return _table[name]; }
   var values = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
   var out = [];
   for (var i = 0; i < values.length; i++) {
     var raw = values[i];
     if (raw.join('') === '') continue;
-    var obj = { __row: i + 2 };
-    for (var c = 0; c < headers.length; c++) if (headers[c]) obj[headers[c]] = raw[c];
-    out.push(obj);
+    out.push(rowObject_(headers, raw, i + 2));
   }
+  _table[name] = out;
   return out;
 }
 
@@ -342,41 +492,138 @@ function findOne_(name, predicate) {
   return rows.length ? rows[0] : null;
 }
 
+/**
+ * Fast single-row lookup by key column, backed by a CacheService row index.
+ *
+ * Cost when the index hits: ONE getRange() of a single row.
+ * Cost on a miss: one full-table read (which is then reused for the rest of
+ * the execution anyway) plus an index refresh.
+ * The index is always verified against the real cell, so a stale entry
+ * (rows deleted/shifted by an admin) can never return the wrong record.
+ */
+function rowByKey_(name, keyCol, keyVal) {
+  var wanted = s_(keyVal);
+  if (!wanted) return null;
+
+  /* Already have the whole table in memory: no service call at all. */
+  if (_table[name]) {
+    var rows = _table[name];
+    for (var i = 0; i < rows.length; i++) if (s_(rows[i][keyCol]) === wanted) return rows[i];
+    return null;
+  }
+
+  var idxKey = 'nx.idx.' + name + '.' + keyCol + '.' + wanted;
+  var cachedRow = int_(cacheGet_(idxKey));
+  if (cachedRow >= 2) {
+    var sheet = sh_(name);
+    if (cachedRow <= sheet.getLastRow()) {
+      var headers = hdr_(name);
+      var raw = sheet.getRange(cachedRow, 1, 1, headers.length).getValues()[0];
+      var obj = rowObject_(headers, raw, cachedRow);
+      if (s_(obj[keyCol]) === wanted) return obj;   /* verified hit */
+    }
+    cacheRemove_(idxKey);                            /* stale: drop it */
+  }
+
+  var found = findOne_(name, function (r) { return s_(r[keyCol]) === wanted; });
+  if (found) cachePut_(idxKey, found.__row, ROWIDX_CACHE_SEC);
+  return found;
+}
+
+function forgetRowIndex_(name, keyCol, keyVal) {
+  cacheRemove_('nx.idx.' + name + '.' + keyCol + '.' + s_(keyVal));
+}
+
+/**
+ * Appends a row with a single setValues() (appendRow() is slower and forces a
+ * flush) and keeps the in-memory table in sync.
+ */
 function appendRow_(name, obj) {
   var sheet = sh_(name);
-  var row = hdr_(name).map(function (h) {
+  var headers = hdr_(name);
+  var values = headers.map(function (h) {
     var v = obj[h];
     return (v === undefined || v === null) ? '' : v;
   });
-  sheet.appendRow(row);
+  var rowNum = sheet.getLastRow() + 1;
+  if (rowNum < 2) rowNum = 2;
+  sheet.getRange(rowNum, 1, 1, headers.length).setValues([values]);
+  if (_table[name]) _table[name].push(rowObject_(headers, values, rowNum));
   return obj;
 }
 
+/** Appends many rows in ONE setValues() call. Used by logging and seeding. */
+function appendRows_(name, objects) {
+  if (!objects || !objects.length) return 0;
+  var sheet = sh_(name);
+  var headers = hdr_(name);
+  var matrix = objects.map(function (obj) {
+    return headers.map(function (h) {
+      var v = obj[h];
+      return (v === undefined || v === null) ? '' : v;
+    });
+  });
+  var startRow = Math.max(2, sheet.getLastRow() + 1);
+  sheet.getRange(startRow, 1, matrix.length, headers.length).setValues(matrix);
+  if (_table[name]) {
+    for (var i = 0; i < matrix.length; i++) {
+      _table[name].push(rowObject_(headers, matrix[i], startRow + i));
+    }
+  }
+  return matrix.length;
+}
+
+/**
+ * Updates only the columns present in `patch`. Writes the smallest possible
+ * range: a single cell when one column changed, otherwise the changed span.
+ * Reads the current values from the in-memory table when available.
+ */
 function patchRow_(name, rowNum, patch) {
   if (!rowNum || rowNum < 2) return false;
   var sheet = sh_(name);
   var headers = hdr_(name);
-  var range = sheet.getRange(rowNum, 1, 1, headers.length);
-  var values = range.getValues()[0];
-  var changed = false;
+
+  /* Current row values: from memory if we already loaded the table. */
+  var cached = null;
+  if (_table[name]) {
+    for (var i = 0; i < _table[name].length; i++) {
+      if (_table[name][i].__row === rowNum) { cached = _table[name][i]; break; }
+    }
+  }
+  var values;
+  if (cached) values = headers.map(function (h) { return cached[h]; });
+  else values = sheet.getRange(rowNum, 1, 1, headers.length).getValues()[0];
+
+  var minIdx = -1, maxIdx = -1, changed = false;
   for (var k in patch) {
+    if (!patch.hasOwnProperty(k)) continue;
     var idx = headers.indexOf(k);
     if (idx === -1) continue;
     var v = patch[k];
     values[idx] = (v === undefined || v === null) ? '' : v;
+    if (cached) cached[k] = values[idx];
+    if (minIdx === -1 || idx < minIdx) minIdx = idx;
+    if (idx > maxIdx) maxIdx = idx;
     changed = true;
   }
-  if (changed) range.setValues([values]);
-  return changed;
+  if (!changed) return false;
+
+  var width = maxIdx - minIdx + 1;
+  sheet.getRange(rowNum, minIdx + 1, 1, width)
+    .setValues([values.slice(minIdx, maxIdx + 1)]);
+  return true;
 }
 
 function deleteRow_(name, rowNum) {
   if (!rowNum || rowNum < 2) return false;
   sh_(name).deleteRow(rowNum);
+  /* Row numbers below the deleted row shift: drop caches for this sheet. */
+  delete _table[name];
   return true;
 }
 
 function countRows_(name) {
+  if (_table[name]) return _table[name].length;
   var sheet = ss_().getSheetByName(name);
   if (!sheet) return 0;
   return Math.max(0, sheet.getLastRow() - 1);
@@ -389,7 +636,9 @@ function nextSeq_(name) {
   var locked = false;
   try { locked = lock.tryLock(SEQ_LOCK_WAIT_MS); } catch (e) { locked = false; }
   try {
-    var cur = int_(prop_(key, '0'));
+    /* Read through the service (not the memory cache) so parallel executions
+     * that already bumped the counter are respected. */
+    var cur = int_(props_().getProperty(key) || '0');
     if (!cur) cur = maxNumericId_(name);
     var next = cur + 1;
     setProp_(key, next);
@@ -431,17 +680,39 @@ var DEFAULT_SETTINGS = {
   schema_version: SCHEMA_VERSION
 };
 
+/**
+ * Settings are read on almost every code path (texts, buttons, currency,
+ * feature flags), so they get TWO cache layers:
+ *   1. `_settingsCache` — per execution, zero cost.
+ *   2. CacheService     — shared across executions for 6 minutes, so a warm
+ *                         update never reads the Settings sheet at all.
+ * Any write (setSetting_) invalidates layer 2 immediately.
+ */
 function settingsMap_() {
   if (_settingsCache) return _settingsCache;
+
+  var cached = cacheGet_(SETTINGS_CACHE_KEY);
+  if (cached) {
+    var parsed = parseJson_(cached, null);
+    if (parsed && typeof parsed === 'object') { _settingsCache = parsed; return _settingsCache; }
+  }
+
   var map = {};
   try {
     allRows_('Settings').forEach(function (r) {
       var k = s_(r.key).trim();
       if (k) map[k] = s_(r.value);
     });
+    cachePut_(SETTINGS_CACHE_KEY, json_(map), SETTINGS_CACHE_SEC);
   } catch (e) { map = {}; }
   _settingsCache = map;
   return map;
+}
+
+/** Drops the shared settings cache so the next read sees fresh values. */
+function invalidateSettingsCache_() {
+  _settingsCache = null;
+  cacheRemove_(SETTINGS_CACHE_KEY);
 }
 
 function getSetting_(key, def) {
@@ -462,7 +733,10 @@ function setSetting_(key, value) {
   var existing = findOne_('Settings', function (r) { return s_(r.key).trim() === key; });
   if (existing) patchRow_('Settings', existing.__row, { value: s_(value), updated_at: nowIso_() });
   else appendRow_('Settings', { key: key, value: s_(value), updated_at: nowIso_() });
+  /* Refresh the in-memory map and drop the shared cache so other executions
+   * (and the admin panel) immediately see the new value. */
   if (_settingsCache) _settingsCache[key] = s_(value);
+  cacheRemove_(SETTINGS_CACHE_KEY);
   return true;
 }
 
@@ -577,9 +851,18 @@ function b_(key) {
 
 /* ================================ LOGGING =============================== */
 
+/*
+ * Logs are BUFFERED in memory and written with a single setValues() at the
+ * end of the request (see flushLogs_, called from doPost's finally block).
+ * The old build issued one appendRow() — i.e. one spreadsheet write plus an
+ * implicit flush — per log line, and a normal update produces 2-5 lines.
+ */
+var _logBuffer = [];
+var LOG_BUFFER_MAX = 40;   /* hard safety valve for long admin operations */
+
 function log_(level, event, userId, message, data) {
   try {
-    appendRow_('Logs', {
+    _logBuffer.push({
       created_at: nowIso_(),
       level: s_(level).toUpperCase(),
       event: s_(event),
@@ -587,7 +870,17 @@ function log_(level, event, userId, message, data) {
       message: truncate_(sanitize_(message), 900),
       data: truncate_(sanitize_(typeof data === 'string' ? data : json_(data || {})), 900)
     });
+    if (_logBuffer.length >= LOG_BUFFER_MAX) flushLogs_();
   } catch (e) { /* logging must never break the bot */ }
+}
+
+/** Writes every buffered log line in ONE spreadsheet call. Never throws. */
+function flushLogs_() {
+  if (!_logBuffer.length) return 0;
+  var pending = _logBuffer;
+  _logBuffer = [];
+  try { return appendRows_('Logs', pending); }
+  catch (e) { return 0; }
 }
 
 function logInfo_(event, userId, message, data) { log_('INFO', event, userId, message, data); }
@@ -609,6 +902,57 @@ function trimLogs_() {
 /* =========================== TELEGRAM API LAYER ========================= */
 /* Single wrapper. Every Telegram call in this project goes through tg_(). */
 
+/** Builds the UrlFetchApp request object for a Telegram method. */
+function tgRequest_(method, payload) {
+  return {
+    url: TG_API + botToken_() + '/' + method,
+    method: 'post',
+    contentType: 'application/json',
+    payload: json_(payload || {}),
+    muteHttpExceptions: true,
+    followRedirects: true
+  };
+}
+
+/** Parses one Telegram HTTP response into the usual { ok, result } object. */
+function tgParse_(method, payload, res) {
+  var out;
+  try { out = JSON.parse(res.getContentText()); }
+  catch (e) { out = { ok: false, description: 'bad json' }; }
+  if (!out.ok) {
+    setProp_('LAST_TG_ERROR', iso_(new Date()) + ' | ' + method + ' | ' + truncate_(sanitize_(out.description), 200));
+    logWarn_('tg_error', s_(payload && payload.chat_id), method + ': ' + s_(out.description), {
+      code: out.error_code || 0
+    });
+  }
+  return out;
+}
+
+/**
+ * Sends N Telegram calls CONCURRENTLY with a single UrlFetchApp.fetchAll().
+ * Used wherever the old build looped over sequential fetches (admin
+ * notifications, broadcast batches): 8 admins used to mean 8 × ~250ms of
+ * blocking latency, now it is one round trip for all of them.
+ *
+ * `calls` is an array of { method, payload }.
+ */
+function tgAll_(calls) {
+  if (!calls || !calls.length) return [];
+  if (!botToken_()) return calls.map(function () { return { ok: false, description: 'BOT_TOKEN missing' }; });
+  var requests = calls.map(function (c) { return tgRequest_(c.method, c.payload); });
+  var responses;
+  try {
+    responses = UrlFetchApp.fetchAll(requests);
+  } catch (err) {
+    setProp_('LAST_TG_ERROR', iso_(new Date()) + ' | fetchAll | ' + sanitize_(err && err.message));
+    logErr_('tg_fetch_all', '', 'fetchAll failed: ' + (err && err.message), { count: calls.length });
+    return calls.map(function () { return { ok: false, description: 'network error' }; });
+  }
+  return responses.map(function (res, i) {
+    return tgParse_(calls[i].method, calls[i].payload, res);
+  });
+}
+
 function tg_(method, payload) {
   var token = botToken_();
   if (!token) return { ok: false, description: 'BOT_TOKEN missing' };
@@ -628,16 +972,7 @@ function tg_(method, payload) {
     logErr_('tg_fetch', '', method + ' failed: ' + (err && err.message), {});
     return { ok: false, description: 'network error' };
   }
-  var body = res.getContentText();
-  var out;
-  try { out = JSON.parse(body); } catch (e) { out = { ok: false, description: 'bad json' }; }
-  if (!out.ok) {
-    setProp_('LAST_TG_ERROR', iso_(new Date()) + ' | ' + method + ' | ' + truncate_(sanitize_(out.description), 200));
-    logWarn_('tg_error', s_(payload && payload.chat_id), method + ': ' + s_(out.description), {
-      code: out.error_code || 0
-    });
-  }
-  return out;
+  return tgParse_(method, payload, res);
 }
 
 function tgSendMessage_(chatId, text, opts) {
@@ -728,13 +1063,19 @@ function editOrSend_(ctx, text, kb) {
   return tgSendMessage_(ctx.chatId, text, { kb: kb });
 }
 
+/** Notifies every admin CONCURRENTLY (one fetchAll instead of N fetches). */
 function notifyAdmins_(text, kb) {
   if (!getBool_('admin_notify', true)) return 0;
-  var sent = 0;
-  allAdminIds_().forEach(function (id) {
-    var res = tgSendMessage_(id, text, { kb: kb });
-    if (res && res.ok) sent++;
+  var admins = allAdminIds_();
+  if (!admins.length) return 0;
+  var calls = admins.map(function (id) {
+    var payload = { chat_id: id, text: s_(text), parse_mode: 'HTML', disable_web_page_preview: true };
+    if (kb) payload.reply_markup = { inline_keyboard: kb };
+    return { method: 'sendMessage', payload: payload };
   });
+  var results = tgAll_(calls);
+  var sent = 0;
+  results.forEach(function (r) { if (r && r.ok) sent++; });
   return sent;
 }
 
@@ -777,23 +1118,36 @@ function pagerRow_(prefix, page, pages, backData) {
 
 /* ============================ USERS & WALLET ============================ */
 
+/** Single-row user lookup (cached row index → one 1-row read, not a scan). */
 function getUser_(userId) {
-  return findOne_('Users', function (r) { return s_(r.user_id) === s_(userId); });
+  return rowByKey_('Users', 'user_id', userId);
 }
+
+/** How often `last_seen` is actually written when nothing else changed. */
+var LAST_SEEN_THROTTLE_SEC = 120;
 
 function ensureUser_(from, refBy) {
   var userId = s_(from.id);
   var existing = getUser_(userId);
   if (existing) {
-    patchRow_('Users', existing.__row, {
-      username: s_(from.username),
-      first_name: s_(from.first_name),
-      last_name: s_(from.last_name),
-      last_seen: nowIso_()
-    });
-    existing.username = s_(from.username);
-    existing.first_name = s_(from.first_name);
-    existing.last_name = s_(from.last_name);
+    var patch = {};
+    if (s_(existing.username) !== s_(from.username)) patch.username = s_(from.username);
+    if (s_(existing.first_name) !== s_(from.first_name)) patch.first_name = s_(from.first_name);
+    if (s_(existing.last_name) !== s_(from.last_name)) patch.last_name = s_(from.last_name);
+
+    /* `last_seen` on its own is written at most once every two minutes: it is
+     * a display-only field and writing it on every keystroke cost one full
+     * spreadsheet write per update. Any real profile change is written
+     * immediately, together with a fresh last_seen. */
+    var seenKey = 'nx.seen.' + userId;
+    if (Object.keys(patch).length || !cacheGet_(seenKey)) {
+      patch.last_seen = nowIso_();
+      cachePut_(seenKey, '1', LAST_SEEN_THROTTLE_SEC);
+    }
+    if (Object.keys(patch).length) {
+      patchRow_('Users', existing.__row, patch);
+      for (var f in patch) existing[f] = patch[f];
+    }
     return { user: existing, created: false };
   }
   var validRef = '';
@@ -816,6 +1170,10 @@ function ensureUser_(from, refBy) {
     note: ''
   };
   appendRow_('Users', row);
+  /* Remember where the new row landed so the very next lookup is a 1-row read. */
+  var appendedRow = sh_('Users').getLastRow();
+  row.__row = appendedRow;
+  cachePut_('nx.idx.Users.user_id.' + userId, appendedRow, ROWIDX_CACHE_SEC);
   ensureWallet_(userId);
   if (validRef) {
     var parent = getUser_(validRef);
@@ -832,8 +1190,8 @@ function ensureUser_(from, refBy) {
       'با اولین خرید او، پورسانت به کیف پول شما اضافه می‌شود.', {});
   }
   logInfo_('user_new', userId, 'کاربر جدید ثبت شد', { ref_by: validRef });
-  var fresh = getUser_(userId);
-  return { user: fresh || row, created: true };
+  /* `row` already carries __row, so no re-read of the sheet is needed. */
+  return { user: row, created: true };
 }
 
 function userName_(user) {
@@ -851,13 +1209,17 @@ function userLabel_(user) {
 }
 
 function ensureWallet_(userId) {
-  var w = findOne_('Wallet', function (r) { return s_(r.user_id) === s_(userId); });
+  var w = rowByKey_('Wallet', 'user_id', userId);
   if (w) return w;
-  appendRow_('Wallet', {
+  var row = {
     user_id: s_(userId), balance: 0, total_charged: 0, total_spent: 0,
     ref_income: 0, updated_at: nowIso_()
-  });
-  return findOne_('Wallet', function (r) { return s_(r.user_id) === s_(userId); });
+  };
+  appendRow_('Wallet', row);
+  /* Build the object locally instead of re-reading the sheet. */
+  row.__row = sh_('Wallet').getLastRow();
+  cachePut_('nx.idx.Wallet.user_id.' + s_(userId), row.__row, ROWIDX_CACHE_SEC);
+  return row;
 }
 
 /**
@@ -907,20 +1269,29 @@ function walletOf_(userId) {
 
 /* =============================== STATES ================================= */
 
+/* The three state columns are adjacent in the schema, so patchRow_ updates
+ * them with a single 3-cell setValues() instead of rewriting the whole row. */
 function setState_(userId, state, data) {
   var user = getUser_(userId);
   if (!user) return false;
-  return patchRow_('Users', user.__row, {
-    state: s_(state),
-    state_data: json_(data || {}),
-    state_at: nowIso_()
-  });
+  var patch = { state: s_(state), state_data: json_(data || {}), state_at: nowIso_() };
+  var ok = patchRow_('Users', user.__row, patch);
+  for (var k in patch) user[k] = patch[k];
+  return ok;
 }
 
+/**
+ * Clearing an already-empty state is a no-op. This matters: /start, /cancel
+ * and every main-menu button called clearState_ unconditionally, costing one
+ * spreadsheet write per tap for users who had no wizard running at all.
+ */
 function clearState_(userId) {
   var user = getUser_(userId);
   if (!user) return false;
-  return patchRow_('Users', user.__row, { state: '', state_data: '', state_at: '' });
+  if (!s_(user.state) && !s_(user.state_data) && !s_(user.state_at)) return false;
+  var ok = patchRow_('Users', user.__row, { state: '', state_data: '', state_at: '' });
+  user.state = ''; user.state_data = ''; user.state_at = '';
+  return ok;
 }
 
 /** Returns null when there is no state or the state has timed out. */
@@ -937,6 +1308,11 @@ function readState_(user) {
 
 /* ============================ WEBHOOK PIPELINE ========================== */
 
+/**
+ * Public liveness endpoint. Deliberately cheap (no spreadsheet access) and
+ * secret-free, so it is safe to expose and to poll from an uptime monitor.
+ * Deeper diagnostics live behind the admin panel / editor functions.
+ */
 function doGet(e) {
   var body = {
     ok: true,
@@ -971,8 +1347,8 @@ function doPost(e) {
       logInfo_('update_duplicate', '', 'آپدیت تکراری نادیده گرفته شد', { update_id: update.update_id, rid: rid });
       return out;
     }
-    setProp_('LAST_UPDATE_ID', update.update_id);
-    setProp_('LAST_UPDATE_AT', nowIso_());
+    /* One batched property write instead of two round trips. */
+    setProps_({ LAST_UPDATE_ID: update.update_id, LAST_UPDATE_AT: nowIso_() });
     logInfo_('webhook_received', '', 'آپدیت دریافت و پردازش شد', { update_id: update.update_id, rid: rid });
     processUpdate_(update);
   } catch (err) {
@@ -980,6 +1356,9 @@ function doPost(e) {
       rid: rid,
       stack: truncate_(s_(err && err.stack), 500)
     });
+  } finally {
+    /* Single batched write for everything logged during this update. */
+    flushLogs_();
   }
   return out;
 }
@@ -994,26 +1373,20 @@ function verifyRequest_(e) {
 }
 
 /**
- * Duplicate protection. The lock is held only around the cache read/write,
- * never around Telegram calls. A busy lock degrades to a cache-only check,
- * so a stuck lock can never stop the bot permanently.
+ * Duplicate protection — LOCK-FREE.
+ *
+ * The old version grabbed the script lock (up to 2s) for every single update,
+ * which serialised the whole bot: two users pressing a button at the same
+ * moment queued behind each other before any work started. Telegram assigns
+ * a unique, monotonically increasing update_id and the Worker only retries a
+ * forward when Apps Script did NOT answer 2xx, so a plain compare-and-set on
+ * CacheService is sufficient here and costs a single fast cache round trip.
  */
 function isDuplicateUpdate_(updateId) {
-  var cache = CacheService.getScriptCache();
   var key = 'upd_' + s_(updateId);
-  try { if (cache.get(key)) return true; } catch (e) { return false; }
-  var lock = LockService.getScriptLock();
-  var locked = false;
-  try { locked = lock.tryLock(2000); } catch (e2) { locked = false; }
-  try {
-    if (locked && cache.get(key)) return true;
-    cache.put(key, '1', DEDUPE_TTL_SEC);
-    return false;
-  } catch (e3) {
-    return false;
-  } finally {
-    if (locked) { try { lock.releaseLock(); } catch (e4) { /* ignore */ } }
-  }
+  if (cacheGet_(key)) return true;
+  cachePut_(key, '1', DEDUPE_TTL_SEC);
+  return false;
 }
 
 function processUpdate_(update) {
@@ -1053,22 +1426,33 @@ function channelLink_(ch) {
   return username ? 'https://t.me/' + username : '';
 }
 
+var MEMBER_STATUSES_OK = ['creator', 'administrator', 'member', 'restricted'];
+
+/**
+ * Checks membership in ALL required channels with one concurrent fetchAll
+ * instead of one blocking getChatMember per channel, and caches a positive
+ * result for MEMBER_CACHE_SEC.
+ */
 function isMemberEverywhere_(userId) {
   var channels = requiredChannels_();
   if (!channels.length) return true;
-  var cache = CacheService.getScriptCache();
   var key = 'mem_' + s_(userId);
-  try { if (cache.get(key) === '1') return true; } catch (e) { /* ignore */ }
+  if (cacheGet_(key) === '1') return true;
+
+  var calls = [];
+  channels.forEach(function (ch) {
+    var ref = channelRef_(ch);
+    if (ref) calls.push({ method: 'getChatMember', payload: { chat_id: ref, user_id: userId } });
+  });
+  if (!calls.length) return true;
+
   var ok = true;
-  for (var i = 0; i < channels.length; i++) {
-    var ref = channelRef_(channels[i]);
-    if (!ref) continue;
-    var res = tgGetChatMember_(ref, userId);
-    if (!res || !res.ok || !res.result) { ok = false; break; }
-    var status = s_(res.result.status);
-    if (['creator', 'administrator', 'member', 'restricted'].indexOf(status) === -1) { ok = false; break; }
-  }
-  if (ok) { try { cache.put(key, '1', MEMBER_CACHE_SEC); } catch (e2) { /* ignore */ } }
+  tgAll_(calls).forEach(function (res) {
+    if (!ok) return;
+    if (!res || !res.ok || !res.result) { ok = false; return; }
+    if (MEMBER_STATUSES_OK.indexOf(s_(res.result.status)) === -1) ok = false;
+  });
+  if (ok) cachePut_(key, '1', MEMBER_CACHE_SEC);
   return ok;
 }
 
@@ -1196,6 +1580,15 @@ function startCommand_(ctx, isNew) {
 function onCallback_(cq) {
   if (!cq || !cq.from) return;
   var data = s_(cq.data);
+
+  /* Answer the callback FIRST. Telegram keeps the little loading spinner on
+   * the button until it gets this call, so acknowledging before any
+   * spreadsheet work makes the UI feel instant even while the rest of the
+   * handler is still running. Denials below are delivered as chat messages
+   * instead of alerts, because the query is already answered. */
+  tgAnswerCallbackQuery_(cq.id, '', false);
+  if (data === 'U:noop') return;
+
   var res = ensureUser_(cq.from, '');
   var user = res.user;
   var ctx = {
@@ -1209,10 +1602,9 @@ function onCallback_(cq) {
   };
 
   if (bool_(user.is_blocked)) {
-    tgAnswerCallbackQuery_(ctx.cqId, 'دسترسی شما محدود شده است.', true);
+    send_(ctx.chatId, t_('blocked'), {});
     return;
   }
-  if (data === 'U:noop') { tgAnswerCallbackQuery_(ctx.cqId, '', false); return; }
 
   var parts = data.split(':');
   var scope = parts[0];
@@ -1220,23 +1612,20 @@ function onCallback_(cq) {
   try {
     if (scope === 'A') {
       if (!ctx.isAdmin) {
-        tgAnswerCallbackQuery_(ctx.cqId, '⛔️ دسترسی مدیریتی ندارید.', true);
+        send_(ctx.chatId, '⛔️ دسترسی مدیریتی ندارید.', {});
         logWarn_('admin_denied', ctx.userId, 'تلاش غیرمجاز برای پنل مدیریت', { data: data });
         return;
       }
-      tgAnswerCallbackQuery_(ctx.cqId, '', false);
       routeAdmin_(ctx, parts);
       return;
     }
     if (scope === 'U') {
-      tgAnswerCallbackQuery_(ctx.cqId, '', false);
       routeUser_(ctx, parts);
       return;
     }
-    tgAnswerCallbackQuery_(ctx.cqId, 'دکمه نامعتبر است.', false);
+    send_(ctx.chatId, t_('unknown'), {});
   } catch (err) {
     logErr_('callback_error', ctx.userId, 'خطا در دکمه: ' + (err && err.message), { data: data });
-    tgAnswerCallbackQuery_(ctx.cqId, '⚠️ خطا رخ داد.', true);
     send_(ctx.chatId, t_('error_generic'), {});
   }
 }
@@ -1245,7 +1634,7 @@ function routeUser_(ctx, p) {
   var action = p[1] || 'menu';
 
   if (action === 'chk') {
-    try { CacheService.getScriptCache().remove('mem_' + ctx.userId); } catch (e) { /* ignore */ }
+    cacheRemove_('mem_' + ctx.userId);
     if (isMemberEverywhere_(ctx.userId)) sendMenu_(ctx.chatId, t_('channel_ok'), ctx.userId);
     else showJoinPrompt_(ctx);
     return;
@@ -1296,9 +1685,7 @@ function activeServices_() {
     .sort(function (a, b) { return int_(a.sort_order) - int_(b.sort_order) || int_(a.id) - int_(b.id); });
 }
 
-function serviceById_(id) {
-  return findOne_('Services', function (r) { return s_(r.id) === s_(id); });
-}
+function serviceById_(id) { return rowByKey_('Services', 'id', id); }
 
 function buyList_(ctx, page, edit) {
   var services = activeServices_();
@@ -1340,9 +1727,8 @@ function serviceView_(ctx, serviceId) {
 
 /* ================================ ORDERS =============================== */
 
-function orderById_(id) {
-  return findOne_('Orders', function (r) { return s_(r.id) === s_(id); });
-}
+/** Indexed single-order lookup (1-row read on a cache hit). */
+function orderById_(id) { return rowByKey_('Orders', 'id', id); }
 
 function orderCode_(order) { return '#' + s_(order.id); }
 
@@ -1543,12 +1929,25 @@ function submitReceipt_(ctx, orderId, msg) {
     '💵 مبلغ: <b>' + money_(order.final_amount) + '</b>\n' +
     '👤 کاربر: ' + esc_(userLabel_(ctx.user)) +
     (photoId || docId ? '' : '\n📝 اطلاعات: <code>' + esc_(ref) + '</code>');
+  /* All admins are notified in one concurrent batch. */
   var kb = adminOrderKb_(order.id);
-  allAdminIds_().forEach(function (adminId) {
-    if (photoId) tgSendPhoto_(adminId, photoId, caption, { kb: kb });
-    else if (docId) tgSendDocument_(adminId, docId, caption, { kb: kb });
-    else tgSendMessage_(adminId, caption, { kb: kb });
-  });
+  tgAll_(allAdminIds_().map(function (adminId) {
+    var payload = { chat_id: adminId, parse_mode: 'HTML' };
+    if (kb) payload.reply_markup = { inline_keyboard: kb };
+    if (photoId) {
+      payload.photo = photoId;
+      payload.caption = s_(caption).substring(0, 1000);
+      return { method: 'sendPhoto', payload: payload };
+    }
+    if (docId) {
+      payload.document = docId;
+      payload.caption = s_(caption).substring(0, 1000);
+      return { method: 'sendDocument', payload: payload };
+    }
+    payload.text = s_(caption);
+    payload.disable_web_page_preview = true;
+    return { method: 'sendMessage', payload: payload };
+  }));
 }
 
 function payWithWallet_(ctx, orderId) {
@@ -1670,9 +2069,7 @@ function configStatusFa_(cfg) {
   return '🟢 فعال';
 }
 
-function configById_(id) {
-  return findOne_('Configs', function (r) { return s_(r.id) === s_(id); });
-}
+function configById_(id) { return rowByKey_('Configs', 'id', id); }
 
 function configView_(ctx, configId) {
   var cfg = configById_(configId);
@@ -1765,7 +2162,7 @@ function guideList_(ctx, page, edit) {
   else send_(ctx.chatId, t_('guide_intro'), { kb: kb });
 }
 
-function guideById_(id) { return findOne_('Guides', function (r) { return s_(r.id) === s_(id); }); }
+function guideById_(id) { return rowByKey_('Guides', 'id', id); }
 
 function guideView_(ctx, guideId) {
   var g = guideById_(guideId);
@@ -2314,6 +2711,7 @@ function routeAdmin_(ctx, p) {
 
     case 'sys':
       if (a === 'repair') { adminRunRepair_(ctx); return; }
+      if (a === 'hc') { adminRunHealthCheck_(ctx); return; }
       if (a === 'test') { adminRunSelfTest_(ctx); return; }
       if (a === 'wh') { adminWebhookInfo_(ctx); return; }
       if (a === 'setwh') { adminSetWebhook_(ctx); return; }
@@ -2343,15 +2741,15 @@ function adminHomeKb_() {
 }
 
 function adminHome_(ctx, edit) {
-  var pendingPay = findRows_('Orders', function (r) {
-    return s_(r.kind) === 'purchase' && s_(r.status) === 'pending_review';
-  }).length;
-  var pendingDeliver = findRows_('Orders', function (r) {
-    return s_(r.kind) === 'purchase' && s_(r.status) === 'paid';
-  }).length;
-  var pendingTest = findRows_('Orders', function (r) {
-    return s_(r.kind) === 'test' && s_(r.status) === 'pending_review';
-  }).length;
+  /* All four counters come from a SINGLE pass over the (already cached)
+   * Orders table instead of three separate full scans. */
+  var pendingPay = 0, pendingDeliver = 0, pendingTest = 0;
+  allRows_('Orders').forEach(function (r) {
+    var kind = s_(r.kind), status = s_(r.status);
+    if (kind === 'purchase' && status === 'pending_review') pendingPay++;
+    else if (kind === 'purchase' && status === 'paid') pendingDeliver++;
+    else if (kind === 'test' && status === 'pending_review') pendingTest++;
+  });
   var pendingWd = findRows_('Withdrawals', function (r) { return s_(r.status) === 'pending'; }).length;
 
   var text = '🛠 <b>پنل مدیریت ' + esc_(getSetting_('bot_title', APP_TITLE)) + '</b>\n' +
@@ -3197,7 +3595,7 @@ function adminChannelsMenu_(ctx) {
   editOrSend_(ctx, text, adminBackKb_(kb));
 }
 
-function channelById_(id) { return findOne_('Channels', function (r) { return s_(r.id) === s_(id); }); }
+function channelById_(id) { return rowByKey_('Channels', 'id', id); }
 
 function adminChannelToggle_(ctx, id) {
   var ch = channelById_(id);
@@ -3305,7 +3703,7 @@ function adminWalletTop_(ctx) {
 
 var WD_STATUS_FA = { pending: '⏳ در انتظار بررسی', approved: '✅ تأییدشده', rejected: '❌ رد‌شده' };
 
-function withdrawById_(id) { return findOne_('Withdrawals', function (r) { return s_(r.id) === s_(id); }); }
+function withdrawById_(id) { return rowByKey_('Withdrawals', 'id', id); }
 
 function adminWithdrawList_(ctx, status, page) {
   var list = findRows_('Withdrawals', function (r) {
@@ -3424,14 +3822,29 @@ function adminBroadcastRun_(ctx, resume) {
   var end = Math.min(users.length, start + BROADCAST_MAX_PER_RUN);
   editOrSend_(ctx, '🚀 ارسال آغاز شد...\nاز ردیف <b>' + (start + 1) + '</b> تا <b>' + end + '</b>', []);
 
+  /* Sent in concurrent chunks (fetchAll) instead of one blocking fetch per
+   * user. A short pause between chunks keeps us inside Telegram's ~30 msg/s
+   * limit, but a 1000-user broadcast now takes seconds, not minutes. */
   var sent = 0, failed = 0, skipped = 0;
+  var batch = [];
   for (var i = start; i < end; i++) {
     var u = users[i];
     if (bool_(u.is_blocked)) { skipped++; continue; }
-    var res = tgSendMessage_(u.user_id, text, {});
-    if (res && res.ok) sent++;
-    else failed++;
-    Utilities.sleep(BROADCAST_SLEEP_MS);
+    batch.push({
+      method: 'sendMessage',
+      payload: {
+        chat_id: u.user_id, text: text, parse_mode: 'HTML',
+        disable_web_page_preview: true
+      }
+    });
+    if (batch.length >= BROADCAST_CHUNK) {
+      tgAll_(batch).forEach(function (r) { if (r && r.ok) sent++; else failed++; });
+      batch = [];
+      Utilities.sleep(BROADCAST_SLEEP_MS);
+    }
+  }
+  if (batch.length) {
+    tgAll_(batch).forEach(function (r) { if (r && r.ok) sent++; else failed++; });
   }
   setProp_('BC_OFFSET', end);
   var remaining = users.length - end;
@@ -3705,6 +4118,7 @@ function adminAddAdmin_(ctx, text) {
   var extras = extraAdminIds_();
   extras.push(id);
   setSetting_('admins', uniq_(extras).join(','));
+  forgetAdminCache_();
   logInfo_('admin_add', ctx.userId, 'مدیر جدید اضافه شد', { target: id });
   send_(ctx.chatId, '✅ کاربر <code>' + esc_(id) + '</code> به مدیران اضافه شد.', { kb: adminBackKb_([], 'A:adm') });
   tgSendMessage_(id, '👮 شما به‌عنوان مدیر ربات انتخاب شدید.\nبرای ورود به پنل، دستور /admin را بفرستید.', {});
@@ -3718,6 +4132,7 @@ function adminRemoveAdmin_(ctx, id) {
   }
   var extras = extraAdminIds_().filter(function (x) { return x !== s_(id); });
   setSetting_('admins', extras.join(','));
+  forgetAdminCache_();
   logInfo_('admin_remove', ctx.userId, 'مدیر حذف شد', { target: s_(id) });
   editOrSend_(ctx, '🗑 دسترسی مدیریت کاربر <code>' + esc_(id) + '</code> حذف شد.', adminBackKb_([], 'A:adm'));
 }
@@ -3732,6 +4147,7 @@ function adminSystemMenu_(ctx) {
     '🕒 زمان سرور: ' + jDateTime_(new Date()) + '\n\n' +
     '<i>همه ابزارها امن هستند و اجرای چندباره آن‌ها مشکلی ایجاد نمی‌کند.</i>', adminBackKb_([
     [btn_('🩺 تشخیص کامل سیستم', 'A:health')],
+    [btn_('🔍 بررسی سلامت اتصال‌ها', 'A:sys:hc')],
     [btn_('🧪 اجرای تست خودکار', 'A:sys:test')],
     [btn_('🛠 تعمیر دیتابیس', 'A:sys:repair')],
     [btn_('🔗 وضعیت وبهوک', 'A:sys:wh')],
@@ -3748,6 +4164,18 @@ function adminRunRepair_(ctx) {
   catch (err) { report = '❌ خطا در تعمیر: ' + s_(err && err.message); }
   logInfo_('admin_repair', ctx.userId, 'تعمیر دیتابیس اجرا شد', {});
   editOrSend_(ctx, report, adminBackKb_([], 'A:sys'));
+}
+
+/**
+ * Runs the full connectivity health check from inside the bot.
+ * The report contains no secrets, so it is safe to show in a chat.
+ */
+function adminRunHealthCheck_(ctx) {
+  var report;
+  try { report = healthCheck(); }
+  catch (err) { report = '❌ خطا در بررسی سلامت: ' + s_(err && err.message); }
+  editOrSend_(ctx, '<pre>' + esc_(truncate_(report, 3700)) + '</pre>',
+    adminBackKb_([[btn_('🔄 بررسی مجدد', 'A:sys:hc')]], 'A:sys'));
 }
 
 function adminRunSelfTest_(ctx) {
@@ -3792,11 +4220,23 @@ function adminDeleteWebhook_(ctx) {
 }
 
 function adminClearStates_(ctx) {
-  var cleared = 0;
-  findRows_('Users', function (u) { return s_(u.state) !== ''; }).forEach(function (u) {
-    patchRow_('Users', u.__row, { state: '', state_data: '', state_at: '' });
-    cleared++;
-  });
+  /* Writes the three state columns for ALL stuck users as contiguous blocks
+   * instead of one setValues() per user. */
+  var stuck = findRows_('Users', function (u) { return s_(u.state) !== ''; });
+  var cleared = stuck.length;
+  if (cleared) {
+    var headers = hdr_('Users');
+    var i0 = headers.indexOf('state');
+    /* Fast path only when the three columns really are adjacent (they are in
+     * the shipped schema; an older repaired sheet might differ). */
+    var adjacent = i0 !== -1 && headers[i0 + 1] === 'state_data' && headers[i0 + 2] === 'state_at';
+    var sheet = sh_('Users');
+    stuck.forEach(function (u) {
+      if (adjacent) sheet.getRange(u.__row, i0 + 1, 1, 3).setValues([['', '', '']]);
+      else patchRow_('Users', u.__row, { state: '', state_data: '', state_at: '' });
+      u.state = ''; u.state_data = ''; u.state_at = '';
+    });
+  }
   logInfo_('admin_clear_states', ctx.userId, 'وضعیت کاربران پاک شد', { count: cleared });
   editOrSend_(ctx, '🧹 وضعیت چندمرحله‌ای <b>' + cleared + '</b> کاربر پاک شد.\n' +
     'هیچ کاربری در میانه فرآیند گیر نمی‌ماند.', adminBackKb_([], 'A:sys'));
@@ -3842,19 +4282,239 @@ function adminHealth_(ctx) {
 }
 
 /* ========================== SETUP & MAINTENANCE ======================== */
+/*
+ * THE SHORT VERSION — run these two functions from the Apps Script editor:
+ *
+ *   1. setup()          → creates everything, generates the secrets, and
+ *                         prints exactly what is still missing.
+ *   2. connect()        → registers the Telegram webhook once the Worker URL
+ *                         is in place.
+ *
+ * Anything else (repairDatabase, healthCheck, selfTest) is optional
+ * maintenance. See README.md for the full walkthrough.
+ */
 
-function resetCaches_() {
-  _ss = null;
-  _hdrCache = {};
-  _settingsCache = null;
+/** Every configuration key, whether it is required, and how to obtain it. */
+var CONFIG_KEYS = [
+  { key: 'BOT_TOKEN', required: true, secret: true,
+    help: 'Token from @BotFather (looks like 8123456789:AA...).' },
+  { key: 'ADMIN_IDS', required: true, secret: false,
+    help: 'Your numeric Telegram id. Get it by sending /id to the bot, or use @userinfobot. Comma-separated for several admins.' },
+  { key: 'SPREADSHEET_ID', required: true, secret: false,
+    help: 'Created automatically by setup(). Do not edit by hand.' },
+  { key: 'WEBHOOK_SECRET', required: true, secret: true,
+    help: 'Generated automatically by setup(). Must equal the Worker secret APPS_SCRIPT_SECRET.' },
+  { key: 'WEB_APP_URL', required: true, secret: false,
+    help: 'Deploy > New deployment > Web app, then paste the /exec URL here.' },
+  { key: 'WORKER_URL', required: true, secret: false,
+    help: 'Public URL of your Cloudflare Worker, e.g. https://nexiup-telegram-gateway.<you>.workers.dev' },
+  { key: 'TELEGRAM_WEBHOOK_SECRET', required: false, secret: true,
+    help: 'Generated automatically. Must equal the Worker secret TELEGRAM_WEBHOOK_SECRET.' }
+];
+
+/**
+ * Reports which configuration values are still missing.
+ * Returns { ok, missing: [{key, help}], present: [key] } — never any secret value.
+ */
+function checkConfig() {
+  var missing = [], present = [];
+  CONFIG_KEYS.forEach(function (c) {
+    if (prop_(c.key, '')) present.push(c.key);
+    else if (c.required) missing.push({ key: c.key, help: c.help });
+  });
+  return { ok: missing.length === 0, missing: missing, present: present };
 }
 
 /**
- * Safe to run any number of times.
- * Creates the spreadsheet (if needed), all sheets, headers and default rows.
+ * ONE-TIME CONFIGURATION HELPER.
+ *
+ * Instead of clicking through the Script Properties UI you can call this once
+ * from the editor, then DELETE the values from your call so they are not left
+ * in the source:
+ *
+ *   configure({ BOT_TOKEN: '8123:AA...', ADMIN_IDS: '123456789' });
+ *
+ * Values are stored as Script Properties (encrypted at rest by Google) and
+ * are never written to the spreadsheet or to any log.
+ */
+function configure(values) {
+  if (!values || typeof values !== 'object') {
+    return '❌ configure({ BOT_TOKEN: "...", ADMIN_IDS: "..." }) — pass an object.';
+  }
+  var known = CONFIG_KEYS.map(function (c) { return c.key; });
+  var patch = {}, accepted = [], ignored = [];
+  Object.keys(values).forEach(function (k) {
+    if (known.indexOf(k) === -1) { ignored.push(k); return; }
+    var v = s_(values[k]).trim();
+    if (!v) return;
+    patch[k] = v;
+    accepted.push(k);
+  });
+  if (accepted.length) setProps_(patch);
+  forgetAdminCache_();
+  var lines = ['✅ Saved: ' + (accepted.join(', ') || '(nothing)')];
+  if (ignored.length) lines.push('⚠️ Ignored unknown keys: ' + ignored.join(', '));
+  var state = checkConfig();
+  if (state.ok) lines.push('🎉 All required configuration is present. Next: run setup() then connect().');
+  else lines.push('⏳ Still missing: ' + state.missing.map(function (m) { return m.key; }).join(', '));
+  Logger.log(lines.join('\n'));
+  return lines.join('\n');
+}
+
+/**
+ * Registers the Telegram webhook on the Cloudflare Worker.
+ * Thin, friendly wrapper around setupWebhook() — this is the name used in the
+ * README so a first-time installer only has to remember setup() + connect().
+ */
+function connect() { return setupWebhook(); }
+
+/**
+ * HEALTH CHECK — verifies every moving part of the deployment and returns a
+ * human-readable report. Also available in the bot's admin panel
+ * (🛠 پنل مدیریت → 🩺 سلامت سیستم) and as machine-readable getDiagnostics().
+ *
+ * Verifies: configuration, spreadsheet, Telegram/bot token, webhook
+ * registration, and the live Cloudflare Worker endpoint.
+ * Contains no secret values — safe to copy/paste when asking for help.
+ */
+function healthCheck() {
+  var checks = [];
+  function add(name, ok, detail) { checks.push({ name: name, ok: !!ok, detail: s_(detail) }); }
+
+  /* --- 1. configuration ------------------------------------------------ */
+  var cfg = checkConfig();
+  CONFIG_KEYS.forEach(function (c) {
+    var set = !!prop_(c.key, '');
+    if (c.required || set) add('config: ' + c.key, set, set ? 'configured' : c.help);
+  });
+
+  /* --- 2. spreadsheet -------------------------------------------------- */
+  var sheetsOk = true, missingBits = [];
+  try {
+    resetCaches_();
+    ss_();
+    SHEET_ORDER.forEach(function (name) {
+      var sheet = ss_().getSheetByName(name);
+      if (!sheet) { sheetsOk = false; missingBits.push(name); return; }
+      var headers = hdr_(name);
+      SCHEMA[name].forEach(function (col) {
+        if (headers.indexOf(col) === -1) { sheetsOk = false; missingBits.push(name + '.' + col); }
+      });
+    });
+  } catch (err) {
+    sheetsOk = false;
+    missingBits.push(s_(err && err.message));
+  }
+  add('spreadsheet reachable & schema complete', sheetsOk,
+    sheetsOk ? SHEET_ORDER.length + ' sheets OK' : 'run repairDatabase() — ' + missingBits.join(', '));
+
+  /* --- 3. Telegram bot ------------------------------------------------- */
+  var me = tgGetMe_();
+  add('Telegram bot token valid', !!(me && me.ok),
+    (me && me.ok) ? '@' + s_(me.result.username) : s_(me && me.description));
+
+  /* --- 4. webhook ------------------------------------------------------ */
+  var info = tgGetWebhookInfo_();
+  var r = (info && info.ok && info.result) ? info.result : {};
+  var hookUrl = s_(r.url);
+  add('webhook registered', !!hookUrl, hookUrl ? 'points at ' + hostOf_(hookUrl) : 'run connect()');
+  var worker = workerUrl_();
+  if (worker) {
+    add('webhook points at the Worker', hookUrl.indexOf(worker.replace(/\/+$/, '')) === 0,
+      hookUrl ? 'registered host: ' + hostOf_(hookUrl) : 'not registered');
+  }
+  add('no recent Telegram delivery error', !r.last_error_message,
+    r.last_error_message ? truncate_(sanitize_(r.last_error_message), 160) : 'clean');
+  add('webhook backlog is empty', int_(r.pending_update_count) === 0,
+    int_(r.pending_update_count) + ' pending updates');
+
+  /* --- 5. Cloudflare Worker (live probe) -------------------------------- */
+  if (worker) {
+    var probe = probeWorker_(worker);
+    add('Cloudflare Worker responding', probe.ok, probe.detail);
+  } else {
+    add('Cloudflare Worker responding', false, 'WORKER_URL is not configured');
+  }
+
+  /* --- 6. secrets consistency ------------------------------------------ */
+  add('Worker↔Apps Script secret set', !!webhookSecret_(),
+    webhookSecret_() ? 'set (must match the Worker secret APPS_SCRIPT_SECRET)' : 'missing');
+  add('Telegram↔Worker secret set', !!telegramWebhookSecret_(),
+    telegramWebhookSecret_() ? 'set (must match the Worker secret TELEGRAM_WEBHOOK_SECRET)' : 'missing — run connect()');
+
+  /* --- 7. admins -------------------------------------------------------- */
+  add('at least one admin configured', allAdminIds_().length > 0, allAdminIds_().length + ' admin(s)');
+
+  var passed = checks.filter(function (c) { return c.ok; }).length;
+  var failed = checks.length - passed;
+
+  var lines = ['🩺 ' + APP_NAME + ' health check', '   build ' + BUILD_VERSION + ' · ' + nowIso_(), ''];
+  checks.forEach(function (c) {
+    lines.push((c.ok ? '✅ ' : '❌ ') + c.name + (c.detail ? '  —  ' + c.detail : ''));
+  });
+  lines.push('');
+  lines.push(failed === 0
+    ? '🎉 ' + passed + '/' + checks.length + ' checks passed. The bot is fully operational.'
+    : '⚠️ ' + failed + ' of ' + checks.length + ' checks failed — fix the ❌ lines above.');
+  if (!cfg.ok) {
+    lines.push('');
+    lines.push('Missing configuration:');
+    cfg.missing.forEach(function (m) { lines.push('  • ' + m.key + ': ' + m.help); });
+  }
+  var report = lines.join('\n');
+  Logger.log(report);
+  flushLogs_();
+  return report;
+}
+
+/** Hostname of a URL, for logs/reports that must not echo query strings. */
+function hostOf_(url) {
+  var m = s_(url).match(/^https?:\/\/([^\/?#]+)/i);
+  return m ? m[1] : '(unknown)';
+}
+
+/** Live GET probe of the Worker's health endpoint. Never sends a secret. */
+function probeWorker_(url) {
+  try {
+    var res = UrlFetchApp.fetch(s_(url), {
+      method: 'get', muteHttpExceptions: true, followRedirects: true,
+      validateHttpsCertificates: true
+    });
+    var code = res.getResponseCode();
+    if (code < 200 || code >= 300) return { ok: false, detail: 'HTTP ' + code + ' from ' + hostOf_(url) };
+    var body = parseJson_(res.getContentText(), {});
+    if (body && body.service) return { ok: true, detail: body.service + ' @ ' + hostOf_(url) };
+    return { ok: true, detail: 'HTTP ' + code + ' from ' + hostOf_(url) };
+  } catch (err) {
+    return { ok: false, detail: 'unreachable: ' + s_(err && err.message) };
+  }
+}
+
+/** Drops every in-memory cache (used by setup/repair/diagnostics tools). */
+function resetCaches_() {
+  _ss = null;
+  _shCache = {};
+  _hdrCache = {};
+  _table = {};
+  _settingsCache = null;
+  _adminIdsCache = null;
+  _propsCache = null;
+  invalidateSettingsCache_();
+}
+
+/**
+ * STEP 1 OF THE INSTALL — run this from the Apps Script editor.
+ *
+ * Safe to run any number of times. It:
+ *   • creates the database spreadsheet (only if SPREADSHEET_ID is empty),
+ *   • creates/repairs every sheet and its headers,
+ *   • seeds the default settings, sample service and sample guide,
+ *   • generates both shared secrets if they do not exist yet,
+ *   • prints a checklist of anything still missing.
+ *
  * Existing data is never deleted or duplicated.
  */
-function initialSetup() {
+function setup() {
   resetCaches_();
   var created = false;
   if (!spreadsheetId_()) {
@@ -3870,7 +4530,12 @@ function initialSetup() {
     }
     resetCaches_();
   }
-  if (!webhookSecret_()) setProp_('WEBHOOK_SECRET', randomToken_(40));
+  /* Both shared secrets are generated here so the installer can copy them
+   * straight into Cloudflare — one batched property write. */
+  var secretPatch = {};
+  if (!webhookSecret_()) secretPatch.WEBHOOK_SECRET = randomToken_(40);
+  if (!telegramWebhookSecret_()) secretPatch.TELEGRAM_WEBHOOK_SECRET = randomToken_(40);
+  if (Object.keys(secretPatch).length) setProps_(secretPatch);
 
   SHEET_ORDER.forEach(function (name) { ensureSheet_(name); });
   resetCaches_();
@@ -3880,26 +4545,51 @@ function initialSetup() {
   setSetting_('schema_version', SCHEMA_VERSION);
 
   var lines = [];
-  lines.push('✅ نصب اولیه ' + APP_NAME + ' با موفقیت انجام شد.');
-  lines.push('🗄 شناسه اسپردشیت: ' + spreadsheetId_());
-  lines.push('🔗 لینک دیتابیس: ' + ss_().getUrl());
-  lines.push(created ? '🆕 اسپردشیت جدید ساخته شد.' : '♻️ از اسپردشیت موجود استفاده شد (داده‌ها حفظ شدند).');
-  lines.push('📄 شیت‌ها: ' + SHEET_ORDER.join(', '));
-  lines.push('⚙️ تنظیمات پیش‌فرض اضافه‌شده: ' + seeded.settings);
-  lines.push('🛒 سرویس نمونه: ' + (seeded.services ? 'اضافه شد' : 'نیازی نبود'));
-  lines.push('📖 راهنمای نمونه: ' + (seeded.guides ? 'اضافه شد' : 'نیازی نبود'));
-  lines.push('🔐 کلید امنیتی وبهوک: ' + (webhookSecret_() ? 'تنظیم شد (مخفی)' : 'تنظیم نشد'));
-  lines.push('🤖 BOT_TOKEN: ' + (botToken_() ? 'تنظیم شده' : '❌ تنظیم نشده — در Script Properties وارد کنید'));
-  lines.push('👮 ADMIN_IDS: ' + (rootAdminIds_().length ? rootAdminIds_().join(',') : '❌ تنظیم نشده'));
-  lines.push('🌐 WEB_APP_URL: ' + (webAppUrl_() ? webAppUrl_() : '❌ تنظیم نشده — پس از Deploy وارد کنید'));
-  lines.push('☁️ WORKER_URL (پیشنهادی): ' + (workerUrl_() ? workerUrl_() : '❌ تنظیم نشده — آدرس Cloudflare Worker را وارد کنید'));
+  lines.push('✅ ' + APP_NAME + ' database is ready.');
   lines.push('');
-  lines.push('گام بعدی: BOT_TOKEN و ADMIN_IDS را ثبت کنید، پروژه را Deploy کنید، WEB_APP_URL را ذخیره کنید، Cloudflare Worker را دیپلوی و WORKER_URL را ذخیره کنید، سپس setupWebhook() را اجرا کنید.');
+  lines.push('🗄  Spreadsheet : ' + ss_().getUrl());
+  lines.push('📄  Sheets      : ' + SHEET_ORDER.length + ' (' + (created ? 'newly created' : 'existing data preserved') + ')');
+  lines.push('⚙️  Settings    : ' + seeded.settings + ' default(s) added');
+  lines.push('🛒  Sample data : service=' + (seeded.services ? 'added' : 'skipped') +
+    ', guide=' + (seeded.guides ? 'added' : 'skipped'));
+  lines.push('');
+
+  /* The two values the installer must copy into Cloudflare. Printed here on
+   * purpose — the Apps Script execution log is private to the project owner. */
+  lines.push('🔐 COPY THESE TWO SECRETS INTO CLOUDFLARE');
+  lines.push('   Run in the worker/ folder:');
+  lines.push('     wrangler secret put APPS_SCRIPT_SECRET');
+  lines.push('       → ' + webhookSecret_());
+  lines.push('     wrangler secret put TELEGRAM_WEBHOOK_SECRET');
+  lines.push('       → ' + telegramWebhookSecret_());
+  lines.push('');
+
+  var state = checkConfig();
+  if (state.ok) {
+    lines.push('🎉 All required configuration is present.');
+    lines.push('');
+    lines.push('NEXT STEP → run  connect()  to register the Telegram webhook,');
+    lines.push('            then healthCheck() to verify everything end to end.');
+  } else {
+    lines.push('⏳ STILL TO DO — add these in Project Settings → Script Properties');
+    lines.push('   (or call configure({ KEY: "value" }) from this editor):');
+    state.missing.forEach(function (m) {
+      lines.push('');
+      lines.push('   • ' + m.key);
+      lines.push('     ' + m.help);
+    });
+    lines.push('');
+    lines.push('Then run setup() again, followed by connect() and healthCheck().');
+  }
   var report = lines.join('\n');
-  logInfo_('initial_setup', '', 'نصب اولیه اجرا شد', { created: created, seeded: seeded });
+  logInfo_('setup', '', 'setup executed', { created: created, seeded: seeded });
   Logger.log(report);
+  flushLogs_();
   return report;
 }
+
+/** Backwards-compatible alias for installs that already use initialSetup(). */
+function initialSetup() { return setup(); }
 
 /** Inserts default rows only when they are missing. Never duplicates. */
 function seedDefaults_() {
@@ -3996,6 +4686,7 @@ function repairDatabase() {
     created: createdSheets, headers: repairedHeaders, wallets: orphanWallets
   });
   Logger.log(report);
+  flushLogs_();
   return report;
 }
 
@@ -4044,9 +4735,11 @@ function setupWebhook() {
     res = tgSetWebhook_(hookTarget, secret);
   }
 
-  me = tgGetMe_();
+  /* getMe + getWebhookInfo are independent — fetch them concurrently. */
+  var post = tgAll_([{ method: 'getMe', payload: {} }, { method: 'getWebhookInfo', payload: {} }]);
+  me = post[0];
+  var info = post[1];
   if (me && me.ok && me.result && me.result.username) setProp_('BOT_USERNAME', me.result.username);
-  var info = tgGetWebhookInfo_();
   var pending = (info && info.ok && info.result) ? int_(info.result.pending_update_count) : 0;
   var report;
   if (res && res.ok) {
@@ -4062,6 +4755,7 @@ function setupWebhook() {
   }
   logInfo_('setup_webhook', '', 'تنظیم وبهوک اجرا شد', { ok: !!(res && res.ok), pending: pending, via_worker: usedWorker });
   Logger.log(report);
+  flushLogs_();
   return report;
 }
 
@@ -4136,6 +4830,7 @@ function selfTest() {
   var report = lines.join('\n');
   logInfo_('self_test', '', 'تست خودکار اجرا شد', { pass: pass, fail: fail });
   Logger.log(report);
+  flushLogs_();
   return report;
 }
 

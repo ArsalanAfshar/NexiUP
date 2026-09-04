@@ -1,16 +1,21 @@
-## Copy this file to ".dev.vars" for local development with `wrangler dev`.
-## ".dev.vars" is git-ignored and must never be committed.
-## In production these same names are set with `wrangler secret put <NAME>`.
+# Copy this file to ".dev.vars" for local development with `wrangler dev`.
+# ".dev.vars" is git-ignored and must NEVER be committed.
+# In production these same names are set with `wrangler secret put <NAME>`.
 
-# Must be IDENTICAL to the WEBHOOK_SECRET Script Property in Google Apps Script.
-# Used by the Worker as the "?s=" query-string secret when forwarding to Apps Script.
-APPS_SCRIPT_SECRET=replace-with-the-same-value-as-WEBHOOK_SECRET-in-Apps-Script
-
-# The Apps Script Web App "/exec" URL (Deploy > New deployment > Web app).
+# The Apps Script Web App URL (Deploy > New deployment > Web app).
+# Must be the production /exec URL, not /dev.
 APPS_SCRIPT_URL=https://script.google.com/macros/s/REPLACE_WITH_YOUR_DEPLOYMENT_ID/exec
 
-# A secret only the Worker and Telegram know. Generate with:
-#   openssl rand -hex 32
-# Passed to Telegram's setWebhook as `secret_token`; Telegram echoes it back
-# on every request as the "X-Telegram-Bot-Api-Secret-Token" header.
-TELEGRAM_WEBHOOK_SECRET=replace-with-a-long-random-string
+# Must be IDENTICAL to the WEBHOOK_SECRET Script Property in Apps Script.
+# setup() prints this value for you — copy it from the execution log.
+APPS_SCRIPT_SECRET=paste-the-WEBHOOK_SECRET-printed-by-setup
+
+# Must be IDENTICAL to the TELEGRAM_WEBHOOK_SECRET Script Property.
+# setup() prints this one too. Telegram echoes it back on every request as
+# the "X-Telegram-Bot-Api-Secret-Token" header, and the Worker verifies it.
+TELEGRAM_WEBHOOK_SECRET=paste-the-TELEGRAM_WEBHOOK_SECRET-printed-by-setup
+
+# Local testing only: lets you POST fake updates without the secret header.
+# Never set this in production — the Worker deliberately fails closed without
+# a configured TELEGRAM_WEBHOOK_SECRET.
+# ALLOW_UNVERIFIED=true
