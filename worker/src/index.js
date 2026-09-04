@@ -1,61 +1,67 @@
 /**
  * NexiUP — Telegram → Cloudflare Worker → Google Apps Script gateway.
  *
- * This is the ONLY piece of the request path that talks to Telegram directly.
- * Its job is intentionally small and defensive:
+ * WHY THIS WORKER EXISTS
+ * ----------------------
+ * 1. Google Apps Script's `/exec` endpoint answers a POST with an HTTP 302
+ *    redirect to script.googleusercontent.com. Telegram does not follow
+ *    redirects and marks the webhook broken ("Wrong response ... 302 Found").
+ *    `fetch()` inside a Worker DOES follow redirects, so the hop is consumed
+ *    here and Telegram never sees it.
+ * 2. Apps Script can take seconds to run. Telegram only needs a fast 2xx from
+ *    the webhook; it does not care what happens to the update afterwards.
+ *    We answer in single-digit milliseconds and forward in the background via
+ *    `ctx.waitUntil()`, so bot latency is bounded by Apps Script alone — never
+ *    by Telegram's webhook timeout or retries.
  *
- *   1. Validate that the request really comes from Telegram by comparing the
- *      "X-Telegram-Bot-Api-Secret-Token" header against the TELEGRAM_WEBHOOK_SECRET
- *      secret (constant-time compare, no early-exit timing leak).
- *   2. Answer Telegram with a fast, real "200 OK" IMMEDIATELY — Telegram only
- *      cares that the webhook endpoint responds quickly with 2xx. It does not
- *      wait for (and does not care about) what happens to the update afterwards.
- *   3. Forward the raw update to the Google Apps Script Web App in the
- *      background via `ctx.waitUntil()`, so the forward never delays or can
- *      break the response already sent to Telegram.
- *   4. `fetch()` inside a Worker follows HTTP redirects by default
- *      (`redirect: "follow"`). Google Apps Script's `/exec` endpoint answers
- *      every request with an HTTP 302 to `script.googleusercontent.com`
- *      before returning the real body. Because the Worker follows that
- *      redirect transparently, Telegram never sees it — it only ever sees the
- *      Worker's own 200 response from step 2. This is what fixes the classic
- *      "Wrong response from the webhook: 302 Found" Telegram error.
+ * DESIGN RULES
+ * ------------
+ * - The request path stays microscopic. Nothing between reading the body and
+ *   returning 200 may block, allocate heavily, or await the network.
+ * - Secrets never appear in a response body, a log line, or an error message.
+ * - Failures are logged as structured JSON and are always non-fatal: Telegram
+ *   still gets its 200 so it does not retry-storm us.
  *
- * IMPORTANT — why this file previously "did nothing":
- *   `wrangler.toml` declares `main = "src/index.js"`, but this file did not
- *   exist in the repository. Any Worker actually deployed to Cloudflare was
- *   therefore either a stale/placeholder script created by hand in the
- *   dashboard (typically the default "Hello World" template, which always
- *   answers 200 without forwarding anything) or a build that could not have
- *   come from this repo. That fully explains the reported symptom: "Worker
- *   returns 200 OK, but doPost never runs on Apps Script". Restoring this
- *   file and redeploying with `wrangler deploy` is the actual fix.
+ * BINDINGS
+ *   APPS_SCRIPT_URL          [var]    the /exec Web App URL
+ *   APPS_SCRIPT_SECRET       [secret] == Apps Script's WEBHOOK_SECRET
+ *   TELEGRAM_WEBHOOK_SECRET  [secret] == the secret_token given to setWebhook
  */
 
-const TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token";
-const FORWARD_TIMEOUT_MS = 20000;
-const FORWARD_MAX_ATTEMPTS = 2;
-const FORWARD_RETRY_DELAY_MS = 300;
+const TELEGRAM_SECRET_HEADER = "x-telegram-bot-api-secret-token";
 
-/** Constant-time string comparison (mitigates timing attacks on the secret). */
+/** Forwarding budget. Apps Script is slow; Workers allow generous waitUntil. */
+const FORWARD_TIMEOUT_MS = 25000;
+const FORWARD_MAX_ATTEMPTS = 3;
+const FORWARD_BASE_DELAY_MS = 250;
+
+/** Refuse absurd bodies outright — a real Telegram update is a few KB. */
+const MAX_BODY_BYTES = 1024 * 1024;
+
+/* ----------------------------- small helpers ----------------------------- */
+
+/**
+ * Constant-time string comparison. A plain `a === b` short-circuits on the
+ * first differing byte, which leaks the secret one character at a time to an
+ * attacker who can measure response times.
+ */
 function timingSafeEqual(a, b) {
   const enc = new TextEncoder();
-  const aBytes = enc.encode(typeof a === "string" ? a : "");
-  const bBytes = enc.encode(typeof b === "string" ? b : "");
-  const len = Math.max(aBytes.length, bBytes.length, 1);
-  let diff = aBytes.length === bBytes.length ? 0 : 1;
-  for (let i = 0; i < len; i++) {
-    diff |= (aBytes[i] || 0) ^ (bBytes[i] || 0);
-  }
+  const x = enc.encode(typeof a === "string" ? a : "");
+  const y = enc.encode(typeof b === "string" ? b : "");
+  const len = Math.max(x.length, y.length, 1);
+  let diff = x.length === y.length ? 0 : 1;
+  for (let i = 0; i < len; i++) diff |= (x[i] || 0) ^ (y[i] || 0);
   return diff === 0;
 }
 
-function json(body, status) {
+function json(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
-    status: status || 200,
+    status,
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
+      ...extraHeaders,
     },
   });
 }
@@ -63,42 +69,100 @@ function json(body, status) {
 function requestId() {
   try {
     return crypto.randomUUID();
-  } catch (e) {
-    return "rid_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
+  } catch {
+    return `rid_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   }
+}
+
+/**
+ * Structured JSON logger (visible via `wrangler tail` and Workers Logs).
+ * `redact()` is applied to every value so a secret can never reach a log line,
+ * even if a future code path accidentally passes one in.
+ */
+function makeLogger(rid, env) {
+  const secrets = [env.APPS_SCRIPT_SECRET, env.TELEGRAM_WEBHOOK_SECRET].filter(
+    (v) => typeof v === "string" && v.length >= 8
+  );
+  const redact = (value) => {
+    if (typeof value !== "string") return value;
+    let out = value;
+    for (const s of secrets) out = out.split(s).join("[REDACTED]");
+    // Defence in depth: never log a Telegram bot token even if one appears.
+    return out.replace(/\b\d{6,}:[A-Za-z0-9_-]{30,}\b/g, "[REDACTED_TOKEN]");
+  };
+
+  return function log(level, message, meta = {}) {
+    const safeMeta = {};
+    for (const [k, v] of Object.entries(meta)) safeMeta[k] = redact(v);
+    const line = JSON.stringify({
+      level,
+      message: redact(message),
+      rid,
+      ts: new Date().toISOString(),
+      ...safeMeta,
+    });
+    if (level === "error") console.error(line);
+    else if (level === "warn") console.warn(line);
+    else console.log(line);
+  };
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
 }
 
+/** Extracts just enough from an update to make logs useful — never content. */
+function summarizeUpdate(rawBody) {
+  try {
+    const u = JSON.parse(rawBody);
+    return {
+      updateId: u.update_id,
+      kind: u.message ? "message" : u.callback_query ? "callback_query" : "other",
+    };
+  } catch {
+    return { updateId: null, kind: "unparseable" };
+  }
+}
+
+/* ------------------------------ forwarding ------------------------------- */
+
 /**
- * Forwards the raw Telegram update to the Apps Script Web App.
- * Runs inside ctx.waitUntil() — Telegram has already received its 200 OK by
- * the time this executes, so latency/errors here never affect delivery.
+ * Forwards the raw update to the Apps Script Web App.
+ * Runs inside ctx.waitUntil(): Telegram already has its 200, so latency and
+ * errors here can never affect delivery or trigger a Telegram retry.
  */
 async function forwardToAppsScript(env, rawBody, rid, log) {
   const baseUrl = (env.APPS_SCRIPT_URL || "").trim();
   if (!baseUrl) {
-    log("error", "APPS_SCRIPT_URL is not configured — update was NOT forwarded", { rid });
+    log("error", "APPS_SCRIPT_URL is not configured — update was NOT forwarded", {
+      fix: "wrangler.toml [vars] APPS_SCRIPT_URL, then `npx wrangler deploy`",
+    });
     return;
   }
-  if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(baseUrl)) {
-    log("warn", "APPS_SCRIPT_URL does not look like a production /exec deployment URL", {
-      rid,
-      url: baseUrl,
+  if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec$/.test(baseUrl)) {
+    log("warn", "APPS_SCRIPT_URL does not look like a production /exec URL", {
+      // The URL is not a secret, but truncate so logs stay readable.
+      url: baseUrl.slice(0, 80),
+    });
+  }
+  if (!env.APPS_SCRIPT_SECRET) {
+    log("warn", "APPS_SCRIPT_SECRET is not set — Apps Script will reject this update", {
+      fix: "npx wrangler secret put APPS_SCRIPT_SECRET",
     });
   }
 
-  const secret = env.APPS_SCRIPT_SECRET || "";
-  const separator = baseUrl.indexOf("?") === -1 ? "?" : "&";
-  const targetUrl = baseUrl + separator + "s=" + encodeURIComponent(secret) + "&rid=" + encodeURIComponent(rid);
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  const targetUrl =
+    baseUrl +
+    sep +
+    "s=" + encodeURIComponent(env.APPS_SCRIPT_SECRET || "") +
+    "&rid=" + encodeURIComponent(rid);
 
   for (let attempt = 1; attempt <= FORWARD_MAX_ATTEMPTS; attempt++) {
     const startedAt = Date.now();
@@ -113,91 +177,120 @@ async function forwardToAppsScript(env, rawBody, rid, log) {
         },
         FORWARD_TIMEOUT_MS
       );
-      const text = await response.text().catch(() => "");
       const elapsedMs = Date.now() - startedAt;
-      if (response.status >= 200 && response.status < 300) {
+
+      if (response.ok) {
         log("info", "forwarded update to Apps Script", {
-          rid,
           attempt,
           status: response.status,
           elapsedMs,
-          bodyPreview: text.slice(0, 150),
         });
         return;
       }
-      log("warn", "Apps Script responded with a non-2xx status", {
-        rid,
+
+      // Read the body only on failure — on success it is always "OK".
+      const text = await response.text().catch(() => "");
+      log("warn", "Apps Script returned a non-2xx status", {
         attempt,
         status: response.status,
         elapsedMs,
-        bodyPreview: text.slice(0, 300),
+        bodyPreview: text.slice(0, 200),
       });
+
+      // 4xx (except 429) means our request is wrong; retrying cannot help.
+      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+        log("error", "permanent error from Apps Script — not retrying", {
+          status: response.status,
+          hint:
+            response.status === 401 || response.status === 403
+              ? "APPS_SCRIPT_SECRET probably does not match Apps Script's WEBHOOK_SECRET"
+              : "check the Web App deployment (Execute as: Me, Access: Anyone)",
+        });
+        return;
+      }
     } catch (err) {
+      const timedOut = err && err.name === "AbortError";
       log("error", "forwarding to Apps Script failed", {
-        rid,
         attempt,
-        error: err && err.name === "AbortError" ? "timeout" : String((err && err.message) || err),
+        error: timedOut ? "timeout" : String((err && err.message) || err),
       });
     }
+
     if (attempt < FORWARD_MAX_ATTEMPTS) {
-      await new Promise((resolve) => setTimeout(resolve, FORWARD_RETRY_DELAY_MS));
+      // Exponential backoff: 250 ms, 500 ms.
+      await new Promise((r) => setTimeout(r, FORWARD_BASE_DELAY_MS * 2 ** (attempt - 1)));
     }
   }
-  log("error", "gave up forwarding update to Apps Script after all retries", { rid });
+  log("error", "gave up forwarding update after all retries", {
+    attempts: FORWARD_MAX_ATTEMPTS,
+  });
 }
 
-function makeLogger(rid) {
-  return function log(level, message, meta) {
-    const line = JSON.stringify({
-      level,
-      message,
-      rid,
-      ts: new Date().toISOString(),
-      ...meta,
-    });
-    if (level === "error") console.error(line);
-    else if (level === "warn") console.warn(line);
-    else console.log(line);
-  };
-}
+/* -------------------------------- handler -------------------------------- */
 
 export default {
   async fetch(request, env, ctx) {
     const rid = requestId();
-    const log = makeLogger(rid);
-    const url = new URL(request.url);
+    const log = makeLogger(rid, env);
 
-    // Lightweight health check — also what Telegram/you can curl to confirm
-    // the Worker itself is alive, independent of Apps Script.
+    let url;
+    try {
+      url = new URL(request.url);
+    } catch {
+      return json({ ok: false, error: "bad_request" }, 400);
+    }
+
+    /* ---- GET/HEAD: health endpoint. Reports configuration presence only,
+       never a secret value, so it is safe to expose publicly. ------------- */
     if (request.method === "GET" || request.method === "HEAD") {
+      const configured = {
+        apps_script_url: Boolean((env.APPS_SCRIPT_URL || "").trim()),
+        apps_script_secret: Boolean(env.APPS_SCRIPT_SECRET),
+        telegram_webhook_secret: Boolean(env.TELEGRAM_WEBHOOK_SECRET),
+      };
+      const ready = configured.apps_script_url && configured.apps_script_secret && configured.telegram_webhook_secret;
       return json({
         ok: true,
+        ready,
         service: "nexiup-telegram-gateway",
-        path: url.pathname,
+        configured, // booleans only — deliberately never the values
         time: new Date().toISOString(),
       });
     }
 
     if (request.method !== "POST") {
-      return json({ ok: false, error: "method_not_allowed" }, 405);
+      return json({ ok: false, error: "method_not_allowed" }, 405, { allow: "GET, HEAD, POST" });
     }
 
+    /* ---- Authenticate the caller as Telegram. -------------------------- */
     const expectedSecret = env.TELEGRAM_WEBHOOK_SECRET || "";
     const receivedSecret = request.headers.get(TELEGRAM_SECRET_HEADER) || "";
 
-    if (expectedSecret) {
-      if (!timingSafeEqual(receivedSecret, expectedSecret)) {
-        log("warn", "rejected request with invalid/missing secret token", {
-          ip: request.headers.get("cf-connecting-ip") || "",
-          hasHeader: !!receivedSecret,
-        });
-        return json({ ok: false, error: "unauthorized" }, 401);
-      }
-    } else {
-      // No secret configured yet: warn loudly but do not hard-fail, so the
-      // very first deployment is not accidentally bricked before secrets
-      // are set with `wrangler secret put`.
-      log("warn", "TELEGRAM_WEBHOOK_SECRET is not set — accepting request WITHOUT verification", {});
+    if (!expectedSecret) {
+      /* FAIL CLOSED. Previously an unset secret meant "accept everything",
+       * which let anyone who found the Worker URL inject forged Telegram
+       * updates straight into the bot (fake payments, fake admin actions).
+       * We now refuse, and say exactly how to fix it. */
+      log("error", "TELEGRAM_WEBHOOK_SECRET is not set — rejecting all webhook traffic", {
+        fix: "npx wrangler secret put TELEGRAM_WEBHOOK_SECRET",
+      });
+      return json({ ok: false, error: "gateway_not_configured" }, 503);
+    }
+
+    if (!timingSafeEqual(receivedSecret, expectedSecret)) {
+      log("warn", "rejected request with invalid or missing secret token", {
+        ip: request.headers.get("cf-connecting-ip") || "",
+        country: request.headers.get("cf-ipcountry") || "",
+        hasHeader: Boolean(receivedSecret),
+      });
+      return json({ ok: false, error: "unauthorized" }, 401);
+    }
+
+    /* ---- Read the body. ------------------------------------------------ */
+    const declaredLength = Number(request.headers.get("content-length") || 0);
+    if (declaredLength > MAX_BODY_BYTES) {
+      log("warn", "rejected oversized body", { bytes: declaredLength });
+      return json({ ok: false, error: "payload_too_large" }, 413);
     }
 
     let rawBody = "";
@@ -205,14 +298,24 @@ export default {
       rawBody = await request.text();
     } catch (err) {
       log("error", "failed to read request body", { error: String((err && err.message) || err) });
+      // Still 200: a retry from Telegram would almost certainly fail the same way.
+      return json({ ok: true, rid, forwarded: false });
     }
 
-    // Fire-and-forget forward. ctx.waitUntil() keeps the Worker alive long
-    // enough to finish the fetch() even though the response below is sent
-    // to Telegram immediately.
+    if (!rawBody) {
+      log("warn", "empty body — nothing to forward", {});
+      return json({ ok: true, rid, forwarded: false });
+    }
+
+    /* ---- Fire-and-forget forward, then answer Telegram immediately. ----- */
     ctx.waitUntil(forwardToAppsScript(env, rawBody, rid, log));
 
-    log("info", "accepted update, forwarding in background", { bytes: rawBody.length });
+    const { updateId, kind } = summarizeUpdate(rawBody);
+    log("info", "accepted update, forwarding in background", {
+      bytes: rawBody.length,
+      updateId,
+      kind,
+    });
 
     return json({ ok: true, rid });
   },

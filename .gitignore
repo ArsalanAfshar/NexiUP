@@ -1,36 +1,28 @@
-# Secrets — never commit these
+# ── Secrets — never commit ──────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
 .dev.vars
 worker/.dev.vars
+*.pem
+*.key
 
-# Cloudflare / Wrangler
-worker/.wrangler/
+# ── Cloudflare / Wrangler ───────────────────────────────────────────────────
 .wrangler/
+worker/.wrangler/
 
-# Node
+# ── Node ────────────────────────────────────────────────────────────────────
 node_modules/
-worker/node_modules/
 npm-debug.log*
-yarn-debug.log*
 yarn-error.log*
+package-lock.json
 
-# Next.js build output
-.next/
-out/
-build/
-dist/
-dist-ssr/
-*.local
+# ── Apps Script local sync (clasp) ──────────────────────────────────────────
+.clasp.json
+apps-script/.clasp.json
 
-# Editors / OS
-.vscode/*
-!.vscode/extensions.json
+# ── Editors / OS ────────────────────────────────────────────────────────────
+.vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
-# Apps Script local sync (if you use clasp)
-apps-script/.clasp.json
-.clasp.json

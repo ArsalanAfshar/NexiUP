@@ -1,27 +1,26 @@
-## NexiUP Telegram webhook gateway — Cloudflare Worker configuration.
-## No secrets belong in this file. Set them with `wrangler secret put <NAME>`.
+# ============================================================================
+#  NexiUP — Cloudflare Worker (Telegram webhook gateway)
+#  NEVER put a secret in this file. It is committed to git.
+#  Secrets are set with:  npx wrangler secret put <NAME>
+# ============================================================================
 
 name = "nexiup-telegram-gateway"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
-# Gives you a URL like https://nexiup-telegram-gateway.<your-subdomain>.workers.dev
+# Publishes to https://nexiup-telegram-gateway.<your-subdomain>.workers.dev
 workers_dev = true
 
-# Workers Logs (Cloudflare dashboard -> your Worker -> Logs) + `wrangler tail`.
-# Required for both to actually receive console.log/warn/error output.
+# Enables Workers Logs (dashboard) and `npx wrangler tail`.
 [observability]
 enabled = true
 head_sampling_rate = 1
 
-# Non-secret configuration only. APPS_SCRIPT_URL is not sensitive by itself
-# (it is useless without APPS_SCRIPT_SECRET), but if you prefer to keep it
-# fully private too, remove it from here and set it with
-# `wrangler secret put APPS_SCRIPT_URL` instead — the code does not care
-# whether a binding arrives via [vars] or as a secret.
 [vars]
+# ▼▼▼ THE ONLY LINE YOU MUST EDIT ▼▼▼
+# Paste your Apps Script Web App URL. It must be the production /exec URL.
 APPS_SCRIPT_URL = "https://script.google.com/macros/s/REPLACE_WITH_YOUR_DEPLOYMENT_ID/exec"
 
-# The following MUST be set as encrypted secrets, never written here:
-#   wrangler secret put APPS_SCRIPT_SECRET
-#   wrangler secret put TELEGRAM_WEBHOOK_SECRET
+# ── Required secrets (set via CLI, never written here) ──────────────────────
+#   npx wrangler secret put APPS_SCRIPT_SECRET       # = Apps Script WEBHOOK_SECRET
+#   npx wrangler secret put TELEGRAM_WEBHOOK_SECRET  # = secret_token given to setWebhook
