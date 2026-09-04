@@ -1,0 +1,16 @@
+{
+  "name": "nexiup-telegram-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker gateway that receives the Telegram webhook and forwards updates to the NexiUP Google Apps Script backend.",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "secrets": "echo 'Run: wrangler secret put APPS_SCRIPT_SECRET  &&  wrangler secret put TELEGRAM_WEBHOOK_SECRET'"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
