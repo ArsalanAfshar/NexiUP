@@ -613,12 +613,20 @@ export async function clearUserState(db, userId) {
   await db.prepare('DELETE FROM user_states WHERE user_id = ?').bind(userId).run();
 }
 
+/**
+ * @param {any} db
+ * @param {number|string} adminId
+ * @param {string} action
+ * @param {string} [targetType]
+ * @param {string|number} [targetId]
+ * @param {string} [details]
+ */
 export async function logAdminAction(db, adminId, action, targetType = '', targetId = '', details = '') {
   const now = new Date().toISOString();
   await db.prepare(`
     INSERT INTO admin_logs (admin_id, action, target_type, target_id, details, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).bind(adminId, action, targetType, String(targetId), details, now).run();
+  `).bind(adminId, action, targetType, String(targetId ?? ''), details, now).run();
 }
 
 export async function logError(db, error, context = '') {
@@ -5034,7 +5042,7 @@ export async function handleUserStateMessage(env, db, chatId, user, state, messa
 
     invalidateCache('admins');
     await clearUserState(db, user.id);
-    await logAdminAction(db, user.id, 'add_admin', 'admin', newAdminId, 'Added admin');
+    await logAdminAction(db, user.id, 'add_admin', 'admin', String(newAdminId), 'Added admin');
 
     await sendMessage(env.BOT_TOKEN, chatId, `✅ شناسه <code>${newAdminId}</code> با موفقیت به عنوان مدیر ثبت گردید.`);
     await renderAdminAdmins(env, db, chatId);
@@ -5587,7 +5595,7 @@ export async function handleCallbackQueryUpdate(env, db, query) {
   if (data.startsWith('adm_user_unban:')) {
     const uId = Number(data.split(':')[1]);
     await db.prepare('UPDATE users SET is_banned = 0, ban_reason = NULL WHERE id = ?').bind(uId).run();
-    await logAdminAction(db, from.id, 'unban_user', 'user', uId, 'Unbanned user');
+    await logAdminAction(db, from.id, 'unban_user', 'user', String(uId), 'Unbanned user');
     await sendMessage(env.BOT_TOKEN, chatId, `✅ کاربر <code>${uId}</code> با موفقیت رفع مسدودیت شد.`);
     await renderAdminUserDetail(env, db, chatId, uId, messageId);
     return;
