@@ -70,3 +70,5 @@ Retrieved 2026-10-20:
 ## Embedded QR library
 
 Project Nayuki QR-Code-generator, commit `3c6d0b3cefb4e049dc337e82237c9644399716a8`; `typescript-javascript/qrcodegen.ts` has a complete MIT notice. Transpiled once for vendoring, with its notice retained in worker.js. Deployment has no build step or package dependencies. Local PNG serialization is original NexiUP code; no subscription URL is sent to a QR service.
+
+The current Workers size rule was also rechecked against the official GitHub documentation source at commit `da69fa833be0a8dc9d9ed6d9429c8ee0c4efbd8e`: 64 MiB uncompressed, with no compressed-size limit. Native local-runtime checks and final file/bundle measurements are in [VERIFICATION.md](VERIFICATION.md).

@@ -1,337 +1,464 @@
-# NexiUP | نکسی آپ 🚀
+# NexiUP
 
-> ربات تلگرام متن‌باز، حرفه‌ای و کامل برای فروش و مدیریت سرویس‌های اشتراکی با پرداخت و تحویل دستی، پیاده‌سازی شده بر روی زیرساخت کاملاً رایگان Cloudflare Workers و دیتابیس Cloudflare D1.
+**[راهنمای کامل فارسی](README_FA.md)** · [Research and original-bot inventory](docs/RESEARCH.md) · [Verification](docs/VERIFICATION.md) · [Licenses](THIRD_PARTY.md)
+
+A single-file Telegram subscription-sales hub and **original Nahan-users-API-compatible node** for Cloudflare Workers + D1. Receipt approval provisions an account automatically. Paid and test accounts get one main-domain subscription URL, a locally generated PNG QR, and an authenticated, per-configuration Telegram fallback.
+
+> **Important scope and license decision:** this is not a verbatim Nahan fork. The inspected Nahan README claims MIT but its LICENSE is missing; a named ancestor reports GPL-2.0. No Nahan/edgetunnel source or HTML is copied into this MIT project. The node is an independent compatible implementation with a smaller embedded panel. Full upstream UI/feature parity is not claimed. See **Design decisions** and `THIRD_PARTY.md`.
 >
-> A complete, production-ready, open-source Telegram bot for selling and managing subscription services (manual payment & manual delivery), built on 100% free Cloudflare Workers and Cloudflare D1 database.
+> **Deployment status:** implemented and locally tested, not certified for production. No live Telegram bot, Cloudflare account deployment, Iranian mobile connection, or Android/iOS/Windows GUI import was tested here. Free-plan feasibility depends on measured CPU, requests, D1 writes and actual workload—not just script size.
 
----
+## 1. What is included
 
-### 🌐 انتخاب زبان / Select Language
-- [🇮🇷 راهنمای فارسی (مطالعه به زبان فارسی)](#-راهنمای-فارسی)
-- [🇬🇧 English Guide (Read in English)](#-english-guide)
+- Persian by default, selectable English, private-chat operation and first-use Terms acceptance.
+- Germany/USA catalog, real numeric daily/total traffic limits, validity, connection limit and integer prices. Location labels are **not proof of exit geography**.
+- Multiple card-transfer/other manual-payment instructions; photo/document/reference receipts; approve/reject with reason; full/split wallet payments; cancellation/refunds; configurable payment timeout.
+- Wallet top-ups/bonus, withdrawals, adjustments and an idempotent ledger; referral commissions; first-order offers; fixed/percentage coupons with durable global/per-user reservations.
+- Automatic account creation, safe node failover, renewal, usage lookup and subscription history. A paid order is retained on provisioning failure.
+- A designated automatic-test node, configurable quotas/validity/cooldown, durable grants, history and audited cooldown resets.
+- Independent, versioned operator profiles: Irancell/other networks and Hamrah-e Aval; both owner-supplied ECH resolvers produce separate entries under the **same account identity**.
+- Main-domain aggregation from stored node base configurations; profile changes update existing subscription responses without changing the URL or deploying code.
+- Actual QR PNGs without an external QR service; exact text URL in the photo caption; **«باز نشد؟ کانفیگ‌ها ارسال شوند»** sends actual complete Xray configurations, one per plain-text message when they fit.
+- Telegram admin menus for nodes, profiles, tests, plans, payments, guides, channels, coupons, texts, settings, users, subscriptions, orders, operations/recovery, withdrawals, broadcasts, statistics, usage, diagnostics, audit and backups.
+- Forced-channel membership (up to three), membership tracking/bot-permission checks, support tickets/replies, direct messages and forwarded-user quick replies when Telegram exposes the sender ID.
+- Segmented cursor-based broadcasts, 3-day/1-day/expired reminders, hourly opportunity for a daily report, audit and bounded cleanup.
+- Node VLESS/Trojan over TLS WebSocket/TCP, optional DNS-only UDP, multiple users, total/daily caps, expiry, per-isolate connection limits, clean IPs, per-user relay/host overrides, kill switch, dashboard, subscription information page, static camouflage and configuration backup/restore.
 
----
+The inventory of the original bot and its security defects is in `docs/RESEARCH.md`. Useful workflows were reimplemented; unsafe optional auth, manual account issuance, misleading availability claims and race-prone wallet logic were not retained. Existing v1 data migration has explicit boundaries in §18.
 
-<div id="-راهنمای-فارسی" dir="rtl">
+## 2. Architecture
 
-# 🇮🇷 راهنمای فارسی
-
-## ۱. معرفی پروژه
-
-**نکسی آپ (NexiUP)** یک پلتفرم جامع، مدرن و کاملاً مستقل برای فروش و مدیریت انواع سرویس‌های اشتراکی (نظیر کانفیگ‌های V2Ray، پروکسی، اکانت‌های اختصاصی و غیره) در بستر تلگرام است. این ربات به صورت **تک‌فایلی (`worker.js`)**، با معماری ماژولار و بدون نیاز به هیچ‌گونه سرور اختصاصی، هاست پولی، داکر یا بسته‌های سنگین npm طراحی شده است و به طور کامل روی لایه **رایگان (Free Tier)** سرویس‌های ابری Cloudflare اجرا می‌شود.
-
-هدف این پروژه، ارائه یک ابزار پایدار، امن و در عین حال به شدت پرسرعت است که هم برای کسب‌وکارهای فروش واقعی ایده‌آل باشد و هم جامعه برنامه‌نویسان بتوانند به سادگی آن را توسعه دهند.
-
-### ویژگی‌های کلیدی
-- **تک‌فایلی و بدون وابستگی**: تمام منطق ربات در قالب یک فایل جاوااسکریپت خالص (`worker.js`) قرار دارد.
-- **دیتابیس ابری رایگان**: ذخیره‌سازی داده‌ها در Cloudflare D1 (پایگاه داده SQL توزیع‌شده با عملکرد فوق‌العاده).
-- **راه‌اندازی فوق سریع (کمتر از ۵ دقیقه)**: صرفاً از طریق داشبورد کلودفلر و بدون نیاز به نصب هیچ نرم‌افزار، ترمینال یا دستور Wrangler.
-- **پرداخت کاملاً دستی و واقعی**: پشتیبانی از شماره کارت‌های متعدد، آدرس‌های ارز دیجیتال (تتر TRC20، تون و...) و تایید نهایی فیش توسط مدیریت بدون درگاه‌های ناپایدار.
-- **تحویل دستی و امن**: ارسال دقیق کانفیگ یا لینک سابسکرایب توسط مدیر با قابلیت کپی آسان (Monospace) و دسترسی همیشگی خریدار در بخش سرویس‌های من.
-- **عضویت اجباری پیشرفته (چند کاناله)**: امکان تعریف بی‌نهایت کانال عمومی یا خصوصی با بررسی موازی و فوق‌سریع عضویت و رهگیری اعضا.
-- **پنل مدیریت ۱۹ گانه درون تلگرام**: دسترسی به تمام ابزارهای مدیریتی بدون نیاز به محیط وب مجزا.
-- **داشبورد تحلیلی و آماری جامع**: گزارش‌های دوره‌ای (امروز، ۷ روز، ۳۰ روز، کل) با یک کوئری تجمیعی بسیار بهینه.
-- **سیستم کیف پول اتمیک**: واریز، برداشت، پرداخت ترکیبی و تاریخچه دوطرفه دقیق بدون ایجاد خطای تراکنش همزمان.
-- **سیستم رفرال و کمیسیون**: لینک اختصاصی برای هر کاربر، پورسانت نقدی درصدی و واریز خودکار به کیف پول با محافظت ضدتقلب.
-- **کدهای تخفیف منعطف**: تعریف تخفیف‌های درصدی یا ثابت با محدودیت تعداد مصرف، حداقل سفارش و تاریخ انقضا.
-- **امکانات خلاقانه هوشمند**: یادآورهای خودکار انقضای سرویس (۳ روز و ۱ روز قبل)، گزارش روزانه خودکار، سیستم تیکت و پیام مستقیم، لغو خودکار سفارش‌های معلق، بنر اطلاعیه سنجاق‌شده و پشتیبان‌گیری یک‌کلیکه در تلگرام.
-
----
-
-## ۲. بررسی محدودیت‌های پلن رایگان کلودفلر
-
-این پروژه به گونه‌ای معماری شده است که حتی در ترافیک‌های بالا به هیچ عنوان از سقف پلن رایگان Cloudflare عبور نکند:
-
-| شاخصه پلن رایگان | سقف مجاز کلودفلر | مصرف هوشمند نکسی آپ |
-| :--- | :--- | :--- |
-| **درخواست‌های Worker** | ۱۰۰,۰۰۰ درخواست در روز | پاسخ آنی با کد ۲۰۰ و انجام فرآیندها در پس‌زمینه با `waitUntil` |
-| **کوئری خواندن دیتابیس D1** | ۵,۰۰۰,۰۰۰ ردیف در روز | کش درون‌حافظه‌ای ایزوله برای تنظیمات، متن‌ها و عضویت‌ها (کاهش ۹۰٪ کوئری‌ها) |
-| **کوئری نوشتن دیتابیس D1** | ۱۰۰,۰۰۰ ردیف در روز | عدم درج رکورد اضافی در پیام‌های عادی و اجرای دسته‌ای کوئری‌ها با `db.batch()` |
-| **فضای ذخیره‌سازی D1** | ۵ گیگابایت | ذخیره فیش‌ها به عنوان `file_id` تلگرام بدون اشغال فضای دیتابیس |
-| **تعداد Subrequest در هر اجرا** | ۵۰ ساب‌ریکوئست | ارسال پیام‌های همگانی در بسته‌های ۲۵ تایی ایمن و سازگار |
-
----
-
-## ۳. راهنمای نصب گام‌به‌گام (فقط از داشبورد کلودفلر در ۵ دقیقه)
-
-برای راه‌اندازی این ربات نیازی به نصب نرم‌افزار، Node.js، گیت یا ترمینال ندارید. مراحل را به ترتیب زیر در داشبورد [Cloudflare Dashboard](https://dash.cloudflare.com) دنبال کنید:
-
-### گام اول: ساخت دیتابیس D1
-1. وارد حساب کلودفلر خود شوید.
-2. از منوی کناری به بخش **Storage & Databases** > **D1 SQL Database** بروید.
-3. روی دکمه **Create Database** کلیک کرده و نام آن را مثلاً `nexiup-db` قرار دهید.
-
-### گام دوم: ساخت Worker و بارگذاری کد
-1. از منوی کناری به بخش **Compute (Workers)** > **Workers & Pages** بروید.
-2. روی دکمه **Create Application** و سپس **Create Worker** کلیک کنید.
-3. یک نام دلخواه (مثلاً `nexiup-bot`) انتخاب کرده و روی **Deploy** بزنید.
-4. وارد صفحه Worker ساخته شده شوید و روی تب **Settings** کلیک کنید.
-5. به بخش **Bindings** بروید، روی **Add Binding** کلیک کرده و گزینه **D1 Database** را انتخاب نمایید:
-   - **Variable name**: دقیقاً عبارت `DB` (با حروف بزرگ).
-   - **D1 Database**: دیتابیسی که در گام اول ساختید (`nexiup-db`) را انتخاب کنید.
-   - روی **Save** کلیک نمایید.
-
-### گام سوم: تنظیم متغیرهای محیطی (Environment Variables)
-در همان تب **Settings** از صفحه Worker، به بخش **Variables and Secrets** بروید و متغیرهای زیر را اضافه کنید:
-
-| نام متغیر | نوع | اجباری؟ | توضیحات |
-| :--- | :--- | :--- | :--- |
-| `BOT_TOKEN` | Secret / Plaintext | **بله** | توکن ربات تلگرام دریافتی از BotFather@ |
-| `ADMIN_IDS` | Plaintext | **بله** | شناسه عددی تلگرام مدیران اصلی (با کاما جدا شوند: `12345678,98765432`) |
-| `WEBHOOK_SECRET` | Secret / Plaintext | اختیاری | یک رشته دلخواه و امن برای تایید اصالت درخواست‌های ارسالی تلگرام |
-| `SETUP_KEY` | Secret / Plaintext | اختیاری | کلید امنیتی جهت محافظت از آدرس نصب (مثلاً `mysecretsetup123`) |
-
-### گام چهارم: ذخیره کد و استقرار نهایی
-1. روی دکمه **Edit code** در گوشه بالای صفحه Worker کلیک کنید.
-2. تمام محتوای فایل `worker.js` موجود در این مخزن را کپی کرده و جایگزین محتوای ادیتور نمایید.
-3. دکمه **Deploy** را بزنید تا کد مستقر شود.
-
-### گام پنجم: اجرای جادوگر راه‌اندازی خودکار (/setup)
-آدرس اینترنتی Worker خود را بردارید (مثلاً `https://nexiup-bot.yourname.workers.dev`) و یک بار در مرورگر به این صورت باز کنید:
 ```text
-https://nexiup-bot.yourname.workers.dev/setup
+Customer / Admin
+       │ Telegram webhook (secret header)
+       ▼
+NexiUP hub ───────────── D1: users, ledger, orders, jobs, profiles, nodes
+       │                         │
+       │ HTTPS + node API key    └─ one cron: provisioning / delivery / upkeep
+       ├──────── Node DE ── its D1 ── VLESS/Trojan TCP
+       ├──────── Node US ── its D1 ── VLESS/Trojan TCP
+       └──────── Test node ─ its D1 ─ test accounts
+
+Client ─ HTTPS main-domain /sub/<random-token>
+       └─ all enabled representable operator variants, same UUID/account
+
+ROLE=all: hub + one local node; provisioning calls the node functions
+          in-process, without an HTTP self-fetch.
 ```
-*(اگر متغیر `SETUP_KEY` را تنظیم کرده‌اید، آن را به عنوان پارامتر اضافه کنید: `?key=mysecretsetup123`)*
 
-با باز کردن این آدرس:
-- تمام ۲۳ جدول و ایندکس‌های دیتابیس به صورت خودکار ساخته می‌شوند.
-- وبهوک تلگرام به همراه کلید مخفی و لیست رویدادها فعال می‌گردد.
-- دستورات استاندارد ربات تلگرام ثبت می‌شوند.
-- صفحه خوش‌آمدگویی و تایید موفقیت نصب به زبان فارسی نمایش داده خواهد شد!
+`ROLE=hub`: bot and main subscription domain. `ROLE=node`: panel/tunnels, no Telegram webhook. `ROLE=all` (default): both. Remote nodes still use HTTPS in `all`; only a registry entry explicitly marked `local:true` uses in-process calls. Only one local registry entry is allowed, preventing double-counting the same local capacity.
 
----
+Use a separate D1 per Worker, except that `all` naturally shares its one binding. Nodes do not need a cron. Creating more Workers in one account does **not** multiply account-wide Free allowances.
 
-## ۴. فعال‌سازی Cron Trigger برای وظایف هوشمند (اختیاری و رایگان)
+## 3. Requirements
 
-ربات بدون کران جاب هم کاملاً کار می‌کند؛ اما برای فعال شدن ارسال همگانی در پس‌زمینه، یادآورهای انقضای اشتراک (۳ روز و ۱ روز قبل)، لغو سفارش‌های پرداخت‌نشده و گزارش روزانه مدیریت، می‌توانید یک تریگر رایگان اضافه فرمایید:
-1. در صفحه Worker به تب **Settings** > **Triggers** بروید.
-2. در بخش **Cron Triggers** روی دکمه **Add Cron Trigger** کلیک کنید.
-3. الگوی زیر را ثبت فرمایید (اجرا هر ۱۰ دقیقه):
-   ```text
-   */10 * * * *
-   ```
+- Cloudflare Workers and D1; an HTTPS Worker origin or correctly routed custom domain.
+- A Telegram bot from `@BotFather`, your numeric Telegram user ID, and independent random secrets from a password manager.
+- For remote nodes, a **node-specific panel API key**, never the node master key.
+- Owner-supplied bank/owner details, prices, intended node endpoints and network settings. None are seeded as live deployment values.
+- A compatible, sufficiently recent Xray client for all advanced operator settings. Read §12 before promising compatibility.
+- Optional: Node **22.13+** for tests (`node:sqlite` is experimental in Node 22); Wrangler for CLI deployment. No Node or npm dependency runs in the Worker. No build step is required.
 
----
+Use must comply with Cloudflare Terms and local law. The software is educational and provided **without warranty**. Review any service-specific proxy restrictions before deploying; this project does not represent Cloudflare permission or an availability guarantee.
 
-## ۵. راهنمای مدیران ربات (اولین ورود)
+## 4. Verified Cloudflare Free limits
 
-1. وارد ربات تلگرام خود شوید و دستور `/start` یا `/admin` را ارسال نمایید.
-2. اگر آیدی عددی شما در متغیر `ADMIN_IDS` باشد، دکمه **👑 پنل مدیریت ربات** به منوی اصلی اضافه می‌گردد.
-3. در منوی مدیریت:
-   - از بخش **💳 روش‌های پرداخت**: شماره کارت یا آدرس کیف پول تتر خود را اضافه کنید.
-   - از بخش **🛒 سرویس‌ها**: پلن‌های پیش‌فرض را ویرایش یا پلن‌های جدید اضافه فرمایید.
-   - از بخش **📢 کانال اجباری**: در صورت تمایل، کانال‌های اسپانسر یا اطلاع‌رسانی خود را ثبت نمایید (ربات باید در کانال ادمین باشد).
-   - از بخش **📖 راهنماها**: متن‌های راهنمای نرم‌افزارهای اتصال برای اندروید، آیفون و ویندوز را طبق نیاز تغییر دهید.
+Verified **2026-10-20** against live official documentation. Workers limits were last updated October 12. [1](https://developers.cloudflare.com/workers/platform/limits/) Pricing includes Workers/KV/D1. [2](https://developers.cloudflare.com/workers/platform/pricing/) D1 has its own stricter query ceiling. [9](https://developers.cloudflare.com/d1/platform/limits/)
 
----
+| Resource | Published Free limit | NexiUP discipline / remaining risk |
+|---|---:|---|
+| Worker requests | 100,000/day **per account**, resets 00:00 UTC | Webhooks, not polling; one cron. Public traffic/abuse still counts. Monitor rather than promise it cannot be exceeded. |
+| HTTP and cron CPU | 10 ms/invocation | Small bounded jobs; cached configuration; fixed-mask QR; no heavy per-packet crypto. **Production CPU is unmeasured.** |
+| Memory | 128 MB/isolate | ≤64 accepted WebSockets/isolate, ≤1 MiB upstream queue/socket, bounded bodies, ≤100 node accounts; real memory must still be monitored. |
+| External subrequests | 50/invocation | Runtime guard at 40; ≤2 creation candidates per attempt; redirects disabled; no recursive Telegram retry. |
+| Internal-service subrequests | 1,000/invocation | Not a substitute for D1's stricter 50-query limit. |
+| D1 statements | 50/invocation | Runtime guard at 46, counting each batch statement; staged migrations and paginated jobs. Long tunnels close before exhausting their budget. |
+| Simultaneous outgoing connections | 6/invocation | Node attempts and Telegram deliveries are sequential; no large `Promise.all` fan-out. |
+| Script size | **64 MiB uncompressed; no compressed-size limit** | Dry-run bundle approximately **270 KiB**, gzip approximately **72 KiB**. The old 3 MB compressed estimate is no longer the published limit. Exact measurements: `docs/VERIFICATION.md`. |
+| Startup | 1 second | No startup I/O; local workerd startup succeeded. Production startup timing not measured. |
+| Cron triggers | 5/account | One on the hub/all Worker; none required on nodes. |
+| Workers | 100/account | Registry does not bypass this or account-wide quotas. |
+| Env values / size | 64/Worker, 5 KB each | Secrets referenced by name, operational values in D1. Leave room for each node key. |
+| D1 reads / writes | 5M rows read/day; 100k written/day/account | Indexed lookups, bounded lists, batched usage. **Index updates also count.** There is no assertion that all workloads fit. |
+| D1 storage | 10 databases; 500 MB/database; 5 GB/account | Receipt `file_id`s rather than images; retention and D1 exports. Audit/financial history needs operator retention planning. |
+| D1 row / parameters | 2 MB/row; 100 bound parameters/query | Input limits, small per-record statements; no unbounded JSON blobs of all users. |
+| D1 recovery | 7-day Free Time Travel | Additional private exports recommended. |
+| KV | 100k reads/day; 1k writes/deletes/lists/day; 1 GB; 1 write/sec/key | **Not used.** No KV binding or paid add-on is required. |
 
-## ۶. گردش کار خرید و تحویل سفارش‌ها
+Further official details: https://developers.cloudflare.com/d1/platform/pricing/ and https://developers.cloudflare.com/kv/platform/limits/.
 
-1. **انتخاب سرویس**: کاربر سرویس مورد نظر را مشاهده و انتخاب می‌کند.
-2. **پیش‌فاکتور و کد تخفیف**: سیستم فاکتور را صادر کرده و کاربر می‌تواند کد تخفیف خود را ثبت کند یا از موجودی کیف پول خود استفاده نماید.
-3. **پرداخت دستی یا ترکیبی**: کاربر بخشی یا کل مبلغ را پرداخت کرده و فیش بانکی را به صورت تصویر یا شماره پیگیری ارسال می‌کند.
-4. **هشدار آنی به تمام مدیران**: پیام حاوی مشخصات خریدار، مبلغ و تصویر فیش بلافاصله برای تمام مدیران ارسال می‌شود.
-5. **ارسال کانفیگ و تحویل**: مدیر دکمه **«✅ تایید و ارسال کانفیگ»** را لمس کرده، متن کانفیگ یا لینک سابسکرایب را می‌فرستد و ربات فوراً با فونت مونو و راهنمای اتصال آن را تحویل کاربر می‌دهد.
-6. **تمدید**: کاربر هر زمان با مراجعه به «سرویس‌های من» می‌تواند اشتراک خود را با یک کلیک تمدید نماید.
+**Usage writes are the likely constraint.** At a 30-second flush interval, a continuously busy isolate has up to 2,880 flush opportunities/day. Roughly `(1 batch row + U active usage rows) × 2,880 × busy isolates`, **plus indexes and bot writes**, can exhaust 100k writes quickly. This is a planning expression, not a measured guarantee. Raising `usage_flush_seconds` reduces writes but increases persistence/limit lag. There are no per-frame database writes.
 
----
+## 5. Dashboard-only deployment — exact first three steps
 
-## ۷. راهنمای بروزرسانی کد بدون از دست رفتن داده‌ها
+1. **Create D1:** Cloudflare → Storage & databases → D1 → Create database. Use a new database for an initial installation; export an existing v1 database before an upgrade.
+2. **Create the Worker and bind it:** Workers & Pages → Create application/Worker → Edit code → paste the **entire `worker.js`** → Deploy. Add a **D1 binding named exactly `DB`**. Set compatibility date `2026-10-20` and flag `global_fetch_strictly_public`.
+3. **Set role, identity and secrets:** Settings → Variables and Secrets. Set `ROLE` and `ADMIN_IDS` for hub/all. Add the required secrets from §6: `BOT_TOKEN`, `WEBHOOK_SECRET`, `CALLBACK_SECRET`, `SETUP_KEY`; add `MASTER_KEY` for node/all. Save/deploy the settings. Never paste secrets into Telegram, Git, a URL query or these examples.
 
-پایگاه داده D1 کاملاً مستقل از کد Worker ذخیره می‌شود. بنابراین:
-1. هر زمان نسخه جدیدی از `worker.js` در مخزن منتشر شد، کافیست به ویرایشگر کد Worker در کلودفلر بروید.
-2. کل کد جدید را جایگزین کرده و **Deploy** را بزنید.
-3. یک‌بار آدرس `/setup` را در مرورگر باز کنید تا مهاجرت‌های ساختار دیتابیس (در صورت وجود نسخه جدید) خودکار اجرا شوند.
-- هیچ داده، سفارش یا کاربری پاک نخواهد شد!
+Then:
 
----
+4. Open `https://<YOUR_WORKER_HOST>/setup`. GET only serves a form; it performs no privileged operation. Enter `SETUP_KEY` (hub/all) or `MASTER_KEY` (node) in the password field. Press **Initialize D1**. The UI makes separate authenticated POSTs: four migration groups, then seed/ready. Wait for `ready:true`. Do not use `?key=...`.
+5. On hub/all, enter the **main HTTPS origin**, without a path, and press **Save main origin**. This is the domain encoded in all new QR/text links. Configure its actual routing before use. Do not change this origin casually: old-domain URLs cannot redirect themselves after the old domain stops serving the Worker.
+6. On hub/all press **Register webhook**. This calls Telegram `setWebhook` with `secret_token`, `max_connections:4`, supported updates and no dropped pending updates; it registers commands and saves the bot username. Send `/start` and accept Terms. `/language` offers Persian/English.
+7. Add **one cron** on hub/all: `* * * * *`. Do not add the same cron to node-only Workers. Without it, automatic queued delivery/provisioning/upkeep does not progress unless an administrator uses the protected setup “process next” buttons.
+8. Complete first-time administration below, then issue a test purchase before enabling real sales.
 
-## ۸. پشتیبان‌گیری و بازگردانی اطلاعات (Backup & Restore)
+### Optional Wrangler
 
-### روش اول: پشتیبان‌گیری درون‌ربات (یک کلیک)
-- در پنل مدیریت ربات، به بخش **🔧 ابزارهای سیستم** بروید و دکمه **💾 دریافت فایل پشتیبان (Backup)** را بزنید. ربات یک فایل `.json` کامل شامل تمام تنظیمات، تعرفه‌ها، روش‌های پرداخت، متن‌ها، کانال‌ها و کدهای تخفیف به شما تحویل می‌دهد.
-- برای بازگردانی کافیست همان فایل را با کپشن `#import_nexiup` در پیوی ربات برای ادمین ارسال کنید.
+`wrangler.toml` contains no credentials. Replace `database_id` with your actual D1 ID, choose your role, and supply secrets with `wrangler secret put NAME` or the dashboard. Do not deploy the placeholder ID.
 
-### روش دوم: خروجی کامل D1 از داشبورد
-- در داشبورد کلودفلر وارد بخش **D1 SQL Database** شده، روی دیتابیس خود کلیک نمایید و از بخش **Settings** یا کنسول، دستور صادرات داده را اجرا فرمایید.
+```sh
+node --check worker.js
+npm test
+npx wrangler deploy --dry-run
+# Only after configuring your real bindings/secrets:
+npx wrangler deploy
+```
 
----
+Wrangler is optional development tooling, not a runtime dependency. Disable its development telemetry if desired with `WRANGLER_SEND_METRICS=false`. `nodejs_compat` is not needed.
 
-## ۹. سوالات متداول و عیب‌یابی (FAQ)
+## 6. Exact environment, secrets and bindings
 
-**سؤال: پس از ارسال پیام به ربات، هیچ پاسخی دریافت نمی‌کنم.**
-> **پاسخ:** مطمئن شوید توکن `BOT_TOKEN` درست است و یک‌بار آدرس `https://<worker-url>/setup` را باز کرده‌اید تا وبهوک در تلگرام فعال شود. همچنین بررسی کنید نام بایندینگ D1 دقیقاً با حروف بزرگ `DB` باشد.
+| Name | Kind | Roles | Meaning |
+|---|---|---|---|
+| `DB` | D1 binding | All | The Worker's database. No `KV`, `IOT_DB`, R2, Queue or Durable Object binding is required. |
+| `ROLE` | Variable | All | `hub`, `node`, or `all` (default). |
+| `ADMIN_IDS` | Variable or Secret | hub/all | Comma-separated positive numeric **private-user** IDs; up to five recipients. Owner IDs cannot be removed by Telegram admins. |
+| `BOT_TOKEN` | Secret | hub/all | Token obtained from BotFather. |
+| `WEBHOOK_SECRET` | Secret | hub/all | 32–256 random characters; Telegram-supported letters/digits/underscore/hyphen. Mandatory. |
+| `CALLBACK_SECRET` | Secret | hub/all | Separate 32–256-character random HMAC secret. Rotation invalidates old buttons; customers can reopen `/start`. |
+| `SETUP_KEY` | Secret | hub/all | Separate 32–256-character setup Bearer credential. |
+| `MASTER_KEY` | Secret | node/all | 32–256 random characters. No default `admin`, recovery URL or database-stored master key. Required before serving a node. |
+| `NODE_KEY_<NAME>` | Secret(s) | hub and corresponding node | On NexiUP nodes: separate 32–256-character panel keys. Register each reference in the node panel; give the hub its own copy in a Secret. Stock Nahan's generated shorter `nahan_*` keys are accepted only for stock adapters, with their upstream security limitations. |
+| `CF_ACCOUNT_ID` | Variable | hub/all, optional | Your real Cloudflare account ID for usage estimates. |
+| `CF_API_TOKEN` | Secret | hub/all, optional | Least-privileged account analytics-read token; no deployment rights needed. |
 
-**سؤال: ربات عضویت کاربران در کانال را تشخیص نمی‌دهد.**
-> **پاسخ:** ربات حتماً باید در کانال مذکور عضو و دارای دسترسی ادمین (Administrator) باشد تا دسترسی متد `getChatMember` برای آن باز شود. در پنل مدیریت از دکمه «🧪 تست دسترسی ربات» استفاده فرمایید.
+There is **no** implicit `NODE_API_KEY`, `MAIN_DOMAIN`, `HOST`, legacy `WORKER_ROLE`, or master-key fallback. Main URL, node URLs, test settings, payment details and profiles are D1 settings edited without source changes. Worker Secret installation/rotation itself is a Cloudflare settings action, not something the Telegram bot can securely perform for you.
 
-**سؤال: چگونه شناسه عددی تلگرام خود را پیدا کنم؟**
-> **پاسخ:** به ربات‌های نمایش شناسه مانند userinfobot@ پیام دهید تا آیدی عددی شما را نمایش دهد.
+## 7. D1, migrations, caching and idempotency
 
----
+`schema_version` tracks four idempotent migration groups using `CREATE TABLE/INDEX/TRIGGER IF NOT EXISTS`. Each protected setup call applies one group in a transactional batch; the final call seeds settings and profiles. Tables use the `nx_` prefix. Legacy bot tables and stock `kv_store` are not overwritten. Upgrades run the same protected initializer. Uninitialized public/tunnel requests fail closed rather than executing DDL on the hot path.
 
-## ۱۰. چک‌لیست آزمایش سلامت سیستم (Testing Checklist)
+D1 stores users, settings, catalog, orders, ledger, withdrawals, coupon reservations, nodes, operations, subscriptions, test slots/grants, locks, action rate limits, profiles/revisions, audit, conversations, webhook deduplication, delivery jobs, support, membership, broadcasts, panel accounts/keys/request receipts, usage and flush receipts. Monetary updates use conditional SQL, unique ledger keys and SQLite triggers inside `batch` transactions; the wallet is an auditable single-user balance ledger, **not an accounting-grade double-entry system**.
 
-- [ ] باز شدن صفحه `/setup` و دریافت نشان سبز برای هر ۳ مورد (دیتابیس، وبهوک، دستورات).
-- [ ] پاسخ صحیح به دستور `/start` و نمایش منوی اصلی.
-- [ ] باز شدن پنل مدیریت با ارسال `/admin` برای شناسه‌های موجود در `ADMIN_IDS`.
-- [ ] امکان ثبت سفارش تستی و رسیدن هشدار فیش برای مدیر.
-- [ ] تایید سفارش توسط مدیر و تحویل کانفیگ با فرمت کپی‌شونده به خریدار.
-- [ ] فعال بودن استعلام کانال اجباری و مسدود ماندن کاربر تا زمان عضویت.
-- [ ] کارکرد صحیح شارژ کیف پول و اعمال کد تخفیف.
+- One durable test slot per Telegram user prevents parallel bypass. A pending request is not cleared by a cooldown reset.
+- Stable operation IDs, persisted random account names, unique local identities, per-operation/per-node D1 leases and remote reconciliation prevent blind duplicate provisioning.
+- Stock Nahan has no transactional idempotent create API. Its node writes are serialized and spaced by 11 seconds to exceed the inspected 10-second config-cache TTL. **All other stock-node writers must be stopped.** An ambiguous mutation quarantines that node from other hub operations until reconciled. It is not treated as permission to create elsewhere.
+- Settings/profile caches are scoped to the binding and expire after **15 seconds**; local saves invalidate them immediately. HTTP subscription responses are `no-store`. Client applications have their own refresh interval; the advertised update interval is one hour, and manual refresh may be needed.
+- Webhook updates are claimed durably and completed after processing. Notifications use a durable outbox/cursor. Telegram lacks a send-message idempotency key: a crash after Telegram accepts a message but before cursor persistence can produce a duplicate **message**, not a second account or wallet credit.
+- There is no per-configuration tunnel identity. Every operator variant shares the same UUID/password and entitlement.
 
-</div>
+## 8. First-time admin setup and editing
 
----
+Send `/admin` in a private bot chat as an owner ID. Add any extra admins from **Users → user → Grant admin**; only configured owners can grant/revoke these admins. Every privileged callback and conversation continuation checks current authorization.
 
-<div id="-english-guide" dir="ltr">
+The editors intentionally use validated JSON rather than dozens of brittle text wizards:
 
-# 🇬🇧 English Guide
+1. Select a record under Nodes / Profiles / Plans / Settings, or **New**.
+2. Copy the displayed JSON, edit values, and send the complete object. Unknown fields, bad ranges and invalid structures are rejected. Use a JSON document when the object is too large for a Telegram message.
+3. Review the validated preview, then **Save and apply**. No active profile is replaced before confirmation. Disabling uses `enabled:false`, preserving historical references.
+4. Use **Roll back** on a profile to restore its previous schema-valid revision as a new, monotonically increasing version. “Known-good” here means **validated schema**, not a claim of a successful mobile-network test.
 
-## 1. Project Introduction
+Bot settings include main origin, support, currency, announcement, maintenance, order hours, referral percentage, first-order discount, top-up bonus, minimum amounts, maximum pending orders, report hour, Terms and platform import guides in both languages. Text overrides cover welcome/main/support/payment/test/approved/rejected messages; `{name}` and `{brand}` are supported. Limits/prices are appended from stored numeric data, not inferred from marketing prose.
 
-**NexiUP** is a complete, production-ready, open-source Telegram bot designed for selling and managing subscription services (e.g. V2Ray configs, VPN subscriptions, proxy credentials, premium accounts) using a **manual payment verification and manual delivery** model.
+## 9. Adding, editing and testing nodes
 
-It is engineered as a **single-file ES Module (`worker.js`)** running on Cloudflare's serverless edge infrastructure with **Cloudflare D1 SQL Database** as its sole storage backend. NexiUP requires no external servers, no paid third-party dependencies, no Docker containers, and no Wrangler CLI setup.
+### NexiUP node
 
-### Key Highlights
-- **Single-File Architecture**: The whole system is organized in `worker.js` with clearly documented sections for easy community maintenance.
-- **100% Free Tier Compliant**: Engineered specifically to fit comfortably within Cloudflare's generous free quotas (100k requests/day, 5M D1 read rows/day).
-- **Fast Dashboard-Only Setup**: Non-technical administrators can deploy and launch the bot in under 5 minutes directly from the Cloudflare web dashboard.
-- **Manual Payment Flow**: Support for bank card transfers, cryptocurrencies (USDT TRC20, TON, etc.), and transaction slip verification via Telegram photo receipts.
-- **Manual Subscription Delivery**: Admins review payment receipts, approve orders, and submit connection keys directly in Telegram; configs are formatted with one-tap copy blocks (`<code>...</code>`).
-- **Multi-Channel Forced Join**: Protect your service behind unlimited public or private channels with parallel membership checks and join/leave event tracking.
-- **Comprehensive In-Bot Admin Panel**: 19 operational submenus covering user profiles, order approvals, catalog management, guides, coupons, and wallet settlements.
-- **High-Performance Analytics Dashboard**: Real-time aggregated business metrics across multiple timeframes (today, 7 days, 30 days, all time) using single batch queries.
-- **Strict Double-Entry Ledger Wallet**: Atomic deposits, withdrawals, split payments, and referral commission bonuses without race conditions.
-- **Smart Automations**: Background broadcast queue processor, subscription expiry notifications (3-day and 1-day reminders), abandoned order auto-cancellation, and automated daily admin summaries.
+1. Deploy `ROLE=node`, bind its D1 and set a fresh `MASTER_KEY`. Initialize `/setup`; open `/<api_route>/dash` (initial route `sync`).
+2. In Cloudflare add a distinct Secret named, for example, `NODE_KEY_DE`. This is a **reference name**, not a provided credential.
+3. In the node dashboard **Keys**, submit `{"name":"hub","secret_ref":"NODE_KEY_DE"}`. Registration requires the master key but does not reveal it or the panel-key value. The same operation is `POST /<route>/api/keys`; keys can be revoked with DELETE `?id=`.
+4. In the hub's Cloudflare settings add the matching panel key as a Secret. In Telegram → Nodes → New fill the exact object below using **your** endpoint, route and reference. No secret value goes into D1/Telegram.
 
----
+```json
+{
+  "id": "de-primary",
+  "code": "de",
+  "label": "Germany sales",
+  "base_url": "https://<YOUR_NODE_HOST>",
+  "api_route": "sync",
+  "api_key_ref": "NODE_KEY_DE",
+  "max_users": 10,
+  "enabled": false,
+  "purpose": "sales",
+  "adapter": "nexiup",
+  "local": false
+}
+```
 
-## 2. Cloudflare Free Tier Compliance
+The hostname is an explicitly non-runnable placeholder. Preview/save, test the API, then enable. USA uses `code:"us"`. A dedicated test node uses `purpose:"test"`, a unique ID and an administrator-chosen code such as `test`. IDs/labels are local registry metadata, not assumed exit IPs.
 
-| Free Tier Resource | Cloudflare Daily Allowance | NexiUP Architectural Optimization |
-| :--- | :--- | :--- |
-| **Worker Invocations** | 100,000 req/day | Immediate 200 OK webhook response; background processing via `ctx.waitUntil`. |
-| **D1 Read Rows** | 5,000,000 rows/day | In-memory isolate caching for settings, text templates, and membership status (~90% query reduction). |
-| **D1 Write Rows** | 100,000 rows/day | Atomic batch statements (`db.batch`), deduplication checks, and zero writes on routine read events. |
-| **D1 Database Storage** | 5 GB | Photos and receipts are stored as Telegram `file_id` references, keeping database storage negligible. |
-| **Subrequests Per Run** | 50 subrequests | Broadcasts process in safe chunks of 25 users with rate-limit backoff. |
+For `all`, set `local:true`, use the actual same Worker origin, `adapter:"nexiup"`, and an empty `api_key_ref`. Calls stay in-process. A sales local node is used for tests only if explicitly selected with `allow_sales_node:true`.
 
----
+### Stock Nahan node
 
-## 3. Step-by-Step Installation (Dashboard Only, < 5 Mins)
+Choose `adapter:"nahan"`, `local:false`. Create a panel API key on that node, put it in a hub Secret and reference it. **Never use its master key.** The hub cannot remotely prove a long supplied string is not another server's master key; credential scope remains an operator responsibility. Short upstream `nahan_*` tokens are less robust than NexiUP keys; prefer NexiUP nodes for stronger idempotency/storage.
 
-No coding, local compilation, or command-line tools are required. Follow these steps in the [Cloudflare Dashboard](https://dash.cloudflare.com):
+Harden a stock node first: replace its default master, disable upstream auto-update/remote deployment and stop other bot/linked-panel configuration writers.
 
-### Step 1: Create a D1 Database
-1. Go to **Storage & Databases** > **D1 SQL Database** in the left sidebar.
-2. Click **Create Database**, name it (e.g. `nexiup-db`), and click **Create**.
+The users API uses GET list / GET `?id=`, POST create, PUT `?id=`, DELETE `?id=`, and POST `?id=&action=toggle|reset`, with `Authorization: Bearer …`. Create fields use actual `trafficLimit`, `dailyLimit`, `expiryDays`, `notes`, `connLimit`, `maxConfigs`. NexiUP also supports per-user `proxyIp`, `cleanIp`, `userNodes`, `userPanelUrl`, `userMode` and `userPorts`, plus exact `expiryMs` and `isPaused` on its own node. Names are unique and restricted to 1–64 ASCII letters/digits/underscore/hyphen. The compatible node subscription route treats the name as a bearer credential: use the hub-generated random names, not predictable human names, when creating directly through the panel/API.
 
-### Step 2: Create Worker and Bind D1
-1. Go to **Compute (Workers)** > **Workers & Pages**.
-2. Click **Create Application** > **Create Worker**, assign a name (e.g. `nexiup-bot`), and click **Deploy**.
-3. Open your newly created Worker and navigate to **Settings** > **Bindings**.
-4. Click **Add Binding** > **D1 Database**:
-   - **Variable name**: Type exactly `DB` (uppercase).
-   - **D1 Database**: Select your database (`nexiup-db`).
-   - Click **Save**.
+NexiUP's keys-registration contract deliberately references Worker Secrets rather than returning database-stored credentials. Arbitrary upstream `seg*`, `nat64`, custom-routing/cascade/deploy fields are **not** silently accepted by the independent node API. Global operator profiles provide the required masks/ECH instead. Stock base subscriptions must be TLS WebSocket VLESS/Trojan with the same actual account UUID; unsupported parameters or >4 distinct base entries fail explicitly. Turn off upstream fake ECH (`pbk=enabled`) before using the hub's real profiles.
 
-### Step 3: Configure Environment Variables
-In the same Worker **Settings** tab, open **Variables and Secrets** and add:
+Assignment chooses the lowest hub load/capacity ratio among enabled nodes with the **exact** selected sales location/purpose, then checks remote account count. It attempts at most two candidates; only preflight/definite non-mutating failures may fail over. At ≥80% capacity an admin notification is queued. Existing endpoint/location identity cannot be silently changed when it has accounts: add a new node for migration. Disabling a node stops new assignment, not existing customer delivery.
 
-| Variable | Type | Required | Description |
-| :--- | :--- | :--- | :--- |
-| `BOT_TOKEN` | Secret / Text | **Yes** | Telegram Bot API token obtained from @BotFather |
-| `ADMIN_IDS` | Text | **Yes** | Comma-separated list of numerical Telegram admin user IDs (e.g. `12345678,98765432`) |
-| `WEBHOOK_SECRET` | Secret / Text | Optional | Optional secret string to authenticate incoming Telegram webhooks |
-| `SETUP_KEY` | Secret / Text | Optional | Secret key parameter required to run or rerun the setup route (e.g. `mysecretkey`) |
+**Test node** checks authenticated API access. NexiUP stats can report `request.cf.colo` as the **Cloudflare edge**, not the tunnel exit. The stats field `request_country` is the requester’s country, not the edge/exit country. Proxy exit IP/country is explicitly “not verified”; the hub's own egress IP is never presented as the node exit. Verify exit location using an actually connected client and a trusted IP-check service.
 
-### Step 4: Paste Code and Deploy
-1. Click **Edit code** in the top right corner of the Worker page.
-2. Copy the entire contents of `worker.js` from this repository and paste it into the editor, replacing the placeholder code.
-3. Click **Deploy**.
+## 10. Plans, payment instructions and customer flow
 
-### Step 5: Execute One-Time Setup Route
-Open your Worker's public URL in your browser at the `/setup` endpoint:
+Plans require `id`, `name`, `description`, `days`, `daily_gb`, `total_gb`, `conn_limit`, `price`, `locations`, `enabled`, `reset_usage`, `max_configs`. These are numeric enforcement inputs. `0` for a traffic/connection cap means no cap at that **plan** level, not exemption from platform limits. Example editor defaults are disabled until reviewed. No live bank card, crypto address or purchasable sample plan is seeded.
+
+Under Payments add a name, bank card/account/owner details, instructions and enabled state. Multiple bank/crypto methods from the original workflow remain possible; an administrator still verifies the transfer. A receipt reference is not proof of settlement.
+
+Screenshots-as-text:
+
 ```text
-https://nexiup-bot.yourname.workers.dev/setup
+/start → Terms [Accept] → Buy subscription → Germany / USA
+→ Plan: duration + daily/total caps + per-isolate connection limit + price
+→ Invoice [Wallet] [Split] [Payment methods] [Coupon] [Cancel]
+→ Card/owner + exact remaining amount → receipt photo
+
+Admin: receipt + order/amount [Approve] [Reject with reason]
+Approve → pending → processing → queued provisioning → done
+Customer: [QR image]
+          https://<MAIN_HOST>/sub/<RANDOM_TOKEN>  (same photo caption)
+          [باز نشد؟ کانفیگ‌ها ارسال شوند]
+          limits + expiry + platform guide
 ```
-*(If you set a `SETUP_KEY`, append it to the URL: `?key=mysecretkey`)*
 
-The setup script automatically:
-- Creates all 23 database tables, indexes, and initial seed catalog entries.
-- Registers the Telegram webhook with secret token verification and allowed update types.
-- Configures default Telegram bot commands (`/start`, `/services`, `/myservices`, `/wallet`, `/test`, `/help`, `/admin`).
-- Displays a confirmation dashboard with step-by-step next actions.
+Unpaid `pending_payment` orders expire after `order_hours` (default 2), with the wallet portion refunded once. Submitted receipts and paid/processing orders are **not** automatically discarded. Manual-bank refunds require human support; the bot does not pretend to reverse a bank transfer.
 
----
+First-order offers and coupon uses are durable reservations; cancellations do not automatically restore coupon/first-offer availability. This conservative anti-abuse decision must be reflected in your Terms. Wallet top-ups and withdrawals do not count as subscription revenue. Referral credits are unique per completed paid order.
 
-## 4. Optional Cron Trigger Setup
+## 11. Automatic test subscriptions
 
-To enable automated background tasks (broadcast queue execution, subscription expiration reminders, and abandoned order cleanups):
-1. In your Worker's dashboard, go to **Settings** > **Triggers**.
-2. Under **Cron Triggers**, click **Add Cron Trigger**.
-3. Set the schedule to run every 10 minutes:
-   ```text
-   */10 * * * *
-   ```
+Defaults: **1 GB in Nahan's API (=1 GiB, 1,073,741,824 bytes)** total, **1 GiB/day**, **1 day**, **48 hours between successful grants**. Tests are initially **disabled** until the admin designates a node.
 
----
+Telegram → Test settings:
 
-## 5. First-Time Admin Workflow
+```json
+{
+  "enabled": false,
+  "traffic_gb": 1,
+  "daily_gb": 1,
+  "days": 1,
+  "cooldown_hours": 48,
+  "node_id": "",
+  "allow_sales_node": false
+}
+```
 
-1. Open your Telegram bot and type `/start` or `/admin`.
-2. As long as your numerical user ID is present in `ADMIN_IDS`, you will see the **👑 پنل مدیریت ربات** button.
-3. Access the admin panel to:
-   - Configure your payment details (bank card or crypto wallet) under **💳 روش‌های پرداخت**.
-   - Review or modify default plans under **🛒 سرویس‌ها**.
-   - Register required announcement channels under **📢 کانال اجباری** (make sure the bot is an admin in those channels).
-   - Customize connection guides under **📖 راهنماها**.
+Select an actual enabled test node, adjust any field, preview and save. No code deployment is needed. Test accounts use a fixed one-connection-per-isolate cap. To intentionally reuse a sales node, select its ID and explicitly set `allow_sales_node:true`; there is no implicit sales-node fallback.
 
----
+```text
+Customer: Get test configuration
+→ durable per-user slot + unique operation/account name
+→ designated node account created automatically
+→ successful issuance recorded → cooldown begins
+→ same main-domain URL / PNG QR / actual-config fallback as paid accounts
+```
 
-## 6. Upgrade & Migration Guide
+A known failure creates a failed grant record but consumes **no** cooldown. An uncertain remote result retains the pending slot while reconciling, rather than permitting another potentially duplicate grant. In Test history inspect node/status/time/error code. Test settings → Reset cooldown, or Users → user → Reset cooldown, clears the next-success deadline and writes an audit event; it never cancels an in-flight issuance.
 
-Because Cloudflare D1 storage exists independently of Worker code:
-1. When a new version of `worker.js` is released, simply copy the updated file and paste it into the Cloudflare Worker editor.
-2. Click **Deploy**.
-3. Open `https://<worker-url>/setup` in your browser once to apply any new database schema migrations.
-- Existing customers, orders, balances, and subscriptions remain intact!
+## 12. Operator profiles and compatibility
 
----
+The initial default set has three enabled entries per base transport: **one Irancell/other variant plus two Hamrah-e Aval variants**. A separate **standard profile is disabled by default** for clients that cannot express the advanced fields. All entries use the same customer account and limits; there are no per-operator duplicate entitlements.
 
-## 7. Backup and Restore
+### Irancell and other networks
 
-- **In-Bot JSON Backup**: Go to **🔧 ابزارهای سیستم** in the Telegram admin panel and click **💾 دریافت فایل پشتیبان (Backup)**. The bot compiles a complete snapshot of settings, services, payment methods, texts, channels, and coupons, delivering it directly to your Telegram chat.
-- **In-Bot Restore**: Simply send the backup JSON file back to the bot with the caption `#import_nexiup`.
-- **D1 Console Export**: Full SQL exports can be performed from the Cloudflare Dashboard under D1 settings.
+Editable defaults: `fingerprint:"unsafe"`, this `finalmask`, and the complete `cipher_suites` string below. The tutorial's example URI says `fp=chrome`; this implementation uses the stated `unsafe` setting because the inspected Xray parser explicitly accepts it. Certificate verification remains enabled (`allowInsecure:false`). This does **not** mean every GUI/URI importer supports it.
 
----
+```json
+{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["0","104","1"],"delays":["0"],"maxSplit":"0"}},{"type":"fragment","settings":{"packets":"1-1","lengths":["114","1"],"delays":["1"],"maxSplit":"11"}}]}
+```
 
-## 8. Security Considerations
+```text
+TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256
+```
 
-- **Webhook Verification**: Validates the `X-Telegram-Bot-Api-Secret-Token` header on every request when `WEBHOOK_SECRET` is configured.
-- **Strict Role-Based Access Control**: Verifies admin status on every admin callback and message before executing privileged actions.
-- **Parameterized SQL Queries**: All database interactions use prepared statements (`db.prepare().bind()`) preventing SQL injection.
-- **HTML Sanitization**: All user inputs (names, descriptions, rejection notes) are HTML-escaped before embedding in messages.
-- **Token Masking**: Bot tokens and secrets are never exposed in user responses, error logs, or diagnostics cards.
-- **Atomic Concurrency Controls**: Balance debits and status transitions check precondition locks to prevent double-spending or duplicate order approvals.
+Validation rejects unknown shapes, unsupported fingerprints/cipher names, descending/negative ranges, excess entries, and a last fragment length with minimum zero. Limits: ≤4 TCP masks, ≤8 lengths/delays per mask, delay/maxSplit bounds 1000, lengths ≤65535, finalmask JSON ≤1600 characters, cipher list ≤1800 bytes. These are implementation safety bounds, not network-performance advice.
 
----
+### Hamrah-e Aval
 
-## 9. Contributing
+`fingerprint:"chrome"`, ECH selection initially **both**:
 
-Contributions are welcome! Please follow these guidelines:
-1. Fork the repository and create a feature branch (`git checkout -b feature/amazing-feature`).
-2. Adhere to the single-file modular architecture within `worker.js`.
-3. Keep all customer-facing texts natural and RTL-friendly in Persian.
-4. Test changes locally or in a sandbox before opening a Pull Request.
+- `cloudflare-ech.com+udp://1.1.1.1`
+- `cloudflare-ech.com+udp://8.8.8.8`
 
----
+The `ech` array stores zero, one or both entries. Each selected resolver produces its **own** URI `ech=` and Xray `tlsSettings.echConfigList` scalar. Never concatenate them into a comma-list: the inspected Xray grammar accepts one `domain+resolver` string. Admins can edit domain/resolver strings, choose either resolver, enable/disable a profile, or add another independently named profile (≤6 profiles, ≤24 generated variants total; active per-base variant weights may sum to at most six so four bases also fit). No future method or IP was invented.
 
-## 10. License
+### Format matrix
 
-This project is open-source software licensed under the [MIT License](LICENSE).
-Copyright (c) 2026 NexiUP Contributors.
-</div>
+| Output | Advanced defaults | Important conditions |
+|---|---|---|
+| Default / `?format=base64` | All variants as encoded VLESS/Trojan URIs with `fp`, `fm`, `cs`, `ech` | Some clients silently ignore unknown URI parameters. Inspected v2rayNG imports `fp/fm/ech` but **not `cs`**. |
+| `?format=raw` | Same full URI entries as plain lines | Useful for inspection; not a promise of lossless GUI import. |
+| `?format=xray` / `vjson` / `v2ray` | Array of complete Xray JSON configurations | Each object has its own inbound/outbounds, correct TLS/WS fields, `finalmask`, `cipherSuites`, scalar ECH. Import individual objects if your client cannot import an array. Not a claim about old V2Ray-core support. |
+| `?format=clash` / `yaml` | Only profiles without Xray-only mask/ciphers/ECH/unsafe | YAML 1.2 using JSON flow syntax, with warnings; needs VLESS-capable Mihomo for VLESS. |
+| `?format=sing-box` / `singbox` | Same representable standard profiles | Proper WS transport and TLS structure; no invented Xray fields. |
+
+Unsupported variants in generic formats are explicitly reported in `X-NexiUP-Warnings` (and YAML comments). If **none** can be represented, HTTP **422** returns an Xray fallback URL, not malformed or empty configuration. The browser information page explains this. Standard variants are an explicit admin opt-in, not a silent downgrade.
+
+Source checks are pinned in `docs/RESEARCH.md`: Xray `92ccc939…` and v2rayNG `118cf5bc…`. Cipher list acceptance does not prove the TLS library can force TLS 1.3 ordering or every suite. Real ECH also depends on compatible Cloudflare hostname/ECH configuration, DNS reachability and client version. **No real Iranian operator test was performed.** Test on your actual devices/networks before enabling sales claims.
+
+## 13. One URL, QR and text fallback
+
+The public bearer URL is `https://<MAIN_HOST>/sub/<128-bit-random-token>`. Stored base transports allow the hub to respond without fetching an unavailable node. Profiles are rendered live from the latest active revisions. The normal client default is Base64; a browser requesting HTML gets a bilingual information page with format links and an embedded, same-origin QR route.
+
+The QR is an actual Model 2 medium-ECC QR rendered to a 1-bit PNG locally. Its pixels encode **exactly** the plain-text URL in its Telegram photo caption. No third party receives that URL for image generation.
+
+The fallback button is HMAC-bound to the private Telegram user and internal subscription ID. Ownership/status/expiry are rechecked. A durable 60-second user rate limit applies. Delivery snapshots contain **all** variants once, in order; each fitting message contains an operator label, import hint and complete compact Xray JSON. No HTML/Markdown parser can alter the config. For an oversized configuration the bot explains how to concatenate the next raw pieces without separators, avoids splitting URI `%XX` or Unicode pairs, and also sends an intact JSON document.
+
+A queued cursor survives 429 `retry_after`; the failed step is not skipped. Repeating a completed request later can intentionally send a new batch. Transport/network reachability remains separate: keeping the main URL reachable does **not** make a blocked tunnel SNI/node host reachable. Neither domain is promised always accessible in Iran.
+
+## 14. Renewal and failed-paid-order recovery
+
+Renewal creates a new bill but updates the **same** node UUID/account and main subscription token. New expiry is `max(now, current expiry) + purchased days`. NexiUP nodes accept an exact absolute `expiryMs`. Stock Nahan PUT interprets integer `expiryDays` **from now**; the hub rounds remaining days upward, so there may be **less than one extra day** of rounding, not loss of already-paid validity.
+
+A target expiry and operation marker are persisted before mutation. Retrying does not keep extending it. `reset_usage:false` is the default: existing usage is retained and caps are set to the new plan, not added. `true` explicitly resets counters and is explained before renewal/payment and on delivery. NexiUP reset keys are idempotent and epoch-fenced against old buffered traffic. A lost stock-reset response is **not** blindly repeated.
+
+In **Operations**:
+
+- Retry/reconcile uses the existing identity, never an arbitrary new name.
+- A definite failed test can reacquire its slot if no later successful/pending test occupies it.
+- An ambiguous stock create stays pinned/quarantined. Inspect the node independently; only then use **Confirm absent**. It performs another GET but the admin confirmation is essential because stock caches cannot prove absence.
+- For an uncertain stock reset, use **Confirm reset done** only after inspection.
+- Never reject/cancel a processing paid order as a shortcut. Recover it or arrange an explicitly audited customer refund outside the provisioning loop.
+
+Admin subscription controls support pause/resume, extension, delete, reset usage and **Refresh transports**. Base transports are snapshots taken at issue/renewal; after changing node clean IPs/ports/host aliases, use Refresh transports for the affected subscription. Operator-profile changes themselves remain live within 15 seconds. NexiUP nodes provide authenticated base retrieval via GET users `?id=…&action=configs`, including capped accounts; no account recreation is necessary. Destructive controls require confirmation; uncertain manual mutations are not automatically replayed.
+
+## 15. Node panel and tunnel behavior
+
+`/<api_route>/dash` is embedded, responsive and bilingual, with users, validated JSON settings, API-key references, stats, audit and paginated backup/restore. Credentials stay in page memory, not localStorage/cookies. Public root camouflage is a small static page, not a third-party website fetch. All HTML user data is escaped; scripts use `textContent` for API results. Unauthorized control APIs have per-isolate brute-force throttling and long required credentials.
+
+Panel configuration: API route, `protocol` (`vless`/`trojan`/`both`), clean IPs, admin-defined relay fallback IPs/hosts, user-node aliases, supported TLS ports, paused state, optional DoH `dns_url`, flush interval and tunnel lifetime. No clean IP, relay, geographic exit, or DNS endpoint is invented. Per-user hostnames must route to the **same account database**; merely entering another independent Worker hostname does not replicate users.
+
+- Only TLS WebSocket TCP tunnels; UDP is DNS-only, destination port 53, and requires an explicitly configured HTTPS DoH endpoint. No arbitrary UDP, SOCKS upstream, NAT64 conversion, cascade, remote deployment or automatic relay scanning is claimed.
+- Incoming client `proxyip` query strings are ignored. Only stored admin relay choices are tried, and only on initial connect failure before replayable application writes. Private/local destinations and SMTP port 25 are rejected.
+- ≤4 base transports/account; `maxConfigs` caps bases, **not** operator variants. An excessive combination fails visibly instead of trimming.
+- 100 stored-account safety cap/node; the hub's default registry capacity is 10. Expired/deleted account cleanup is an operator task, not proof of extra Free quota. Disable/delete old accounts from admin controls as appropriate.
+- Real upload/download bytes are accumulated without per-frame writes and flushed in additive D1 batches; unique batch receipts prevent duplicate accounting, and reset epochs reject old deltas. **Cross-isolate limits are eventually consistent**: simultaneous use can overshoot, and isolate eviction can lose unflushed tail bytes. They are not a financially exact global hard quota.
+- `connLimit` means concurrent tunnels **per isolate**, not a globally exact device count. Workers cannot impose a distributed exact count without additional coordination/writes; do not market it as “two devices guaranteed”.
+- Settings caches may lag 15 seconds; open tunnels refresh during usage cycles. Kill switch is not instantaneous across all isolates (normally cache + refresh interval). Long tunnels close after the configured maximum (default 600 seconds), or earlier to protect the D1 budget; clients must reconnect.
+
+Auto-update and remote deploy are **off and intentionally non-enableable** in this implementation. Metadata points to `ArsalanAfshar/NexiUP`. There is no telemetry/phone-home or startup GitHub fetch. Manual reviewed upgrades avoid turning an upstream compromise into remote execution. Reintroducing remote deployment needs an explicit security/license review and dedicated least-privilege credentials.
+
+## 16. Scheduling, usage screen and capacity planning
+
+One `* * * * *` cron partitions UTC minutes modulo six:
+
+| Slot | Work |
+|---|---|
+| 0, 2 | One queued provisioning/reconciliation operation |
+| 1, 3 | One delivery job, at most three steps (one-second per-chat pacing) |
+| 4 | At most two unpaid cancellations + two expiry reminders + bounded cleanup |
+| 5 | Broadcast up to five recipients; at minute 5 each hour, analytics/daily-report work instead |
+
+This conservative default offers about **20 operation attempts and 20 delivery-job visits/hour**, not a high-volume sales guarantee. An operation can need multiple visits; one order can generate several admin/customer jobs. Queue latency can be minutes or longer. Protected `/setup` process-next controls can advance one operation/job per request; never run an unbounded cron loop to compensate. Measure CPU and queue depth before changing schedules/batch sizes.
+
+Diagnostics shows a D1 read wall-time check, webhook/main-origin match, pending Telegram updates and operation/delivery counts without echoing credentials or raw remote error text. `/health` is only a liveness/version route, not a database-capacity test.
+
+Usage menu queries optional Cloudflare GraphQL analytics for **account-wide UTC-day requests** against 100,000 and queues daily-deduplicated warnings at 70% and 90%. It labels adaptive/delayed data as an estimate. Without API credentials it says “not configured”, not “0 used”. Account limits include other projects. D1 row use must also be checked in the Cloudflare dashboard; this bot screen is not a D1 billing meter.
+
+Choose customers/node from actual usage, concurrency, isolate count and daily write budget. Approximate traffic entitlement for `U` users with daily cap `D` is `U×D` GiB/day, but that does not establish a Cloudflare bandwidth allowance or operational capacity. Start with a few test users, inspect CPU p95/p99 and D1 rows, maintain headroom, and reduce traffic or move plans if the Free limits are exceeded. No VPS or paid add-on is required by the code; no workload is guaranteed to stay free.
+
+## 17. Backup and restore
+
+- Telegram **Backup** exports validated configuration by kind in pages of up to three records. It includes secret **references**, not secret values. Settings still contain private payment/support data; keep files private.
+- Send a v2 page as a JSON document with caption **`#import_nexiup`** as a current admin. All records are validated before per-record upserts; restoration is audited and non-destructive. It is not a whole-database atomic transaction across multiple pages.
+- Node panel backups are up to twenty user records/page, with identities and configuration. Download **every page**. Treat these files as credentials. Restore upserts settings/identities and does not reset usage.
+- Neither configuration export is a complete customer/financial/usage backup. Use Cloudflare D1 export/download or optional `wrangler d1 export` for the full database, and Free Time Travel (7 days) for recent recovery. Store Worker Secrets separately in a password manager. Test restore in a separate non-production Worker/D1 first.
+- Built-in cleanup bounds old completed webhook/outbox/flush rows to seven-day retention attempts, with small per-run batches. Audit, ledger, grants and accounts are retained until an operator applies an appropriate retention policy. Growing backlogs can outpace cleanup; monitor storage.
+
+## 18. Upgrading and original-v1 cutover
+
+For v2 upgrades: private D1 export → review diff/licenses → paste updated complete `worker.js` → run protected `/setup` initialization → check health, one test issuance, QR/fallback, renewal, and cron. Do not rotate/delete keys or change the main domain unintentionally. For rollback restore the old code only when schema-compatible; otherwise restore a tested D1 snapshot too.
+
+For the original manual bot:
+
+1. Export its D1, stop the old webhook/Worker writes and settle outstanding manual orders/withdrawals. Do not run old/new financial writers simultaneously.
+2. New `nx_` tables coexist with untouched v1 tables. `/setup` accepts authenticated POST `{"action":"legacy","kind":"users","after":0,"confirm":"old_worker_stopped_and_d1_backed_up"}`. Repeat with returned `next` until a page imports zero rows. It imports users/referrers/bans and an idempotent opening-balance ledger entry. Owner/admin access is configured separately; old flags do not silently grant new privilege.
+3. Repeat with `kind:"services"` after users. Existing manual subscriptions become read-only legacy services with new main-domain URLs and their original text fallback. Their unknown caps are labeled **unverified**, and they cannot be automatically renewed without a real node mapping.
+4. Review/re-enter numeric plans, bank instructions, guides, channels, coupons and text/settings from the retained v1 data. There is no safe automatic inference from a traffic marketing string to daily quotas/device limits/node locations. Existing order/ledger/support history remains in the original tables for export/audit; this importer does **not** move all historical records into v2 dashboards or manufacture node identities.
+
+This is an explicit migration boundary, not a claim of an invisible one-click full historical migration. The original source remains at commit `77e421f…`. Main and repository visibility were not changed.
+
+## 19. Security checklist
+
+- [ ] Independent random setup/callback/webhook/master secrets; no default password; correct private owner IDs.
+- [ ] Distinct node panel API keys, never master keys; scopes verified on stock Nahan; no other stock config writers.
+- [ ] HTTPS origins/routing and the main subscription domain checked; no secrets in URL queries.
+- [ ] Webhook rejects missing/wrong `X-Telegram-Bot-Api-Secret-Token`; old webhook disabled during cutover.
+- [ ] Existing payment/plan/test settings reviewed before enabling; Terms disclose actual caps, resets, coupons and network limitations.
+- [ ] Profile previews/rollback tested, fresh client import checked, real operator trials completed before claims.
+- [ ] Request URL logging disabled or appropriately redacted: `/sub/<token>` is a bearer credential. Example Wrangler observability is off.
+- [ ] Private D1/config backups; restrict Cloudflare dashboard/D1 access. D1 necessarily holds customer identities/configuration bases and Telegram receipt references.
+- [ ] Analytics token is read-only; no remote-deploy token is requested. Secrets never go into audit details/error messages.
+- [ ] Monitor D1 writes, CPU, request totals, storage, queue lag, grant failures and quarantined nodes. Rotate exposed credentials and review logs.
+
+The node prevents common literal private-host targets, but this is not a replacement for platform network controls, abuse monitoring or a formal security audit. Denial-of-service against public Worker URLs can still consume account quotas.
+
+## 20. Troubleshooting
+
+| Symptom | Check / remedy |
+|---|---|
+| `run_setup_migrations` | Binding name `DB`; complete all initializer calls until `ready:true`. |
+| `master_key_required_min_32` | Set a strong `MASTER_KEY` for node/all. No default login is provided. |
+| Bot silent | Correct `ROLE`, token/owner IDs, main origin and webhook secret; run Register webhook; inspect Telegram webhook status privately. A GET to `/setup` alone does not set it. |
+| Issuance/delivery queued | Enable hub cron; check operation state, node settings/capacity and 429 retry times. Use protected process-next to inspect one step. |
+| `node_quarantined`, `stock_result_not_proven_absent` | Do not create a second account elsewhere. Inspect stock node, wait for cached responses to expire, then reconcile/explicitly confirm absence. |
+| `node_api_key_missing_or_master` | The D1 value must be a Secret reference, not the key value. Install the corresponding panel key in hub secrets. |
+| No matching node | Exact `de`/`us` and `sales`, enabled state, max users; tests require a designated node and explicit sales-node permission. |
+| Cloudflare **1042** | Official docs identify same-zone Worker fetch without `global_fetch_strictly_public`, or nonexistent/disabled workers.dev routing. Set the flag, enable the actual workers.dev route, or use a correctly configured public custom domain. Cloudflare service bindings are another architectural remedy but not wired into this registry adapter. Never fix it by disabling TLS. Documentation-verified, not live-account-tested here. |
+| HTTP 422 for Clash/sing-box | Advanced profiles cannot be losslessly represented. Use `?format=xray`, or explicitly enable a compatible standard profile. Read warning headers. |
+| `unrepresentable_node_parameter` | Disable stock fake ECH (`pbk=enabled`) and unsupported transports/routing options; don't silently strip unknown critical fields. |
+| QR scans but connection fails | QR/subscription reachability is separate from tunnel SNI/clean-IP/relay reachability. Verify an individual full Xray config and actual exit from a client. |
+| Limits lag / usage missing | Buffered cross-isolate counters are eventual; eviction can lose tail bytes. Review D1 errors/write quota and flush interval. |
+| Node full with expired accounts | Remote count includes stored identities. Inspect/delete old accounts; do not assume expiry deletes them or frees platform quota. |
+| `version_conflict` / `stale_preview` | Another save changed the record or the confirmation is stale. Reopen editor and preview again. |
+| Bot secret changed / invalid callback | Reopen `/start` or `/admin` for newly signed buttons. |
+| 1027 / D1 quota errors / 1102 | Respect account request/row budgets and 10 ms CPU. Reduce workload/format size, inspect metrics, or change platform plan; no “retry forever” workaround. |
+
+1042 reference: https://developers.cloudflare.com/workers/observability/errors/.
+
+## 21. Verification
+
+```sh
+node --check worker.js
+npm test
+```
+
+**57 tests pass** using Node's built-in test runner and a D1-shaped real-SQLite fake: conditional state transitions, wallet/coupon concurrency, per-user test slots and success-time cooldowns, API shapes, failover/quarantine, renewal/reset, webhook/admin authorization, profile versioning/encoding/formats, per-config fallback/429, PNG-pixel QR decoding and VLESS/Trojan stream fakes with no per-frame writes. No test framework/package installation is needed for this suite. The test-only loader exposes private helpers and stubs `cloudflare:sockets`; the deployable file exports only its Worker handler.
+
+Optional `tests/workerd-smoke.mjs` ran on Miniflare **5.20261019.1-beta** / workerd: actual Worker startup, native local D1 migrations/triggers, authenticated panel creation, three Xray variants, HTML panel and PNG output passed. The optional **two-Worker** `tests/remote-workerd-smoke.mjs` also passed with separate native D1 databases: a hub made authenticated HTTP calls to the local node, provisioned one account, rendered three variants on its main domain, and sent PNG plus metadata to a Telegram fake. A separate jsQR **1.4.0** decode recovered the exact URL from PNG pixels. Wrangler **4.151.3** dry-run passed. These development tools are not committed dependencies.
+
+See `docs/VERIFICATION.md` for measurements and the unverified list. No real receipts, credentials or illustrative owner UUID/hosts/proxy IPs were deployed or copied as defaults.
+
+## 22. FAQ, limitations, licenses and Design decisions
+
+**Is this a literal customized Nahan fork?** No: license uncertainty blocked copying. It is an independent, compatible users-API implementation; upstream NAT64/cascade/full UI/remote-update behavior is not claimed.
+
+**Can I paste only worker.js?** Yes. It embeds its UI, QR encoder and migrations. Bind D1, set secrets and finish the protected initializer; package.json/tests are development-only.
+
+**Will the main URL work if a node is blocked?** It can serve stored configurations when the main domain is reachable, but cannot bypass a blocked transport domain or guarantee reachability in Iran.
+
+**Are traffic and device limits globally exact?** No. Traffic bytes are additive/deduplicated when flushed, but persistence and enforcement lag across isolates. Connection counts are per isolate, not exact device counts. If strict global metering is essential, this Free/no-hot-write design is unsuitable without additional coordination and measurement.
+
+**Do admin changes need source edits?** Operational bot/test/node/profile/catalog values live in D1. Profile changes affect existing URLs within the documented server cache TTL. Installing/rotating Worker Secrets is still a Cloudflare operation.
+
+**Why are queued jobs conservative?** Free cron has the same 10 ms CPU limit as HTTP. Throughput and latency are intentionally bounded rather than advertised as high-volume or guaranteed free.
+
+### Design decisions — verified facts vs assumptions
+
+1. **Verified:** current Free size limit is 64 MiB uncompressed with no compressed-size cap. D1 has a 50-statement/invocation ceiling despite the higher generic internal-subrequest ceiling. Every account shares its quotas.
+2. **Verified:** inspected stock Nahan uses JSON-blob RMW storage, 10-second caches, byte counters with activity-triggered ~30-second whole-blob writes, relative-from-now integer expiry PUT and non-unique POST names. NexiUP normalizes local users/usage, serializes stock writes, persists intent and quarantines ambiguity.
+3. **Verified in source, not in mobile networks:** `unsafe`, finalmask and scalar ECH grammar; v2rayNG does not import `cs`. Full Xray JSON is the lossless fallback. Both ECH resolvers mean two variants, one account.
+4. **Chosen:** tests start disabled, with 1 GiB total/day, one day, 48 hours from **successful issuance**; no silent production-node fallback; no cooldown consumption on definite failure.
+5. **Chosen:** no example host, UUID, proxy IP, bank number or assumed exit country is used as production configuration. Main origin and sales/test nodes are explicit admin choices.
+6. **Chosen:** schema-valid profile rollback, 15-second server cache, one account per subscription, no silent generic-format downgrade, true local PNG QR and full-config fallback.
+7. **Chosen:** renewal preserves usage unless its plan explicitly requests reset. First-offer/coupon reservations survive cancellation. Exact stock reset uncertainty requires operator reconciliation.
+8. **Chosen for security/license clarity:** original compatible node rather than copying uncertain/GPL upstream code; no auto-update/deploy, fake configs, external HTML, telemetry or guessed future operator methods.
+9. **Chosen repository handling:** the connected checkout is already `ArsalanAfshar/NexiUP` (public). Work stays on `arena/4a2b629b-nexiup`, not a new `nexiup` branch/repository. Main and existing visibility are unchanged; no credentials are committed.
+10. **Needs confirmation before production:** node/proxy geography and reachability, operator/client-version compatibility, bank/owner/prices/Terms, acceptable queue delay and quota lag, measured Free CPU/D1 capacity, exclusive stock-node writes, and completeness of any v1 data cutover. A literal upstream fork also needs a documented license grant.
+
+NexiUP-owned code and the attributed embedded QR encoder are MIT. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md). Use must comply with Cloudflare Terms and applicable local law; educational use, **no warranty**.
