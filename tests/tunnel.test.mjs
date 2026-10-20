@@ -65,3 +65,19 @@ test('malformed early data returns before creating lifetime/flush timers',async 
   const response=await worker.fetch(new Request('https://node.example.test/sync/ws',{headers:{Upgrade:'websocket','Sec-WebSocket-Protocol':'%'}}),x.env,{waitUntil(){}});
   assert.equal(response.status,400);assert.equal(intervals.length,0);assert.equal(connections.length,0);
 });
+
+test('stored ProxyIP host:port selections are actual tunnel fallbacks, including the fourth entry; client overrides stay ignored',async t=>{
+  const x=await fixture();t.after(()=>x.DB.close());
+  const p=JSON.parse(x.DB.row("SELECT value FROM nx_settings WHERE key='panel'").value);
+  p.proxy_ips=['one.example.test:8443','two.example.test','three.example.test:2053','four.example.test:2087'];
+  x.DB.exec("UPDATE nx_settings SET value=? WHERE key='panel'",JSON.stringify(p));
+  const user=await panelCreate(x.r(),{name:'fallback_fixture',trafficLimit:1,expiryDays:1},'fallback_fixture');
+  const connections=cloudflareFakes(t),echo=globalThis.__testConnect,attempts=[];
+  globalThis.__testConnect=address=>{attempts.push(address);if(attempts.length<5)return {opened:Promise.reject(new Error('synthetic connect failure')),closed:Promise.resolve(),close(){}};return echo(address);};
+  const tasks=[];const response=await worker.fetch(new Request('https://node.example.test/sync/ws?proxyip=untrusted.example.test',{headers:{Upgrade:'websocket'}}),x.env,{waitUntil(p){tasks.push(p);}});
+  assert.equal(response.status,101);const ws=response.webSocket;t.after(()=>ws.close());const before=x.DB.writes;
+  const received=once(ws,'message');ws.send(header(user.id,'vless'));await received;
+  assert.deepEqual(attempts,[{hostname:'example.test',port:443},{hostname:'one.example.test',port:8443},{hostname:'two.example.test',port:443},{hostname:'three.example.test',port:2053},{hostname:'four.example.test',port:2087}]);
+  assert.equal(connections.length,1);assert.equal(x.DB.writes,before);
+  ws.close();await Promise.allSettled(tasks);
+});

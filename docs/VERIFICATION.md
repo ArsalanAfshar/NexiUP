@@ -1,69 +1,71 @@
 # Verification record / گزارش راستی‌آزمایی
 
-Date: **2026-10-20 UTC**. Repository: `ArsalanAfshar/NexiUP`. Working branch: `arena/4a2b629b-nexiup`.
+Version **2.1.0**. Date: **2026-10-21 Asia/Tehran** (execution began 2026-10-20 UTC). Repository: `ArsalanAfshar/NexiUP`. Working branch: `arena/4a2b629b-nexiup`.
 
-This is a reproducible local verification record, not a production, security-audit, capacity or Iranian-network certification.
+This records reproducible **local** checks, not production deployment, an independent security audit, Cloudflare Free capacity certification or Iranian-network success.
 
-این گزارش آزمون محلیِ قابل‌تکرار است، نه تأیید استقرار تولید، ممیزی امنیت، ظرفیت یا اتصال واقعی اپراتورهای ایران.
+این گزارش آزمون **محلی** قابل‌تکرار است، نه استقرار تولید، ممیزی مستقل امنیت، تضمین ظرفیت Free یا موفقیت اینترنت ایران.
 
 ## Results / نتایج
 
 | Check | Result |
 |---|---|
-| `node --check worker.js` | PASS on Node 22.22.3 |
-| `npm test` | **57 passed, 0 failed, 0 skipped**, about 5 seconds |
-| Static review | No undefined variables, unreachable statements, duplicate parameters, invalid `typeof`, or unsafe `finally` reported by the development-only ESLint check |
-| Single-Worker workerd smoke | PASS: native Worker startup, four D1 migration groups + seeding, authenticated user creation, three operator variants, embedded dashboard, PNG QR and additive native-D1 usage trigger |
-| Two-Worker workerd smoke | PASS: separate hub/node native D1 databases, env-backed panel key, authenticated HTTP provisioning burst, exactly one remote account, three main-domain Xray variants, PNG and metadata sent to a Telegram fake |
-| Independent QR scan | jsQR 1.4.0 decoded the real generated PNG and recovered the exact main-domain URL; no URL metadata/text trick |
-| `wrangler deploy --dry-run` | PASS with Wrangler 4.151.3; **no deployment performed** |
-| Diff review | Whitespace check passed; no credentials, generated bundles, reference clones, dependencies, or receipt/configuration datasets staged |
+| `node --check worker.js` | PASS, Node **22.22.3** |
+| `npm run typecheck` | PASS: TypeScript **5.9.3**, Workers types **5.20261019.1**, `checkJs` on the production file |
+| `npm run verify` / built-in tests | **98 passed, 0 failed, 0 skipped**; runner approximately **5.5 s**; no runtime npm dependencies |
+| Single-Worker native smoke | PASS: five migration groups **plus final seeding**, native local D1 triggers, authenticated account creation, three Xray variants, embedded dashboard, **5,603-byte PNG QR**, exact additive usage |
+| Two-Worker native smoke | PASS: separate hub/node D1, panel-key-authenticated HTTP burst, exactly one remote account, three main-domain variants, PNG + metadata to a Telegram fake |
+| Real-browser integration | PASS: Playwright **1.64.1**, Chromium **153.0.0**, local HTTPS/workerd/D1; synthetic fixture data; desktop/mobile and FA/EN workflows |
+| Independent QR scan | jsQR **1.4.0** recovered exact synthetic subscription URLs from current PNG pixels; built-in independent PNG reader also passes |
+| Wrangler dry-run | PASS, Wrangler **4.151.3**; **no deployment** |
+| Legal notices | NexiUP MIT, Nayuki MIT and Vazirmatn **OFL-1.1** notices all present in source and optional bundle; complete font notice also served inside the UI CSS |
+| Diff/packaging | `git diff --check` passed; no node_modules, build output, reference clones, live credentials or real receipt/IP datasets included |
 
-The default suite uses **only Node built-ins**: `node:test`, strict assertions, `node:sqlite`, streams, module-loader hooks, crypto, VM and zlib. Fake D1 wraps real SQLite transactions, UNIQUE constraints, triggers and conditional updates instead of returning canned “success” results. Fake fetch captures Telegram payloads and simulates HTTP node errors/retries. WebSocket/socket stream fakes exercise the real tunnel handler. The test loader exposes private helpers; production exports only the Worker handler (workerd rejects scalar named entrypoint exports).
+Default tests use Node built-ins (`node:test`, SQLite, assertions, crypto, streams, VM and zlib), not a test framework. The D1-shaped fake runs real SQLite transactions, indexes, UNIQUE/CHECK constraints and triggers. Network/socket fakes are marked as such. Optional native tests run **Miniflare 5.20261019.1-beta/workerd**. Only the default Worker handler is exported by the production file; test-only loaders expose private helpers.
 
-مجموعه اصلی فقط از ابزارهای داخلی Node استفاده می‌کند. Fake مربوط به D1، SQL واقعی SQLite شامل تراکنش، شرط، یکتایی و trigger را اجرا می‌کند، نه پاسخ موفق از پیش‌ساخته. fetch شبیه‌سازی‌شده، payload تلگرام و خطا/تلاش نود را بررسی می‌کند. شبیه‌ساز WebSocket/socket مسیر واقعی تونل را اجرا می‌کند. loader تست توابع خصوصی را در دسترس می‌گذارد؛ فایل تولید فقط handler را export می‌کند.
+مجموعه پیش‌فرض از ابزارهای داخلی Node و SQLite واقعی استفاده می‌کند؛ پاسخ موفق از پیش‌ساخته جای تراکنش و شرط SQL را نگرفته است. شبکه/سوکت ساختگی مشخص‌اند؛ تست native نیز workerd واقعی محلی دارد. فایل تولید فقط handler Worker را export می‌کند.
 
 ## Exact size measurements / اندازه دقیق
 
-Measured after the final runtime changes:
+Node `gzipSync` defaults (gzip level 6); 1 KiB = 1,024 bytes:
 
 | Artifact | Uncompressed | gzip |
 |---|---:|---:|
-| Paste-ready `worker.js` | **251,473 bytes** (245.58 KiB) | **74,991 bytes** (73.23 KiB) |
-| Wrangler dry-run upload module | **276,868 bytes** (270.38 KiB) | **74,053 bytes** (72.32 KiB) |
-
-Both NexiUP and Project Nayuki legal notices are marked as legal comments and were verified present in the dry-run bundle, not just in source files.
-
-Wrangler output:
+| Paste-ready `worker.js` | **485,234 bytes** (473.86 KiB) | **175,243 bytes** (171.14 KiB) |
+| Optional Wrangler upload module | **517,219 bytes** (505.10 KiB) | **174,449 bytes** (170.36 KiB) |
 
 ```text
 wrangler 4.151.3
-Total Upload: 270.38 KiB / gzip: 72.32 KiB
+Total Upload: 505.10 KiB / gzip: 170.36 KiB
 --dry-run: exiting now.
 ```
 
-Current official Workers Free limit: **64 MiB uncompressed = 67,108,864 bytes**, and **no compressed-size limit**. The dry-run module uses approximately **0.41%** of that uncompressed ceiling. The prior 3 MB compressed estimate is not the current documented rule. Source and bundled sizes differ because the optional development bundler reformats/tree-shakes the module; pasting the source needs no bundling.
+Current documented Workers Free size limit is **64 MiB uncompressed (67,108,864 bytes)**, with **no compressed-size limit**. This bundle is **0.77%** of that uncompressed ceiling. Being below the size cap does not prove CPU/memory/D1/traffic feasibility. Source needs no build; bundling is optional. An unmodified 46,308-byte Arabic variable font is embedded as a data URI and accounts for part of the size increase; it causes no external font request.
 
-سقف فعلی مستندات Free برابر **۶۴ MiB غیرفشرده** است و سقف فشرده ندارد. خروجی dry-run حدود **۰٫۴۱٪** آن است. تخمین قبلی ۳ MB فشرده، قاعده فعلی نیست. اختلاف source و bundle ناشی از تبدیل ابزار اختیاری توسعه است؛ paste کردن source به build نیاز ندارد.
+سقف مستند Free، **۶۴ MiB غیرفشرده** و بدون سقف اندازه فشرده است. bundle حدود **۰٫۷۷٪** آن است؛ این اندازه به‌معنی رعایت CPU/D1 یا تضمین رایگان‌ماندن نیست. فونت فارسی ۴۶٬۳۰۸بایتی داخل فایل است و دانلود بیرونی ندارد.
 
-Source SHA-256:
-
-```text
-3063c4e259cd97878670682b004a465db65a0979d815fa36733c05be9d29962b
-```
-
-Dry-run module SHA-256:
+SHA-256:
 
 ```text
-c096911347bd6ea8b585136674941056c62fadb5a8ef7f9563e30492cec722cf
+worker.js       4c8065fac0c31362889e5d011108c0e2b126eb197954b4fcd101f61cd765de1a
+Wrangler module 8d11e1a3e1e859c7b20dcae8ac9b98ef82d7c01f48c828c4431a144b146549b0
 ```
 
-Limit independently checked both on the official documentation page and its official GitHub source:
+Size rule evidence: [official limits](https://developers.cloudflare.com/workers/platform/limits/#worker-size), and [pinned official source](https://github.com/cloudflare/cloudflare-docs/blob/da69fa833be0a8dc9d9ed6d9429c8ee0c4efbd8e/src/content/docs/workers/platform/limits.mdx). Other limits/source pins are in [RESEARCH.md](RESEARCH.md).
 
-- https://developers.cloudflare.com/workers/platform/limits/#worker-size
-- https://github.com/cloudflare/cloudflare-docs/blob/da69fa833be0a8dc9d9ed6d9429c8ee0c4efbd8e/src/content/docs/workers/platform/limits.mdx
+### Bounded SQL checks, not billing benchmarks
 
-Other limits and pinned upstream/client evidence are in [RESEARCH.md](RESEARCH.md).
+Measured by the runtime's own statement guard in SQLite fixtures:
+
+| Operation fixture | D1 statements | External fetches |
+|---|---:|---:|
+| Complete 20-row import helper | **9** | 0 |
+| Apply four endpoints to local fallback | **11** | 0 |
+| Remote account issuance with four bases, ProxyIP defaults and five configured owners | **23** | **4** |
+
+The first two exclude HTTP session/CSRF entry checks; all are below the runtime guard of **46 statements**, itself below D1's 50. They are bounded regression fixtures, **not an exhaustive worst-case proof**. They do not measure billed rows/index writes or hosted CPU. Catalog summaries may scan up to 2,000 records. Default diagnostics budget is 500 attempts/day, but import frequency, the rest of the bot and other account Workers share Free quotas. There are still no per-frame tunnel writes.
+
+این شمارش، دستور SQL است، نه تعداد ردیف قابل‌صورتحساب یا اندازه‌گیری CPU تولید. نقش ورود HTTP، ایندکس، دفعات واردسازی و بار دیگر حساب باید جدا پایش شوند؛ هیچ تضمین ظرفیت Free از این جدول نتیجه نمی‌شود.
 
 ## Covered behavior / رفتارهای پوشش‌داده‌شده
 
@@ -84,46 +86,95 @@ Other limits and pinned upstream/client evidence are in [RESEARCH.md](RESEARCH.m
 
 پوشش شامل گردش خرید کامل، اتمی‌بودن مالی/تست، هم‌زمانی و تکرار، محدودیت نود/کشور، بازیابی و قرنطینه، تمدید/reset، بایت‌شماری و مسیر تونل، مجوز وبهوک/مدیر، QR از روی پیکسل، ارسال واقعی هر کانفیگ، حفظ cursor در 429، استقلال/نسخه‌بندی پروفایل، ECH صحیح، قالب‌های معتبر و رد روشن قالب ناسازگار، به‌روزرسانی URL موجود، هشدار مصرف و رفتار fetch واقعی workerd است.
 
+### Added in 2.1 / افزوده‌شده در ۲٫۱
+
+- `checkJs` source diagnostics: menu/button union annotations and QR factory/static members; no `@ts-nocheck` or blanket source suppression.
+- **40 web/ProxyIP tests**: role boundaries; HTTPS/Bearer/cookie login; wrong/expired/rotated sessions; credential forms redirected from HTTP to HTTPS; CSRF/Origin; private Symbol actor cannot be forged by JSON/Telegram; receipt masking/streaming; idempotent owner wallet/order/account actions; version-conflict validation; old-v4 data preserved.
+- Readiness requires both migration version **five** and completed seeding. Both native smoke scripts stop on `ready:true`, not a hardcoded old count. An incomplete schema no longer reaches a misleading 422 subscription response.
+- Separate `/admin/web-api/` namespace preserves legacy `api_route=admin` API, dashboard, subscriptions and tunnel path. Web/setup/master secrets cannot be registered as weaker hub-facing node keys.
+- Country catalog parsing/normalization, bounded JSON/simple CSV, preserved test evidence, exact 2,000-entry capacity, genuinely concurrent imports, repeated cursors, cancellation racing an in-flight batch, atomic data/cursor/count updates across an interrupted reply.
+- Synthetic TCP/TLS stream fixtures assert the requested TLS hostname, raw/upgraded stream cleanup, deadlines/response limits, chunked HTTP trace parsing, public exit/provenance fields and refusal to promote TCP/provider reports to relay verification. Malformed remote reports are rejected.
+- Durable daily attempted-test budget, per-origin cooldown, explicit override for unverified/stale/wrong-target evidence, real D1 fallback application, rollback fencing and future-only remote per-account defaults using panel keys.
+- Actual tunnel-handler stream test exercises direct failure followed by **all four** stored fallbacks with explicit ports, original-port inheritance, ignored client `proxyip` overrides and no per-frame D1 writes.
+- Browser test performs HTTPS login/CSRF/logout, no credential localStorage/sessionStorage, FA/EN RTL/LTR, desktop 1,440 px and mobile 390 px (no document-wide horizontal overflow), mobile navigation, validated plan/account creation, isolated profile save/rollback, order rejection, queue filters, legacy-tool link, ProxyIP import/country filter/apply/rollback and source-label XSS escaping. No external asset requests or browser JavaScript/CSP errors.
+
+آزمون‌های جدید، ورود امن/مجوز نقش/CSRF، حفظ داده و آماده‌سازی کامل، تکرار و هم‌زمانی/لغو واردسازی، اعتبار و منشأ مدرک آزمون، چهار fallback واقعیِ سوکت شبیه‌سازی‌شده، اعمال واقعی D1 و گردش مرورگر فارسی/انگلیسی و موبایل را پوشش می‌دهند. منابع عمومی، خود IPها و شبکه ایران در این تست‌ها زنده آزموده نشده‌اند.
+
+### Added in 2.1 / افزوده‌شده در ۲٫۱
+
+- `checkJs` source diagnostics: menu/button union annotations and QR factory/static members; no `@ts-nocheck` or blanket source suppression.
+- **40 web/ProxyIP tests**: role boundaries; HTTPS/Bearer/cookie login; wrong/expired/rotated sessions; CSRF/Origin; private Symbol actor cannot be forged by JSON/Telegram; receipt masking/streaming; idempotent owner wallet/order/account actions; version-conflict validation; old-v4 data preserved.
+- Readiness requires both migration version **five** and completed seeding. Both native smoke scripts stop on `ready:true`, not a hardcoded old count. An incomplete schema no longer reaches a misleading 422 subscription response.
+- Separate `/admin/web-api/` namespace preserves legacy `api_route=admin` API, dashboard, subscriptions and tunnel path. Web/setup/master secrets cannot be registered as weaker hub-facing node keys.
+- Country catalog parsing/normalization, bounded JSON/simple CSV, preserved test evidence, exact 2,000-entry capacity, genuinely concurrent imports, repeated cursors, cancellation racing an in-flight batch, atomic data/cursor/count updates across an interrupted reply.
+- Synthetic TCP/TLS stream fixtures assert the requested TLS hostname, raw/upgraded stream cleanup, deadlines/response limits, chunked HTTP trace parsing, public exit/provenance fields and refusal to promote TCP/provider reports to relay verification. Malformed remote reports are rejected.
+- Durable daily attempted-test budget, per-origin cooldown, explicit override for unverified/stale/wrong-target evidence, real D1 fallback application, rollback fencing and future-only remote per-account defaults using panel keys.
+- Actual tunnel-handler stream test exercises direct failure followed by **all four** stored fallbacks with explicit ports, original-port inheritance, ignored client `proxyip` overrides and no per-frame D1 writes.
+- Browser test performs HTTPS login/CSRF/logout, no credential localStorage/sessionStorage, FA/EN RTL/LTR, desktop 1,440 px and mobile 390 px (no document-wide horizontal overflow), mobile navigation, validated plan/account creation, isolated profile save/rollback, order rejection, queue filters, legacy-tool link, ProxyIP import/country filter/apply/rollback and source-label XSS escaping. No external asset requests or browser JavaScript/CSP errors.
+
+آزمون‌های جدید، ورود امن/مجوز نقش/CSRF، حفظ داده و آماده‌سازی کامل، تکرار و هم‌زمانی/لغو واردسازی، اعتبار و منشأ مدرک آزمون، چهار fallback واقعیِ سوکت شبیه‌سازی‌شده، اعمال واقعی D1 و گردش مرورگر فارسی/انگلیسی و موبایل را پوشش می‌دهند. منابع عمومی، خود IPها و شبکه ایران در این تست‌ها زنده آزموده نشده‌اند.
+
 ## Reproduce / تکرار آزمون
 
-Required, dependency-free suite:
+Dependency-free syntax/default test suite:
 
 ```sh
 node --check worker.js
 npm test
 ```
 
-Optional local development tooling (not needed for dashboard deployment):
+Pinned development-only compiler checks:
 
 ```sh
-npm install --no-save --package-lock=false miniflare@5.20261019.1-beta wrangler@4.151.3
+npm ci
+npm run verify
+```
+
+Optional local native/browser tooling (not needed for dashboard deployment):
+
+```sh
+npm install --no-save --package-lock=false miniflare@5.20261019.1-beta wrangler@4.151.3 playwright@1.64.1
 node tests/workerd-smoke.mjs
 node tests/remote-workerd-smoke.mjs
+npx playwright install --with-deps chromium
+node tests/browser-smoke.mjs
 WRANGLER_SEND_METRICS=false npx wrangler deploy --dry-run
 ```
 
-The optional smoke scripts also accept `MINIFLARE_MODULE=file:///absolute/path/to/miniflare/dist/src/index.js`. They create temporary local databases and random synthetic credentials in memory, intercept test network calls, then dispose the runtimes. They do not deploy Cloudflare resources or contact a live Telegram bot. Keep local dependencies/bundles out of Git. A real CLI deployment requires replacing the example database ID and configuring secrets; dry-run does not validate that those live bindings exist.
+The browser test additionally needs `openssl` for a disposable, one-day localhost TLS certificate. It sets browser-only `ignoreHTTPSErrors` for that self-signed test origin; this does **not** disable production probe TLS verification. This environment used the Chromium 153.0.0 binary from `@sparticuz/chromium` (with its packaged Linux shared libraries), without `--disable-web-security`. The production worker's CSP remains in the browser test; only the dev wrapper's iframe exception differs from production.
 
-مسیر اصلی هیچ package اضافی نمی‌خواهد. ابزارهای اختیاری فقط برای اجرای workerd محلی و dry-run هستند؛ دیتابیس/اعتبار ساختگی موقت می‌سازند و شبکه تست را رهگیری می‌کنند، نه منابع واقعی Cloudflare یا ربات واقعی. خروجی build و dependency را commit نکنید. dry-run وجود binding و راز واقعی حساب شما را تأیید نمی‌کند.
+Tests accept optional `MINIFLARE_MODULE=file:///absolute/path/to/miniflare/dist/src/index.js`, `PLAYWRIGHT_MODULE=file:///absolute/path/to/playwright/index.mjs` and `CHROMIUM_EXECUTABLE=/absolute/path/to/chromium`. Browser artifacts and temporary certificates are under ignored `.work/`; certificates are removed after the test. Do not commit dependency directories or generated bundles. Optional tool installation does not add runtime dependencies.
+
+The disposable preview is explicit:
+
+```sh
+# Development only; synthetic records, no working proxies, no production keys:
+PREVIEW_AUTO_LOGIN=1 node tests/preview.mjs
+# http://localhost:8787/admin (server binds 0.0.0.0)
+```
+
+`tests/preview.mjs` generates its own keys/data, does not read production credentials, intercepts external HTTP and rejects network-diagnostic routes. It can serve the UI in a preview iframe; the deployed Worker still denies framing and requires owner authentication. Do not expose a credentialed production system through this development wrapper. The browser test uses real cookie login, **not** auto-login.
+
+مسیر پیش‌فرض package نمی‌خواهد؛ بررسی نوع، ابزار توسعه اختیاری دارد. تست مرورگر، ورود واقعی با cookie را آزمایش می‌کند، نه ورود خودکار. پیش‌نمایش جدا، کلید/داده ساختگی می‌سازد و تست شبکه را عمداً مسدود می‌کند؛ هیچ اتصال موفق واقعی به کاربر نسبت داده نمی‌شود. خروجی build، dependency، گواهی موقت و داده تولید را commit نکنید.
 
 ## Not verified / تأییدنشده
 
-1. **No real deployment or Telegram delivery:** actual bot token, webhook registration, Telegram photo rendering, 429 behavior and recovery must be tested with an owner-configured bot/account.
-2. **No actual stock-Nahan server integration:** request shapes/storage/expiry semantics were inspected in pinned source and tested with fakes. No guarantee is made for other commits, concurrent outside writers, or arbitrary remote failure histories. A stock server cannot offer the same transactional idempotency as the independent node.
-3. **No Iranian mobile-network tests or client GUI imports:** source-schema verification and representative output fixtures are not tests of Hamrah-e Aval/Irancell routing, ECH DNS resolution, cipher effectiveness, Android/iOS/Windows import behavior or all client versions. In particular, inspected v2rayNG URI import ignores `cs`; use full Xray JSON.
-4. **No external TCP/UDP tunnel reachability/exit-country proof:** stream forwarding was tested with fakes; edge colo is not proxy exit country. Cloudflare egress restrictions, actual relays and DNS behavior remain deployment-specific.
-5. **No Free production CPU/load measurement:** 10 ms CPU, 128 MB memory, D1 row/write/storage quotas, incoming requests and queue throughput require real monitoring. Local workerd success and a small script do not establish quota compliance under load.
-6. **Not a global hard-metering claim:** usage flushes are batched/eventually consistent; isolation/eviction can lose tail bytes or allow overshoot. Connection limits are per isolate, not exact global device counts. Telegram message acceptance and local cursor commit cannot be one transaction.
-7. **Not full upstream Nahan feature/UI parity:** upstream license grant is incomplete; NAT64/cascade/arbitrary custom routing and automatic remote code deployment are deliberately not copied/implemented. Keys registration references Worker Secrets rather than returning plaintext D1 secrets.
-8. **Not a full v1 historical migration:** explicit import covers users/opening balances and legacy manual services. Catalog/network/financial-history cutover needs operator review. Original tables remain untouched.
-9. **No formal security or legal audit:** review threat model, bank operations, backup permissions, Cloudflare Terms and local law before use.
+1. **No real Cloudflare deployment or Telegram delivery.** Bot token/webhook, actual rendering/delivery/rate limits and customer workflows need an owner-controlled staging deployment. Dry-run does not verify live bindings/secrets exist.
+2. **No live public catalog or checker validation.** Preset URLs are source-observed only. Availability, content size, data freshness, global country coverage, permission to use candidates and provider terms are unverified. Both integrations remain off by default.
+3. **No live ProxyIP TCP/TLS reachability, exit-country or ISP proof.** Socket/HTTP trace fixtures check implementation boundaries; source labels and Worker colo are not exit proof. No real Iranian network, Irancell/Hamrah client route, ECH DNS resolution or arbitrary-service compatibility was tested.
+4. **No actual stock-Nahan server integration or client GUI import.** Pinned source/API/schema and representative fixtures do not certify arbitrary Nahan commits or Android/iOS/Windows client versions. Inspected v2rayNG URI import ignores `cs`; full Xray JSON remains the lossless fallback.
+5. **No Free production CPU/load/billing measurement.** 10 ms CPU, 128 MB memory, D1 reads/writes/indexes/storage, account requests and queue delay require actual monitoring. Local workerd/browser success and a small bundle are not hosted Free feasibility certification.
+6. **No global hard metering/device-count guarantee.** Batched usage is eventually consistent; isolate eviction can lose tail bytes and concurrent traffic can overshoot. Connection caps are per isolate. Telegram acceptance and local cursor commit are not one transaction.
+7. **No full upstream UI/feature parity or universal web replacement for bot screens.** No GPL/unlicensed Nahan/EDT dashboard was copied; NAT64/cascade/arbitrary routing and automatic remote deployment remain absent. Some business workflows remain in Telegram. Full web ownership is not delegated staff/customer authentication.
+8. **No complete historical v1 migration.** Explicit cutover preserves old tables and imports documented users/balances/manual services; history/catalog/network reconciliation requires review.
+9. **No independent security/legal audit.** Evaluate owner-key protection, network policy, payment operations, backup access, Cloudflare Terms and local law.
 
-**فارسی:** استقرار واقعی، ارسال واقعی تلگرام، اتصال به سرور stock Nahan، اینترنت همراه اول/ایرانسل، ورود GUI کلاینت‌ها، خروجی جغرافیایی تونل، مصرف واقعی Free و ممیزی رسمی امنیت/حقوقی آزمایش نشده‌اند. مصرف و تعداد اتصال جهانیِ سخت تضمین نمی‌شود. این خروجی fork عینی نهان یا مهاجرت کامل تاریخچه نسخه ۱ نیست؛ مرزهای آن در هر دو README روشن است.
+**فارسی:** استقرار/تلگرام واقعی، منبع/checker عمومی، IPهای زنده، کشور خروجی واقعی، اینترنت ایران، stock Nahan، رابط کلاینت‌ها و مصرف/ظرفیت Free تأیید نشده‌اند. برنامه نتیجه ساختگی موفق تولید نمی‌کند. انتساب/مجوز فونت و QR حفظ شده، ولی این کار ممیزی مستقل امنیت/حقوقی نیست. مصرف و تعداد دستگاه جهانی سخت، برابری کامل بالادستی یا مهاجرت تمام تاریخچه نسخه ۱ تضمین نمی‌شود.
 
-## Final-review notes / یادداشت بازبینی
+## Final review / بازبینی نهایی
 
-- No owner-supplied illustrative UUID, sample Worker host or proxy IP was used as a live default.
-- Secrets are environment references; no query-string master/setup/API key and no raw error-body logging. Panel user audit targets are hashed instead of recording raw tunnel UUIDs.
-- Node registry and main domain are explicit validated admin choices. Test defaults are disabled until a designated node is selected; sales-node use requires explicit consent.
-- All runtime files are embedded; external repositories are not fetched for UI/code/QR. Optional analytics only runs when configured.
-- Main is still based on the original commit; all project changes are on the session branch. Repository visibility was not changed. No live credentials or customer data were available or requested.
+- No owner tutorial UUID/host/proxy/card examples were installed as production values. Synthetic TEST-NET records appear only in test/preview fixtures with an explicit banner.
+- Control secrets remain environment-backed; web sessions are hashed in D1. Node keys cannot equal configured web/setup/master secrets. No query-string control credentials or raw receipt/configuration/error-body logging was introduced.
+- New tests and forms use shared business validators. Operator defaults and legacy routes survive migration; no previously issued account identity is duplicated for operator variants.
+- External source/checker operations are manual and opt-in; no code/UI/QR/font is loaded from an external repository. Auto-deploy is still disabled.
+- All work stays on `arena/4a2b629b-nexiup`; main and repository visibility remain unchanged. No real Cloudflare credentials were requested or deployed.

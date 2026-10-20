@@ -1,6 +1,6 @@
 # Implementation evidence and original-bot inventory
 
-Research date: **2026-10-20 (UTC)**. Source inspection is not a network deployment test.
+Research dates: **2026-10-20 UTC / 2026-10-21 Asia/Tehran**, including the 2.1 web/ProxyIP follow-up. Source inspection is not a network deployment test.
 
 ## Original bot: `77e421f59f1c354c3a2cf507568790e0d7902a29`
 
@@ -72,3 +72,17 @@ Retrieved 2026-10-20:
 Project Nayuki QR-Code-generator, commit `3c6d0b3cefb4e049dc337e82237c9644399716a8`; `typescript-javascript/qrcodegen.ts` has a complete MIT notice. Transpiled once for vendoring, with its notice retained in worker.js. Deployment has no build step or package dependencies. Local PNG serialization is original NexiUP code; no subscription URL is sent to a QR service.
 
 The current Workers size rule was also rechecked against the official GitHub documentation source at commit `da69fa833be0a8dc9d9ed6d9429c8ee0c4efbd8e`: 64 MiB uncompressed, with no compressed-size limit. Native local-runtime checks and final file/bundle measurements are in [VERIFICATION.md](VERIFICATION.md).
+
+## 2.1 follow-up: web administration and ProxyIP evidence
+
+- Reproduced the screenshot JavaScript diagnostics using TypeScript **5.9.3** and `@cloudflare/workers-types` **5.20261019.1** with `checkJs` on `worker.js`. Mixed one-dimensional/nested menu inference and the generated QR namespace/static-member shape caused the errors. JSDoc menu unions and a lexical QR factory fix the source; source checking is not switched off.
+- Inspected `cmliu/edgetunnel` commit `a8ab11125ece9bc27983f609a6359be81b21050c` and the external UI repository `EDT-Pages/EDT-Pages.github.io` commit `53d1fd9fbf2179714ea2b3c5d2fee781d72de7b1`. The former has GPL lineage; the latter has no recognized license. No dashboard/obfuscated code was copied. NexiUP embeds an original bilingual UI instead of fetching a remote page.
+- In `admin/index.html`, the public catalog loader references **https://zip.cm.edu.kg.cmliussss.net/all.json**. It reads `data.data`, candidates' `ip` and `port`, with `meta.country`, localized country names, city, ASN/organization and `meta.clientIp`. The inspected loader selects port 443 or an array containing 443. These are interoperability facts, not proof of country or currently working IPs.
+- That UI calls **https://api.090227.xyz/check?proxyip=…** and consumes `success`, `responseTime`, `supports_ipv4` and `supports_ipv6`. NexiUP treats such responses only as third-party reports. The candidate alone is an application-level input to the optional checker; administrative secrets/configurations are not sent to it.
+- **Neither preset endpoint was live-fetched or tested here.** Both are off by default. Actual availability, payload size, geographic coverage, endpoint permission, provider terms and relay behavior require operator verification. No external country-IP dataset was vendored or advertised as healthy.
+- Native socket API evidence: [official TCP socket docs](https://github.com/cloudflare/cloudflare-docs/blob/43dc7d94e21340f7940ae9fde065f7b0ee976b1d/src/content/docs/workers/runtime-apis/tcp-sockets.mdx) and the pinned Workers types. `secureTransport:'starttls'` permits one upgrade; `startTls()` replaces the original socket/streams. Types document `startTls({expectedServerHostname})` for the expected remote identity. NexiUP checks a fixed Cloudflare HTTPS trace target with hostname verification and bounded responses, not an unauthenticated HTTP/geo guess. Parser/stream/option tests are synthetic; no live Cloudflare TCP/TLS or ISP success is inferred.
+- Diagnostic provenance explicitly separates claimed source country, TCP reachability, remote provider reports, selected-node measurements, request Worker colo and the trace's observed IP/country/colo. A trace at one destination and time does not prove arbitrary traffic always exits there. Remote-node reports trust that configured node; they are not independent attestation.
+- Owner cookies/CSRF and protected receipt streaming use a separate `/admin/web-api/` namespace, preserving custom legacy `api_route=admin` node routes. Browser integration uses real local HTTPS, workerd and D1 with synthetic business records; production has no auto-login or iframe exception.
+- The Arabic variable font from `@fontsource-variable/vazirmatn` **5.3.0** was inspected under complete SIL OFL-1.1 terms and embedded unmodified (46,308 bytes). Full notices and byte hash are in `THIRD_PARTY.md`; no font is loaded from a CDN.
+
+آزمون مرورگر، API و سوکت ساختگی را نباید معادل تأیید IP عمومی، کشور خروجی واقعی، اینترنت ایران یا ظرفیت Free دانست. فهرست/سرویس بیرونی فقط با رضایت صریح و بدون دریافت کد رابط استفاده می‌شود؛ هیچ داده کشور/IP به‌عنوان فهرست سالمِ تولید در مخزن قرار نگرفته است.

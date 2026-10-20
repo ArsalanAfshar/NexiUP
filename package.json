@@ -1,13 +1,21 @@
 {
   "name": "nexiup",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "Single-file Cloudflare Worker; no runtime dependencies or deployment build step",
   "scripts": {
     "check": "node --check worker.js",
-    "test": "node --import ./tests/register.mjs --test tests/*.test.mjs"
+    "test": "node --import ./tests/register.mjs --test tests/*.test.mjs",
+    "typecheck": "tsc --project jsconfig.json",
+    "verify": "npm run check && npm run typecheck && npm test"
   },
-  "engines": { "node": ">=22.13.0" },
-  "license": "MIT"
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "MIT AND OFL-1.1",
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261019.1",
+    "typescript": "5.9.3"
+  }
 }

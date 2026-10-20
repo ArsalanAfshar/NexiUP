@@ -1,14 +1,17 @@
 /*!
- * NexiUP 2 — Telegram sales hub and original Nahan-compatible node.
+ * NexiUP 2.1 — Telegram sales hub, web control panel and compatible node.
  * Copyright (c) 2026 NexiUP Contributors. MIT; see LICENSE and THIRD_PARTY.md.
  * One ES module; paste directly into Cloudflare Workers. No runtime npm dependencies.
  * Nahan source is NOT vendored: its inspected license grant was incomplete.
- * Sections: storage/security, profiles/formats, node API/tunnel, provisioning,
- * Telegram UI/administration, delivery/cron, HTTP router, embedded MIT QR encoder.
+ * Original web UI / ProxyIP diagnostics; embedded QR: MIT; embedded font: SIL OFL-1.1.
+ * Full font and QR notices are included below. No remote UI assets or auto-deploy.
  */
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
+
+/** @typedef {{ label: string, action?: string, id?: string | number, url?: string }} MenuButton */
+/** @typedef {(MenuButton | MenuButton[])[]} MenuButtons */
 const DAY = 86400000;
 const GIB = 1073741824;
 const enc = new TextEncoder();
@@ -95,6 +98,7 @@ function validNodeKey(node,key) {
   return strongSecret(key)||(node.adapter==='nahan'&&typeof key==='string'&&/^nahan_[a-z0-9]{6,16}_[a-z0-9]{6,16}$/.test(key));
 }
 function strongSecret(v) { return typeof v === 'string' && v.length >= 32 && v.length <= 256; }
+function controlSecret(env,key) { return ['MASTER_KEY','SETUP_KEY','WEB_ADMIN_KEY'].some(name=>strongSecret(env[name])&&constantTimeEqual(key,env[name])); }
 function getRole(env) { const r = env.ROLE || 'all'; if (!['hub','node','all'].includes(r)) fail('invalid_role', 503); return r; }
 function ownerIds(env) { return String(env.ADMIN_IDS || '').split(',').filter(x => /^\d{1,16}$/.test(x.trim())).map(x => Number(x.trim())).filter(x => x > 0 && Number.isSafeInteger(x)).slice(0, 5); }
 
@@ -112,7 +116,7 @@ function runtime(env, execution = {}) {
     async all(sql, ...args) { reserve(1); return (await st(sql, args).all()).results || []; },
     run(sql, ...args) { reserve(1); return st(sql, args).run().catch(dbError); },
     batch(items) { reserve(items.length); return raw.batch(items.map(([sql, ...args]) => st(sql, args))).catch(dbError); },
-    async fetch(url, init = {}, timeout = 8000) {
+    async fetch(url, init = {}, timeout = 8000, maxBytes = 1024 * 1024) {
       if (++external > 40) throw new Fault('fetch_budget', 503, 60);
       // Disallow redirects so Authorization never follows a node to a different origin.
       const controller = new AbortController();
@@ -122,7 +126,7 @@ function runtime(env, execution = {}) {
         if(res.status>=300&&res.status<400){await res.body?.cancel();throw new Fault('redirect_forbidden',502);}
         // Workers supports manual/follow, not redirect:error. Never forward credentials.
         // Body reads must be bounded by the same deadline, not just response headers.
-        const bytes = await boundedBody(res, 1024 * 1024);
+        const bytes = await boundedBody(res, maxBytes);
         return new Response([204,205,304].includes(res.status)?null:bytes, { status:res.status, headers:res.headers });
       } finally { clearTimeout(timer); }
     },
@@ -210,6 +214,15 @@ const MIGRATIONS = [
       UPDATE nx_panel_users SET epoch=epoch+1 WHERE id=NEW.user_id;
       DELETE FROM nx_panel_usage WHERE id=NEW.user_id;
       END`
+  ],
+  [
+    `CREATE TABLE IF NOT EXISTS nx_web_sessions (token_hash TEXT PRIMARY KEY, credential_hash TEXT NOT NULL, role TEXT NOT NULL, expires_at INTEGER NOT NULL)`,
+    `CREATE INDEX IF NOT EXISTS nx_web_session_expiry ON nx_web_sessions(expires_at)`,
+    `CREATE TABLE IF NOT EXISTS nx_proxy_catalog (id TEXT PRIMARY KEY, host TEXT NOT NULL, port INTEGER NOT NULL, country TEXT NOT NULL DEFAULT 'ZZ', label TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, imported_at INTEGER NOT NULL, probe TEXT NOT NULL DEFAULT '{}', state TEXT NOT NULL DEFAULT 'untested', checked_at INTEGER, exit_country TEXT NOT NULL DEFAULT '')`,
+    `CREATE INDEX IF NOT EXISTS nx_proxy_country ON nx_proxy_catalog(country,id)`,
+    `CREATE TABLE IF NOT EXISTS nx_proxy_imports (id TEXT PRIMARY KEY, source TEXT NOT NULL, data TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL, original_total INTEGER NOT NULL, imported INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
+    `CREATE TABLE IF NOT EXISTS nx_proxy_budgets (day TEXT PRIMARY KEY, tests INTEGER NOT NULL DEFAULT 0)`,
+    `CREATE TABLE IF NOT EXISTS nx_proxy_policies (target TEXT PRIMARY KEY, endpoints TEXT NOT NULL, previous TEXT, version INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)`
   ]
 ];
 
@@ -228,8 +241,8 @@ async function migrate(r) {
 async function ready(r) {
   if (initialized.has(r.raw)) return;
   try {
-    const row = await r.first('SELECT MAX(version) AS version FROM schema_version');
-    if (row?.version === MIGRATIONS.length) { initialized.set(r.raw, true); return; }
+    const row = await r.first("SELECT MAX(version) AS version,(SELECT COUNT(*) FROM nx_settings WHERE key IN ('bot','test','panel','proxy')) AS seeded,(SELECT COUNT(*) FROM nx_profiles) AS profiles FROM schema_version");
+    if (row?.version === MIGRATIONS.length && row.seeded === 4 && row.profiles > 0) { initialized.set(r.raw, true); return; }
   } catch {}
   fail('run_setup_migrations', 503);
 }
@@ -250,7 +263,7 @@ const DEFAULT_PANEL = { api_route:'sync', protocol:'vless', clean_ips:[], proxy_
 async function setting(r, key, fresh = false) {
   const c = cache(r).get('settings:' + key);
   if (!fresh && c && c.until > now()) return copy(c.value);
-  const fallback = ({ bot:DEFAULT_SETTINGS, test:DEFAULT_TEST, panel:DEFAULT_PANEL })[key] || {};
+  const fallback = ({ bot:DEFAULT_SETTINGS, test:DEFAULT_TEST, panel:DEFAULT_PANEL, proxy:DEFAULT_PROXY })[key] || {};
   const row = await r.first('SELECT value FROM nx_settings WHERE key=?', key);
   const value = { ...copy(fallback), ...parse(row?.value, {}) };
   cache(r).set('settings:' + key, { value, until:now() + CACHE_MS }); return copy(value);
@@ -262,7 +275,7 @@ async function putSetting(r, key, value, actor) {
   ]);
   invalidate(r, 'settings:' + key);
 }
-function auditStmt(actor, action, target, detail = {}) { return ['INSERT INTO nx_audit(actor,action,target,detail,created_at) VALUES(?,?,?,?,?)', String(actor), action, String(target), JSON.stringify(detail), now()]; }
+function auditStmt(actor, action, target, detail = {}) { return ['INSERT INTO nx_audit(actor,action,target,detail,created_at) VALUES(?,?,?,?,?)', actor===WEB_ACTOR?'web:owner':String(actor), action, String(target), JSON.stringify(detail), now()]; }
 async function audit(r, actor, action, target, detail = {}) { const [sql, ...args] = auditStmt(actor, action, target, detail); await r.run(sql, ...args); }
 async function rate(r, key, milliseconds) {
   const row = await r.first(`INSERT INTO nx_limits(key,next_at) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET next_at=excluded.next_at WHERE nx_limits.next_at<=? RETURNING key`, key, now() + milliseconds, now());
@@ -296,7 +309,7 @@ const DEFAULT_PROFILES = [
 ];
 async function seed(r) {
   const items = [
-    ...[['bot',DEFAULT_SETTINGS],['test',DEFAULT_TEST],['panel',DEFAULT_PANEL]].map(([k,v]) => ['INSERT OR IGNORE INTO nx_settings(key,value,updated_at) VALUES(?,?,?)', k, JSON.stringify(v), now()]),
+    ...[['bot',DEFAULT_SETTINGS],['test',DEFAULT_TEST],['panel',DEFAULT_PANEL],['proxy',DEFAULT_PROXY]].map(([k,v]) => ['INSERT OR IGNORE INTO nx_settings(key,value,updated_at) VALUES(?,?,?)', k, JSON.stringify(v), now()]),
     ...DEFAULT_PROFILES.map(p => ['INSERT OR IGNORE INTO nx_profiles(id,data,updated_at) VALUES(?,?,?)', p.id, JSON.stringify(p), now()])
   ];
   await r.batch(items);
@@ -513,7 +526,7 @@ function validatePanel(p) {
   keys(p,Object.keys(DEFAULT_PANEL)); ident(p.api_route,48);
   if (['setup','webhook','sub','health'].includes(p.api_route)) fail('reserved_route');
   if (!['vless','trojan','both'].includes(p.protocol)) fail('invalid_protocol');
-  p.clean_ips=listHosts(p.clean_ips); p.proxy_ips=listHosts(p.proxy_ips); p.user_nodes=listHosts(p.user_nodes);
+  p.clean_ips=listHosts(p.clean_ips); p.proxy_ips=listProxyEndpoints(p.proxy_ips); p.user_nodes=listHosts(p.user_nodes);
   if (!Array.isArray(p.ports) || !p.ports.length || p.ports.length>4) fail('invalid_ports');
   p.ports.forEach(n => { if (![443,2053,2083,2087,2096,8443].includes(n)) fail('unsupported_tls_port'); });
   bool(p.paused); if(p.dns_url) p.dns_url=httpsUrl(p.dns_url);
@@ -532,7 +545,7 @@ function validatePanelUser(input, previous = null) {
   if(input.expiryDays!==undefined) d.expiryMs=input.expiryDays ? now()+number(Number(input.expiryDays),1,3650,true)*DAY : 0;
   if(input.expiryMs!==undefined) d.expiryMs=number(input.expiryMs,0,now()+3650*DAY,true);
   if(input.notes!==undefined) d.notes=string(input.notes,600);
-  for(const k of ['proxyIp','cleanIp','userNodes']) if(input[k]!==undefined) d[k]=listHosts(input[k] || []).join(',');
+  for(const k of ['proxyIp','cleanIp','userNodes']) if(input[k]!==undefined) d[k]=(k==='proxyIp'?listProxyEndpoints(input[k]||[]):listHosts(input[k]||[])).join(',');
   if(input.userPanelUrl!==undefined) d.userPanelUrl=input.userPanelUrl ? httpsOrigin(input.userPanelUrl) : '';
   if(input.userMode!==undefined) { if(!['','alpha','beta','both'].includes(input.userMode)) fail('invalid_user_mode'); d.userMode=input.userMode; }
   if(input.userPorts!==undefined) {
@@ -658,12 +671,19 @@ async function panelApi(r,request,url,panel) {
     if(method==='DELETE'&&id) { await r.run('DELETE FROM nx_panel_keys WHERE id=?',id); await audit(r,actor,'key_revoked',id); return json({success:true}); }
     if(method==='POST') {
       const data=await bodyJson(request); keys(data,['name','secret_ref']);string(data.name,80,1);ref(data.secret_ref);
-      if(!strongSecret(r.env[data.secret_ref])||constantTimeEqual(r.env[data.secret_ref],r.env.MASTER_KEY)) fail('set_distinct_panel_key_secret_first');
+      if(!strongSecret(r.env[data.secret_ref])||controlSecret(r.env,r.env[data.secret_ref])) fail('set_distinct_panel_key_secret_first');
       if((await r.first('SELECT COUNT(*) AS n FROM nx_panel_keys')).n>=8) fail('too_many_keys');
       const kid=randomId(8);
       await r.run('INSERT INTO nx_panel_keys(id,name,secret_ref,created_at) VALUES(?,?,?,?)',kid,data.name,data.secret_ref,now());
       await audit(r,actor,'key_registered',kid,{secret_ref:data.secret_ref});return json({success:true,id:kid},201);
     }
+  }
+  if(endpoint==='proxy-check'&&method==='POST') {
+    const b=await bodyJson(request);keys(b,['endpoint','mode']);const endpoint=proxyEndpoint(b.endpoint).endpoint;
+    if(!['tcp','relay'].includes(b.mode))fail('invalid_probe_mode');
+    const settings=await setting(r,'proxy',true);
+    await rate(r,'node:proxy-probe:'+b.mode+':'+endpoint,30000);await spendProxyBudget(r,settings);
+    return json({success:true,probe:await localProxyProbe(endpoint,b.mode,settings.timeout_ms,request.cf?.colo||'')});
   }
   if(endpoint==='stats'&&method==='GET') return json({success:true,colo:request.cf?.colo||null,request_country:request.cf?.country||null,proxy_exit:{verified:false,ip:null,country:null},users:(await r.first('SELECT COUNT(*) AS n FROM nx_panel_users')).n,version:VERSION});
   if(endpoint==='logs'&&method==='GET') return json({success:true,logs:await r.all('SELECT * FROM nx_audit WHERE id>? ORDER BY id LIMIT 20',Number(url.searchParams.get('after')||0))});
@@ -794,9 +814,9 @@ async function tunnel(r,request,panel) {
       if(parsed.udp){if(parsed.port!==53||!panel.dns_url)fail('only_configured_dns_udp_supported');auth.udp=true;return dns(parsed.payload);}
       if(!parsed.port||parsed.port===25)fail('destination_port_denied');
       // Client-supplied proxyip query strings are never trusted. Only admin-stored fallback hosts.
-      const proxies=listHosts(auth.proxyIp||panel.proxy_ips);
-      for(const host of [parsed.host,...proxies].slice(0,3)) {
-        try{socket=connect({hostname:host,port:parsed.port});socket.closed?.catch(()=>{});await timed(socket.opened,5000,()=>closeSocket(socket));break;}catch{closeSocket(socket);socket=null;}
+      const proxies=listProxyEndpoints(auth.proxyIp||panel.proxy_ips).map(p=>proxyEndpoint(p,parsed.port));
+      for(const destination of [{host:parsed.host,port:parsed.port},...proxies]) {
+        try{socket=connect({hostname:destination.host,port:destination.port});socket.closed?.catch(()=>{});await timed(socket.opened,5000,()=>closeSocket(socket));break;}catch{closeSocket(socket);socket=null;}
       }
       if(!socket)fail('tcp_connect_failed',502);writer=socket.writable.getWriter();
       if(parsed.payload.length){await timed(writer.write(parsed.payload),5000,close);trackBytes(r,auth,parsed.payload.length,0);}
@@ -845,7 +865,7 @@ async function saveNode(r,n,actor) {
   n=validateNode(n);
   if(n.local&&getRole(r.env)==='hub')fail('local_requires_all_role');
   if(n.local&&!strongSecret(r.env.MASTER_KEY))fail('master_key_required_min_32',503);
-  if(!n.local&&(!validNodeKey(n,r.env[n.api_key_ref])||constantTimeEqual(r.env[n.api_key_ref],r.env.MASTER_KEY)))fail('distinct_node_secret_required');
+  if(!n.local&&(!validNodeKey(n,r.env[n.api_key_ref])||controlSecret(r.env,r.env[n.api_key_ref])))fail('distinct_node_secret_required');
   if(n.local){const other=await r.first('SELECT id FROM nx_nodes WHERE local=1 AND id<>?',n.id);if(other)fail('one_local_node_registry_entry_only');}
   const previous=await r.first('SELECT * FROM nx_nodes WHERE id=?',n.id);
   if(previous){
@@ -858,6 +878,10 @@ async function saveNode(r,n,actor) {
   ]);
 }
 async function nodeRequest(r,node,method='GET',id='',payload=null,action='',idempotency='') {
+  if(method==='POST'&&!id&&payload&&payload.proxyIp===undefined&&!node.local){
+    const policy=await r.first('SELECT endpoints FROM nx_proxy_policies WHERE target=?','node:'+node.id);
+    if(policy)payload={...payload,proxyIp:listProxyEndpoints(parse(policy.endpoints,[])).join(',')};
+  }
   if(node.local) {
     if(getRole(r.env)==='hub')fail('local_requires_all_role',503);
     if(!strongSecret(r.env.MASTER_KEY))fail('master_key_required_min_32',503);
@@ -867,7 +891,7 @@ async function nodeRequest(r,node,method='GET',id='',payload=null,action='',idem
     return panelMutate(r,id,method,payload||{},action,idempotency);
   }
   const key=r.env[node.api_key_ref];
-  if(!validNodeKey(node,key)||constantTimeEqual(key,r.env.MASTER_KEY))fail('node_api_key_missing_or_master',503);
+  if(!validNodeKey(node,key)||controlSecret(r.env,key))fail('node_api_key_missing_or_master',503);
   const url=new URL(`${httpsOrigin(node.base_url)}/${ident(node.api_route,48)}/api/users`);
   if(id)url.searchParams.set('id',id);if(action)url.searchParams.set('action',action);
   let res;
@@ -1185,7 +1209,7 @@ async function saveCatalog(r,actor,kind,doc,version) {
   if(!changes(result[0]))fail('version_conflict',409);
 }
 async function editableDoc(r,kind,id) {
-  if(['bot','test','panel'].includes(kind))return {doc:await setting(r,kind,true),version:0};
+  if(['bot','test','panel','proxy'].includes(kind))return {doc:await setting(r,kind,true),version:0};
   if(kind==='profiles'){const p=(await profiles(r,true)).find(p=>p.id===id);if(p){const {version,...doc}=p;return {doc,version};}return {doc:{...copy(DEFAULT_PROFILES[2]),id:id||'custom'},version:0};}
   if(kind==='nodes'){
     const n=await r.first('SELECT * FROM nx_nodes WHERE id=?',id);
@@ -1206,6 +1230,7 @@ async function editableDoc(r,kind,id) {
 async function validateEdit(r,kind,doc) {
   if(kind==='bot')return validateBotSettings(doc);
   if(kind==='panel')return validatePanel(doc);
+  if(kind==='proxy')return validateProxySettings(doc);
   if(kind==='test'){
     const t=validateTestSettings(doc);if(t.enabled){const n=await r.first('SELECT * FROM nx_nodes WHERE id=? AND enabled=1',t.node_id);if(!n)fail('test_node_unavailable');if(n.purpose!=='test'&&!t.allow_sales_node)fail('sales_node_not_explicitly_allowed_for_tests');}return t;
   }
@@ -1215,10 +1240,571 @@ async function validateEdit(r,kind,doc) {
 }
 async function applyEdit(r,actor,kind,doc,version) {
   const value=await validateEdit(r,kind,doc);
-  if(['bot','test','panel'].includes(kind))return putSetting(r,kind,value,actor);
+  if(['bot','test','panel','proxy'].includes(kind))return putSetting(r,kind,value,actor);
   if(kind==='profiles')return saveProfile(r,actor,value,version);
   if(kind==='nodes')return saveNode(r,value,actor);
   return saveCatalog(r,actor,kind,value,version);
+}
+
+// ---------------- ProxyIP catalog and bounded, explicit live diagnostics (original implementation) ----------------
+const DEFAULT_PROXY = {
+  source_url:'https://zip.cm.edu.kg.cmliussss.net/all.json', external_enabled:false,
+  checker_url:'https://api.090227.xyz/check', checker_enabled:false,
+  timeout_ms:5000, daily_test_limit:500
+};
+const PROXY_TRACE_HOST = 'www.cloudflare.com';
+const PROXY_MAX_ENTRIES = 2000;
+const PROXY_IMPORT_PAGE = 20;
+function proxyEndpoint(value,defaultPort=443) {
+  const raw=string(value,300,1).trim();let host,port=defaultPort,explicit=false;
+  if(raw.startsWith('[')){
+    const match=/^\[([a-fA-F0-9:]+)\](?::([0-9]{1,5}))?$/.exec(raw);if(!match)fail('invalid_proxy_endpoint');
+    host=match[1];if(match[2]){port=Number(match[2]);explicit=true;}
+  }else{
+    const colons=(raw.match(/:/g)||[]).length;
+    if(colons===1){const parts=raw.split(':');if(!/^[0-9]{1,5}$/.test(parts[1]))fail('invalid_proxy_endpoint');host=parts[0];port=Number(parts[1]);explicit=true;}
+    else host=raw;
+  }
+  host=publicHost(host);
+  // Normalize IPv6 before validating it; block mapped/expanded private forms too.
+  if(host.includes(':'))host=new URL('https://['+host+']').hostname.slice(1,-1);
+  host=publicHost(host);
+  if(/^[0-9.]+$/.test(host))host=host.split('.').map(Number).join('.');
+  if(port!==null){number(port,1,65535,true);if(port===25)fail('destination_port_denied');}
+  return {host,port,explicit,endpoint:hostPort(host)+(port===null?'':':'+port)};
+}
+function listProxyEndpoints(value,max=4) {
+  if(typeof value==='string')value=value.split(/[,\n]/).map(s=>s.trim()).filter(Boolean);
+  if(!Array.isArray(value)||value.length>max)fail('too_many_proxy_endpoints');
+  // Legacy bare hosts keep the destination port; explicit endpoints use their configured port.
+  return [...new Set(value.map(v=>proxyEndpoint(v,null).endpoint))];
+}
+function validateProxySettings(p) {
+  keys(p,Object.keys(DEFAULT_PROXY));
+  for(const field of ['source_url','checker_url']){
+    p[field]=httpsUrl(string(p[field],500,1));
+    const u=new URL(p[field]);if(u.search||u.hash||(u.port&&u.port!=='443'))fail('public_https_url_without_query_required');
+  }
+  bool(p.external_enabled);bool(p.checker_enabled);
+  number(p.timeout_ms,2000,8000,true);number(p.daily_test_limit,1,5000,true);
+  return copy(p);
+}
+function proxySourceRows(input) {
+  if(typeof input==='string'){
+    const s=input.trim();
+    if(s.startsWith('[')||s.startsWith('{')){input=parse(s);if(!input)fail('invalid_catalog_json');}
+    else{
+      const lines=s.split(/\r?\n/).map(s=>s.trim()).filter(s=>s&&!s.startsWith('#'));
+      if(lines[0]&&/^(country|country_code)[,\t]/i.test(lines[0]))lines.shift();
+      input=lines.map(line=>{const [country,endpoint,label='']=line.split(/[,\t]/);return {country,endpoint,label};});
+    }
+  }
+  const rows=Array.isArray(input)?input:input?.data||input?.proxies;
+  if(!Array.isArray(rows)||!rows.length)fail('empty_or_unsupported_catalog');
+  return rows;
+}
+function normalizeProxyRecord(row) {
+  if(!isObject(row))fail('invalid_proxy_record');
+  const address=row.endpoint||row.proxy||row.ip||row.host;
+  if(typeof address!=='string')fail('proxy_address_required');
+  let port=443;
+  if(row.port!==undefined){
+    if(Array.isArray(row.port)){if(!row.port.includes(443))fail('catalog_no_tls_443');}
+    else port=number(Number(row.port),1,65535,true);
+  }
+  const ep=proxyEndpoint(address,port),meta=isObject(row.meta)?row.meta:{};
+  const claimed=String(row.country_code||row.country||meta.country||'ZZ').toUpperCase();
+  const country=/^[A-Z]{2}$/.test(claimed)?claimed:'ZZ';
+  const label=String(row.label||meta.asOrganization||row.asOrganization||'').replace(/[\x00-\x1f]/g,'').slice(0,100);
+  const city=String(row.city||meta.city||'').replace(/[\x00-\x1f]/g,'').slice(0,80);
+  // Provider clientIp, colo and lat/lon are NOT promoted to independently measured exit evidence.
+  return {id:ep.endpoint,host:ep.host,port:ep.port,country,label,city};
+}
+async function startProxyImport(r,input,source) {
+  const rows=proxySourceRows(input),taken=rows.slice(0,PROXY_MAX_ENTRIES),id=randomId(12),created=now();
+  const text=JSON.stringify(taken);if(enc.encode(text).length>1024*1024)fail('catalog_too_large',413);
+  await r.batch([
+    ['DELETE FROM nx_proxy_imports WHERE expires_at<=?',created],
+    ['DELETE FROM nx_proxy_imports WHERE id IN (SELECT id FROM nx_proxy_imports ORDER BY created_at DESC LIMIT -1 OFFSET 3)'],
+    ['INSERT INTO nx_proxy_imports(id,source,data,total,original_total,created_at,expires_at) VALUES(?,?,?,?,?,?,?)',id,source,text,taken.length,rows.length,created,created+3600000],
+    auditStmt(WEB_ACTOR,'proxy_import_started',id,{source:source==='manual'?'manual':'configured_url',rows:taken.length,truncated:rows.length>taken.length})
+  ]);
+  return {id,total:taken.length,original_total:rows.length,cursor:0,imported:0,rejected:0,state:'pending',truncated:rows.length>taken.length};
+}
+async function advanceProxyImport(r,id,expectedCursor) {
+  ident(id,48);number(expectedCursor,0,PROXY_MAX_ENTRIES,true);
+  const release=await lock(r,'proxy:catalog-import');
+  try{
+    const job=await r.first('SELECT * FROM nx_proxy_imports WHERE id=? AND expires_at>?',id,now());
+    if(!job)fail('import_expired_or_missing',404);
+    if(job.cursor!==expectedCursor||job.state!=='pending')return {id,cursor:job.cursor,total:job.total,original_total:job.original_total,imported:job.imported,rejected:job.rejected,state:job.state};
+    const input=parse(job.data,[]).slice(job.cursor,job.cursor+PROXY_IMPORT_PAGE),rows=[],errors={};
+    for(const raw of input){try{rows.push(normalizeProxyRecord(raw));}catch(e){const code=codeOf(e);errors[code]=(errors[code]||0)+1;}}
+    const count=(await r.first('SELECT COUNT(*) AS n FROM nx_proxy_catalog')).n;
+    const existing=new Set((await r.all('SELECT id FROM nx_proxy_catalog WHERE id IN (SELECT value FROM json_each(?))',JSON.stringify(rows.map(row=>row.id)))).map(row=>row.id));
+    let space=Math.max(0,PROXY_MAX_ENTRIES-count);
+    const admitted=[];for(const row of new Map(rows.map(row=>[row.id,row])).values()){
+      if(existing.has(row.id)||space>0){admitted.push(row);if(!existing.has(row.id))space--;}
+      else errors.catalog_capacity=(errors.catalog_capacity||0)+1;
+    }
+    const at=now(),cursor=job.cursor+input.length,state=cursor>=job.total?'done':'pending',imported=admitted.length;
+    const result=await r.batch([
+      [`INSERT INTO nx_proxy_catalog(id,host,port,country,label,city,source,imported_at)
+        SELECT json_extract(j.value,'$.id'),json_extract(j.value,'$.host'),json_extract(j.value,'$.port'),json_extract(j.value,'$.country'),json_extract(j.value,'$.label'),json_extract(j.value,'$.city'),?,?
+        FROM json_each(?) j WHERE 1
+        ON CONFLICT(id) DO UPDATE SET country=excluded.country,label=excluded.label,city=excluded.city,source=excluded.source,imported_at=excluded.imported_at`,job.source,at,JSON.stringify(admitted)],
+      ["UPDATE nx_proxy_imports SET cursor=?,state=CASE WHEN state='pending' THEN ? ELSE state END,imported=imported+?,rejected=rejected+? WHERE id=? AND cursor=?",cursor,state,imported,input.length-imported,id,job.cursor]
+    ]);
+    const current=await r.first('SELECT id,cursor,total,original_total,imported,rejected,state FROM nx_proxy_imports WHERE id=?',id);
+    if(!current)fail('import_expired_or_missing',404);
+    if(!changes(result[1])||current.state!==state)return current;
+    if(state==='done')await audit(r,WEB_ACTOR,'proxy_import_finished',id,{imported:job.imported+imported,rejected:job.rejected+input.length-imported});
+    return {id,cursor,total:job.total,original_total:job.original_total,imported:job.imported+imported,rejected:job.rejected+input.length-imported,state,errors,truncated:job.original_total>job.total};
+  }finally{await release();}
+}
+async function spendProxyBudget(r,settings) {
+  const row=await r.first('INSERT INTO nx_proxy_budgets(day,tests) VALUES(?,1) ON CONFLICT(day) DO UPDATE SET tests=tests+1 WHERE tests<? RETURNING tests',dayKey(),settings.daily_test_limit);
+  if(!row)throw new Fault('proxy_daily_test_budget',429,Math.ceil((DAY-now()%DAY)/1000));
+  if(row.tests===1)await r.run('DELETE FROM nx_proxy_budgets WHERE day<?',new Date(now()-7*DAY).toISOString().slice(0,10));
+  return settings.daily_test_limit-row.tests;
+}
+function parseProxyTrace(bytes) {
+  const text=dec.decode(bytes),split=text.indexOf('\r\n\r\n');
+  if(split<0||split>8192)fail('proxy_invalid_http',502);
+  const head=text.slice(0,split),lines=head.split('\r\n');
+  if(!/^HTTP\/1\.[01] 200(?: |$)/.test(lines[0]))fail('proxy_trace_not_200',502);
+  let body=text.slice(split+4);
+  if(/\r\ncontent-encoding:\s*(?!identity\s*$)\S+/im.test('\r\n'+head))fail('proxy_encoded_response',502);
+  if(/\r\ntransfer-encoding:\s*chunked\s*$/im.test('\r\n'+head)){
+    let decoded='',offset=0,finished=false;
+    for(let i=0;i<128;i++){
+      const end=body.indexOf('\r\n',offset);if(end<0)fail('proxy_incomplete_chunk',502);
+      const hex=body.slice(offset,end).split(';')[0];if(!/^[a-f0-9]{1,6}$/i.test(hex))fail('proxy_invalid_chunk',502);
+      const length=parseInt(hex,16);offset=end+2;
+      if(length===0){finished=true;break;}
+      if(offset+length+2>body.length||body.slice(offset+length,offset+length+2)!=='\r\n')fail('proxy_incomplete_chunk',502);
+      decoded+=body.slice(offset,offset+length);offset+=length+2;
+    }
+    if(!finished)fail('proxy_incomplete_chunk',502);body=decoded;
+  }else{
+    const match=/\r\ncontent-length:\s*(\d+)\s*$/im.exec('\r\n'+head);
+    if(match&&Number(match[1])!==enc.encode(body).length)fail('proxy_incomplete_body',502);
+  }
+  const fields=Object.create(null);for(const line of body.split('\n')){const p=line.indexOf('=');if(p>0)fields[line.slice(0,p)]=line.slice(p+1).trim();}
+  if(fields.h!==PROXY_TRACE_HOST || !/^[A-Z]{2}$/.test(fields.loc||'') || !/^[A-Z]{3}$/.test(fields.colo||''))fail('proxy_invalid_trace',502);
+  const ip=string(fields.ip||'',64,1);
+  if(!ip.includes(':')&&!/^\d+\.\d+\.\d+\.\d+$/.test(ip))fail('proxy_invalid_exit_ip',502);
+  publicHost(ip);
+  return {exit_ip:ip,exit_country:fields.loc,trace_colo:fields.colo};
+}
+async function localProxyProbe(endpoint,mode,timeout,fromColo='') {
+  const ep=proxyEndpoint(endpoint),started=now(),deadline=started+timeout;
+  if(!['tcp','relay'].includes(mode))fail('invalid_probe_mode');
+  let socket=null,raw=null,reader=null,writer=null,stage='tcp';
+  const result={mode,endpoint:ep.endpoint,tcp_ok:false,relay_ok:false,tcp_ms:null,tls_ms:null,total_ms:0,exit_ip:null,exit_country:null,trace_colo:null,from_colo:/^[A-Z]{3}$/.test(fromColo)?fromColo:null,evidence:'local',error:null,checked_at:started};
+  const wait=p=>timed(p,Math.max(1,deadline-now()),()=>{closeSocket(socket);closeSocket(raw);});
+  try{
+    raw=connect({hostname:ep.host,port:ep.port},{secureTransport:mode==='relay'?'starttls':'off',allowHalfOpen:false});
+    socket=raw;raw.closed?.catch(()=>{});await wait(raw.opened);
+    result.tcp_ok=true;result.tcp_ms=now()-started;
+    if(mode==='relay'){
+      stage='tls';const tlsAt=now();
+      // Native TLS validates the certificate for the diagnostic host, not for the relay IP.
+      // Never disable certificate verification or send customer UUIDs/subscription URLs.
+      socket=raw.startTls({expectedServerHostname:PROXY_TRACE_HOST});socket.closed?.catch(()=>{});
+      await wait(socket.opened);result.tls_ms=now()-tlsAt;stage='trace';
+      writer=socket.writable.getWriter();
+      await wait(writer.write(enc.encode(`GET /cdn-cgi/trace HTTP/1.1\r\nHost: ${PROXY_TRACE_HOST}\r\nUser-Agent: NexiUP-diagnostic\r\nAccept: text/plain\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n`)));
+      reader=socket.readable.getReader();const chunks=[];let length=0;
+      for(;;){const part=await wait(reader.read());if(part.done)break;length+=part.value.length;if(length>16384)fail('proxy_response_too_large',502);chunks.push(part.value);}
+      Object.assign(result,parseProxyTrace(concat(...chunks)));result.relay_ok=true;
+    }
+  }catch(e){result.error=e instanceof Fault?e.code:'proxy_'+stage+'_failed';}
+  finally{try{reader?.releaseLock();writer?.releaseLock();}catch{}closeSocket(socket);if(raw!==socket)closeSocket(raw);result.total_ms=now()-started;}
+  return result;
+}
+async function externalProxyProbe(r,endpoint,settings) {
+  if(!settings.checker_enabled)fail('external_checker_opt_in_required',403);
+  const ep=proxyEndpoint(endpoint),url=new URL(settings.checker_url),started=now();url.searchParams.set('proxyip',ep.endpoint);
+  const base={mode:'external',endpoint:ep.endpoint,evidence:'third_party',checked_at:started,from_colo:null,tcp_ok:false,relay_ok:false,exit_ip:null,exit_country:null,reported_ok:false,reported_ms:null,error:null,total_ms:0};
+  try{
+    const res=await r.fetch(url.toString(),{headers:{Accept:'application/json'}},settings.timeout_ms,32768);
+    const body=parse(await res.text());if(!res.ok||typeof body?.success!=='boolean')fail('checker_invalid_response',502);
+    base.reported_ok=body.success;
+    const ms=Number(body.responseTime);if(Number.isFinite(ms)&&ms>=0&&ms<120000)base.reported_ms=ms;
+    if(!body.success)base.error='checker_reported_failure';
+  }catch(e){base.error=e instanceof Fault?e.code:'checker_unavailable';}
+  base.total_ms=now()-started;return base;
+}
+async function nodeProxyProbe(r,node,endpoint,mode) {
+  if(node.adapter!=='nexiup')fail('remote_probe_requires_nexiup_2_1',422);
+  const key=r.env[node.api_key_ref];if(!validNodeKey(node,key)||controlSecret(r.env,key))fail('node_api_key_missing_or_master',503);
+  const res=await r.fetch(`${httpsOrigin(node.base_url)}/${ident(node.api_route,48)}/api/proxy-check`,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:JSON.stringify({endpoint,mode})},10000,32768);
+  if(!res.ok)throw new Fault(res.status===404?'remote_probe_requires_nexiup_2_1':'node_probe_unavailable',502);
+  const body=parse(await res.text()),p=body?.probe;
+  if(body?.success!==true||!p||p.endpoint!==endpoint||p.mode!==mode||!['tcp','relay'].includes(mode)||p.evidence!=='local'||typeof p.tcp_ok!=='boolean'||typeof p.relay_ok!=='boolean')fail('invalid_node_probe',502);
+  if(p.relay_ok && (mode!=='relay'||!p.tcp_ok||!/^[A-Z]{2}$/.test(p.exit_country||'')||!/^[A-Z]{3}$/.test(p.trace_colo||'')||!/^([0-9.]+|[a-fA-F0-9:]+)$/.test(p.exit_ip||'')))fail('invalid_node_probe',502);
+  // Even authenticated remote results are parsed, bounded and clearly attributed to that node.
+  return {mode,endpoint,evidence:'node:'+node.id,checked_at:now(),tcp_ok:p.tcp_ok,relay_ok:p.relay_ok,
+    tcp_ms:p.tcp_ms===null?null:number(p.tcp_ms,0,120000),tls_ms:p.tls_ms===null?null:number(p.tls_ms,0,120000),total_ms:number(p.total_ms,0,120000),
+    from_colo:/^[A-Z]{3}$/.test(p.from_colo||'')?p.from_colo:null,trace_colo:/^[A-Z]{3}$/.test(p.trace_colo||'')?p.trace_colo:null,
+    exit_ip:p.relay_ok?publicHost(p.exit_ip):null,exit_country:p.relay_ok&&/^[A-Z]{2}$/.test(p.exit_country||'')?p.exit_country:null,
+    error:p.error&&/^[a-z0-9_]{1,80}$/.test(p.error)?p.error:null};
+}
+async function proxyProbe(r,request,b) {
+  keys(b,['id','mode','node_id']);const endpoint=proxyEndpoint(b.id).endpoint;
+  const row=await r.first('SELECT id FROM nx_proxy_catalog WHERE id=?',endpoint);if(!row)fail('proxy_not_in_catalog',404);
+  const settings=await setting(r,'proxy',true),mode=b.mode||'relay',nodeId=b.node_id||'';
+  if(!['tcp','relay','external'].includes(mode))fail('invalid_probe_mode');
+  let node=null;
+  if(nodeId){webHub(r);node=await r.first('SELECT * FROM nx_nodes WHERE id=? AND enabled=1',ident(nodeId));if(!node)fail('node_unavailable',404);if(node.local)webNode(r);}
+  if(mode==='external'&&!settings.checker_enabled)fail('external_checker_opt_in_required',403);
+  if(mode==='external'&&nodeId)fail('external_checker_not_node_measurement');
+  await rate(r,'proxy:probe:'+nodeId+':'+mode+':'+endpoint,30000);
+  const remaining=await spendProxyBudget(r,settings);
+  const probe=mode==='external'?await externalProxyProbe(r,endpoint,settings):node&&!node.local?await nodeProxyProbe(r,node,endpoint,mode):await localProxyProbe(endpoint,mode,settings.timeout_ms,request.cf?.colo||'');
+  const state=mode==='external'?(probe.reported_ok?'reported_ok':'reported_failed'):probe.relay_ok?'relay_ok':mode==='tcp'&&probe.tcp_ok?'tcp_ok':probe.tcp_ok?'relay_failed':'tcp_failed';
+  await r.batch([
+    ['UPDATE nx_proxy_catalog SET probe=?,state=?,checked_at=?,exit_country=? WHERE id=?',JSON.stringify(probe),state,probe.checked_at,probe.exit_country||'',endpoint],
+    auditStmt(WEB_ACTOR,'proxy_tested','probe',{mode,state,from:nodeId||'self'})
+  ]);
+  return {id:endpoint,probe,state,checked_at:probe.checked_at,exit_country:probe.exit_country||'',remaining};
+}
+async function proxyPolicy(r,target) {
+  if(target==='self'){webNode(r);return {target,node:null};}
+  webHub(r);if(!target.startsWith('node:'))fail('invalid_proxy_target');
+  const node=await r.first('SELECT * FROM nx_nodes WHERE id=?',ident(target.slice(5)));
+  if(!node)fail('node_not_found',404);
+  if(node.local)fail('use_self_for_local_node');
+  return {target,node};
+}
+async function applyProxyPolicy(r,b,rollback=false) {
+  const {target}=await proxyPolicy(r,string(b.target,80,1));
+  const release=await lock(r,'proxy-policy:'+target);
+  try{
+    const old=await r.first('SELECT * FROM nx_proxy_policies WHERE target=?',target);
+    const version=old?.version||0;
+    if(number(b.version,0,1e9,true)!==version)fail('version_conflict',409);
+    let current=old?parse(old.endpoints,[]):[];
+    if(target==='self')current=(await setting(r,'panel',true)).proxy_ips;
+    let endpoints;
+    if(rollback){
+      if(!old||old.previous===null)fail('no_proxy_rollback',409);
+      if(target==='self'&&JSON.stringify(current)!==old.endpoints)fail('proxy_changed_since_apply',409);
+      endpoints=parse(old.previous,[]);
+    }else{
+      if(!Array.isArray(b.ids)||b.ids.length>4)fail('max_four_proxy_endpoints');
+      endpoints=[...new Set(b.ids.map(id=>proxyEndpoint(id).endpoint))];
+      for(const id of endpoints){
+        const row=await r.first('SELECT * FROM nx_proxy_catalog WHERE id=?',id);if(!row)fail('proxy_not_in_catalog',404);
+        const probe=parse(row.probe,{}),expected=target==='self'?'local':target;
+        if(b.allow_unverified!==true && (row.state!=='relay_ok'||row.checked_at<now()-30*60000||probe.evidence!==expected))fail('fresh_target_relay_test_or_explicit_override_required',409);
+      }
+    }
+    const at=now(),stmts=[
+      ['INSERT INTO nx_proxy_policies(target,endpoints,previous,version,updated_at) VALUES(?,?,?,1,?) ON CONFLICT(target) DO UPDATE SET endpoints=excluded.endpoints,previous=excluded.previous,version=version+1,updated_at=excluded.updated_at',target,JSON.stringify(endpoints),JSON.stringify(current),at],
+      auditStmt(WEB_ACTOR,rollback?'proxy_rollback':'proxy_applied',target,{count:endpoints.length,version:version+1,unverified_override:b.allow_unverified===true,scope:target==='self'?'local_fallback':'new_accounts'})
+    ];
+    if(target==='self')stmts.push(["UPDATE nx_settings SET value=json_set(value,'$.proxy_ips',json(?)),version=version+1,updated_at=? WHERE key='panel'",JSON.stringify(endpoints),at]);
+    await r.batch(stmts);if(target==='self')invalidate(r,'settings:panel');
+    return {success:true,target,endpoints,version:version+1,scope:target==='self'?'local_fallback':'new_accounts',affects_existing_inheriting_accounts:target==='self',existing_per_user_overrides_changed:false};
+  }finally{await release();}
+}
+async function proxyApi(r,request,url,path) {
+  const method=request.method;
+  if(path==='list'&&method==='GET'){
+    const country=string(url.searchParams.get('country')||'',2),state=string(url.searchParams.get('state')||'',30),q=string(url.searchParams.get('q')||'',80),cursor=string(url.searchParams.get('cursor')||'',300);
+    if(country&&!/^[A-Z]{2}$/.test(country))fail('invalid_country');
+    const where="(?='' OR country=?) AND (?='' OR state=?) AND (id LIKE ? OR label LIKE ?)",args=[country,country,state,state,'%'+q+'%','%'+q+'%'];
+    const rows=await r.all(`SELECT * FROM nx_proxy_catalog WHERE ${where} AND id>? ORDER BY id LIMIT 21`,...args,cursor);
+    const total=(await r.first(`SELECT COUNT(*) AS n FROM nx_proxy_catalog WHERE ${where}`,...args)).n;
+    const countries=await r.all('SELECT country,COUNT(*) AS count,SUM(state=\'relay_ok\') AS verified FROM nx_proxy_catalog GROUP BY country ORDER BY count DESC,country');
+    const settings=await setting(r,'proxy'),budget=await r.first('SELECT tests FROM nx_proxy_budgets WHERE day=?',dayKey());
+    const nodes=getRole(r.env)!=='node'?await r.all('SELECT id,label,local,adapter,enabled FROM nx_nodes ORDER BY id LIMIT 30'):[];
+    const policies=await r.all('SELECT target,endpoints,version,updated_at,previous IS NOT NULL AS can_rollback FROM nx_proxy_policies LIMIT 31');
+    const active=getRole(r.env)!=='hub'?(await setting(r,'panel')).proxy_ips:[];
+    return json({items:rows.slice(0,20).map(row=>({...row,probe:parse(row.probe,{})})),next:rows.length>20?rows[19].id:null,total,countries,settings,nodes,policies:policies.map(p=>({...p,endpoints:parse(p.endpoints,[])})),active,remaining:Math.max(0,settings.daily_test_limit-(budget?.tests||0)),server_time:now()});
+  }
+  if(path==='sync'&&method==='POST'){
+    const settings=await setting(r,'proxy',true);if(!settings.external_enabled)fail('external_catalog_opt_in_required',403);
+    await rate(r,'proxy:source-sync',600000);
+    let res;try{res=await r.fetch(settings.source_url,{headers:{Accept:'application/json'}},8000);}catch(e){throw new Fault(e instanceof Fault?e.code:'catalog_source_unavailable',502);}
+    if(!res.ok)fail('catalog_source_unavailable',502);
+    return json(await startProxyImport(r,await res.text(),settings.source_url));
+  }
+  if(path==='import'&&method==='POST'){
+    const b=await bodyJson(request,1100000);keys(b,['data']);return json(await startProxyImport(r,b.data,'manual'));
+  }
+  if(path==='continue'&&method==='POST'){
+    const b=await bodyJson(request);return json(await advanceProxyImport(r,b.id,b.cursor));
+  }
+  if(path==='import-status'&&method==='GET'){
+    const id=ident(url.searchParams.get('id'),48),row=await r.first('SELECT id,cursor,total,original_total,imported,rejected,state FROM nx_proxy_imports WHERE id=? AND expires_at>?',id,now());
+    if(!row)fail('import_expired_or_missing',404);return json(row);
+  }
+  if(path==='cancel-import'&&method==='POST'){
+    const b=await bodyJson(request);await r.run("UPDATE nx_proxy_imports SET state='cancelled' WHERE id=? AND state='pending'",ident(b.id,48));return json({success:true});
+  }
+  if(path==='probe'&&method==='POST')return json(await proxyProbe(r,request,await bodyJson(request)));
+  if(path==='apply'&&method==='POST')return json(await applyProxyPolicy(r,await bodyJson(request)));
+  if(path==='rollback'&&method==='POST')return json(await applyProxyPolicy(r,await bodyJson(request),true));
+  if(path==='remove'&&method==='POST'){
+    const b=await bodyJson(request),id=proxyEndpoint(b.id).endpoint;
+    // Removing discovery metadata does not silently alter a live node's fallback settings.
+    await r.batch([['DELETE FROM nx_proxy_catalog WHERE id=?',id],auditStmt(WEB_ACTOR,'proxy_catalog_removed','entry')]);return json({success:true});
+  }
+  fail('not_found',404);
+}
+
+// ---------------- Web control plane: owner sessions, shared validators, role boundaries ----------------
+const WEB_ACTOR = Symbol('web:owner'); // Not representable in a Telegram update or JSON request.
+const WEB_COOKIE = '__Host-nexiup-admin';
+const WEB_SESSION_MS = 30 * 60000;
+const WEB_EDITORS = ['bot','test','panel','proxy','nodes','profiles','plans','payments','guides','channels','coupons','texts'];
+function webSecret(env) {
+  const secret = env.WEB_ADMIN_KEY !== undefined ? env.WEB_ADMIN_KEY : getRole(env) === 'node' ? env.MASTER_KEY : env.SETUP_KEY;
+  if (!strongSecret(secret)) fail('web_admin_secret_required_min_32',503);
+  return secret;
+}
+async function digestHex(text) {
+  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',enc.encode(text))),b=>b.toString(16).padStart(2,'0')).join('');
+}
+async function webCsrf(secret, token) {
+  const key=await crypto.subtle.importKey('raw',enc.encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  return Array.from(new Uint8Array(await crypto.subtle.sign('HMAC',key,enc.encode('nexiup:web:csrf:'+token))),b=>b.toString(16).padStart(2,'0')).join('');
+}
+function webOrigin(request) {
+  const url=new URL(request.url),origin=request.headers.get('origin');
+  if(url.protocol!=='https:')fail('https_required',400);
+  if(origin && origin!==url.origin)fail('origin_forbidden',403);
+  if(request.headers.get('sec-fetch-site')==='cross-site')fail('origin_forbidden',403);
+}
+function webFailure(request,record=false) {
+  const ip='web:'+String(request.headers.get('cf-connecting-ip')||'unknown'),bucket=authFailures.get(ip);
+  if(bucket?.until>now() && bucket.count>=8)throw new Fault('auth_throttled',429,60);
+  if(record){
+    if(authFailures.size>1000)authFailures.clear();
+    authFailures.set(ip,{count:(bucket?.until>now()?bucket.count:0)+1,until:now()+60000});
+    fail('unauthorized',401);
+  }
+}
+function sessionCookie(token='',seconds=0) {
+  return `${WEB_COOKIE}=${token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${seconds}`;
+}
+async function webLogin(r,request) {
+  webOrigin(request);webFailure(request);
+  const secret=webSecret(r.env);
+  if(!constantTimeEqual(request.headers.get('authorization'),'Bearer '+secret))webFailure(request,true);
+  // Bounded, idempotent migrations are authenticated; no unauthenticated DDL/seed work.
+  const progress=await migrate(r);
+  if(!progress.ready)return json({migration_required:true,...progress},202);
+  await rate(r,'web:login:'+String(request.headers.get('cf-connecting-ip')||'unknown'),1000);
+  const token=randomId(32),hash=await digestHex(token),expires=now()+WEB_SESSION_MS;
+  await r.batch([
+    ['DELETE FROM nx_web_sessions WHERE expires_at<=?',now()],
+    ['DELETE FROM nx_web_sessions WHERE token_hash IN (SELECT token_hash FROM nx_web_sessions ORDER BY expires_at DESC LIMIT -1 OFFSET 15)'],
+    ['INSERT INTO nx_web_sessions(token_hash,credential_hash,role,expires_at) VALUES(?,?,?,?)',hash,await digestHex(secret),getRole(r.env),expires],
+    auditStmt(WEB_ACTOR,'web_login','owner')
+  ]);
+  return json({success:true,role:getRole(r.env),version:VERSION,csrf:await webCsrf(secret,token),expires_at:expires},200,{'Set-Cookie':sessionCookie(token,WEB_SESSION_MS/1000)});
+}
+async function webAuth(r,request) {
+  webOrigin(request);webFailure(request);
+  const secret=webSecret(r.env),header=request.headers.get('authorization');
+  if(header!==null){
+    if(!constantTimeEqual(header,'Bearer '+secret))webFailure(request,true);
+    await ready(r);return {actor:WEB_ACTOR,hash:'',csrf:'',expires_at:0};
+  }
+  const cookies=String(request.headers.get('cookie')||'').split(';').map(s=>s.trim());
+  const entry=cookies.find(s=>s.startsWith(WEB_COOKIE+'=')),token=entry?.slice(WEB_COOKIE.length+1)||'';
+  if(!/^[a-f0-9]{64}$/.test(token))webFailure(request,true);
+  await ready(r);
+  const hash=await digestHex(token),session=await r.first('SELECT * FROM nx_web_sessions WHERE token_hash=? AND expires_at>?',hash,now());
+  if(!session || session.role!==getRole(r.env) || !constantTimeEqual(session.credential_hash,await digestHex(secret)))webFailure(request,true);
+  const csrf=await webCsrf(secret,token);
+  if(!['GET','HEAD'].includes(request.method)){
+    if(request.headers.get('origin')!==new URL(request.url).origin || !constantTimeEqual(request.headers.get('x-nexiup-csrf'),csrf))fail('csrf_failed',403);
+  }
+  return {actor:WEB_ACTOR,hash,csrf,expires_at:session.expires_at};
+}
+function webHub(r) { if(getRole(r.env)==='node')fail('hub_only',403); }
+function webNode(r) { if(getRole(r.env)==='hub')fail('node_only',403); }
+function webEditor(r,kind) {
+  if(!WEB_EDITORS.includes(kind))fail('unknown_editor',404);
+  if(kind==='panel')webNode(r);
+  else if(!['profiles','proxy'].includes(kind))webHub(r);
+  return kind;
+}
+function webNonce(request) { return ident(request.headers.get('idempotency-key')||'',80); }
+async function webOverview(r) {
+  const role=getRole(r.env),hub=role!=='node',local=role!=='hub';
+  const bot=hub?await setting(r,'bot'):null,panel=local?await setting(r,'panel'):null;
+  const summary=hub?await getStats(r,'7d'):null;
+  const pending=hub?(await r.first("SELECT COUNT(*) AS n FROM nx_orders WHERE status='pending'")).n:0;
+  const ops=hub?await r.all('SELECT state,COUNT(*) AS n FROM nx_ops GROUP BY state'):[];
+  const localUsers=local?(await r.first('SELECT COUNT(*) AS n FROM nx_panel_users')).n:0;
+  const proxyCounts=await r.first("SELECT COUNT(*) AS total,COUNT(DISTINCT CASE WHEN country<>'ZZ' THEN country END) AS countries,SUM(state='relay_ok') AS verified FROM nx_proxy_catalog");
+  const recent=await r.all('SELECT id,actor,action,target,created_at FROM nx_audit ORDER BY id DESC LIMIT 6');
+  const days=hub?await r.all("SELECT strftime('%Y-%m-%d',created_at/1000,'unixepoch') AS day,COUNT(*) AS orders,COALESCE(SUM(total),0) AS revenue FROM nx_orders WHERE status='done' AND kind='sale' AND created_at>=? GROUP BY day ORDER BY day",now()-7*DAY):[];
+  return {role,version:VERSION,server_time:now(),summary,pending,ops,local_users:localUsers,proxies:proxyCounts,recent,days,currency:bot?.currency||'',main_url:bot?.main_url||'',maintenance:!!bot?.maintenance,node_paused:!!panel?.paused,node_ready:local&&strongSecret(r.env.MASTER_KEY),telegram_configured:!!r.env.BOT_TOKEN&&!!ownerIds(r.env).length,external_catalog_enabled:(await setting(r,'proxy')).external_enabled};
+}
+async function webSettingsSave(r,kind,doc,version) {
+  const value=await validateEdit(r,kind,doc);
+  if(['bot','test','panel','proxy'].includes(kind)){
+    number(version,1,1e9,true);
+    const result=await r.run('UPDATE nx_settings SET value=?,version=version+1,updated_at=? WHERE key=? AND version=?',JSON.stringify(value),now(),kind,version);
+    if(!changes(result))fail('version_conflict',409);
+    invalidate(r,'settings:'+kind);
+    await audit(r,WEB_ACTOR,'setting_saved',kind,{fields:Object.keys(value),validation:'passed',version:version+1});
+    return;
+  }
+  await applyEdit(r,WEB_ACTOR,kind,value,version);
+}
+async function webReceipt(r,id) {
+  webHub(r);ident(id,80);
+  const row=await r.first('SELECT receipt FROM nx_orders WHERE id=?',id),receipt=parse(row?.receipt);
+  if(!receipt)fail('receipt_not_found',404);
+  if(!receipt.file_id)return json({note:String(receipt.note||'')});
+  await rate(r,'web:receipt:'+id,2000);
+  const file=await telegram(r,'getFile',{file_id:receipt.file_id});
+  if(!file.file_path || !/^[A-Za-z0-9_./-]+$/.test(file.file_path) || file.file_path.includes('..'))fail('invalid_telegram_file',502);
+  const res=await r.fetch(`https://api.telegram.org/file/bot${r.env.BOT_TOKEN}/${file.file_path}`,{},8000,8*1024*1024);
+  if(!res.ok)fail('receipt_unavailable',502);
+  await audit(r,WEB_ACTOR,'receipt_viewed',id);
+  const type=res.headers.get('content-type')?.split(';')[0],image=receipt.type==='photo'&&['image/jpeg','image/png','image/webp'].includes(type);
+  return new Response(res.body,{headers:{...noStore,'Content-Type':image?type:'application/octet-stream','Content-Disposition':image?'inline':'attachment; filename="receipt.bin"','Content-Security-Policy':"default-src 'none'; sandbox; frame-ancestors 'none'"}});
+}
+async function webApi(r,request,url) {
+  const path=url.pathname.slice('/admin/web-api/'.length),method=request.method;
+  if(path==='login'&&method==='POST')return webLogin(r,request);
+  const auth=await webAuth(r,request);
+  if(path==='session'&&method==='GET')return json({success:true,role:getRole(r.env),version:VERSION,csrf:auth.csrf,expires_at:auth.expires_at});
+  if(path==='logout'&&method==='POST'){
+    if(auth.hash)await r.run('DELETE FROM nx_web_sessions WHERE token_hash=?',auth.hash);
+    await audit(r,WEB_ACTOR,'web_logout','owner');
+    return json({success:true},200,{'Set-Cookie':sessionCookie()});
+  }
+  if(path==='overview'&&method==='GET')return json(await webOverview(r));
+  if(path.startsWith('proxy/'))return proxyApi(r,request,url,path.slice(6));
+  if(path==='editor'&&method==='GET'){
+    const kind=webEditor(r,url.searchParams.get('kind')),id=url.searchParams.get('id')||'';
+    const data=await editableDoc(r,kind,id);
+    if(['bot','test','panel','proxy'].includes(kind))data.version=(await r.first('SELECT version FROM nx_settings WHERE key=?',kind))?.version||1;
+    return json(data);
+  }
+  if(['validate','save'].includes(path)&&method==='POST'){
+    const b=await bodyJson(request),kind=webEditor(r,b.kind);
+    const doc=await validateEdit(r,kind,b.doc);
+    if(path==='save')await webSettingsSave(r,kind,doc,number(b.version,0,1e9,true));
+    return json({success:true,validated:true,...(path==='validate'?{doc}:{})});
+  }
+  if(path==='catalog'&&method==='GET'){
+    const kind=webEditor(r,url.searchParams.get('kind')),cursor=string(url.searchParams.get('cursor')||'',100),q=string(url.searchParams.get('q')||'',60);
+    if(kind==='nodes'){
+      const rows=await r.all('SELECT n.*,COUNT(s.id) AS active FROM nx_nodes n LEFT JOIN nx_subs s ON s.node_id=n.id AND s.status=? AND s.expires_at>? WHERE n.id>? AND (n.label LIKE ? OR n.id LIKE ?) GROUP BY n.id ORDER BY n.id LIMIT 21','active',now(),cursor,'%'+q+'%','%'+q+'%');
+      return json({items:rows.slice(0,20),next:rows.length>20?rows[19].id:null});
+    }
+    if(kind==='profiles')return json({items:await profiles(r,true),next:null});
+    if(['bot','test','panel','proxy'].includes(kind))fail('use_editor');
+    const rows=await r.all('SELECT * FROM nx_catalog WHERE kind=? AND id>? AND (id LIKE ? OR data LIKE ?) ORDER BY id LIMIT 21',kind,cursor,'%'+q+'%','%'+q+'%');
+    return json({items:rows.slice(0,20).map(row=>({...parse(row.data),version:row.version})),next:rows.length>20?rows[19].id:null});
+  }
+  if(path==='profiles/rollback'&&method==='POST'){
+    const b=await bodyJson(request);await rollbackProfile(r,WEB_ACTOR,ident(b.id));return json({success:true});
+  }
+  if(path==='audit'&&method==='GET'){
+    const before=number(Number(url.searchParams.get('before')||Number.MAX_SAFE_INTEGER),1,Number.MAX_SAFE_INTEGER,true);
+    const rows=await r.all('SELECT * FROM nx_audit WHERE id<? ORDER BY id DESC LIMIT 21',before);
+    return json({items:rows.slice(0,20),next:rows.length>20?rows[19].id:null});
+  }
+  if(path==='receipt'&&method==='GET')return webReceipt(r,url.searchParams.get('id'));
+  if(['orders','subscriptions','customers','operations'].includes(path)&&method==='GET'){
+    webHub(r);
+    const cursor=string(url.searchParams.get('cursor')||'',100),q=string(url.searchParams.get('q')||'',64),filter=string(url.searchParams.get('status')||'',30),id=url.searchParams.get('id');
+    if(id){
+      let row;
+      if(path==='orders')row=await r.first('SELECT o.*,u.name AS customer,u.username FROM nx_orders o LEFT JOIN nx_users u ON u.id=o.user_id WHERE o.id=?',id);
+      else if(path==='subscriptions')row=await r.first('SELECT * FROM nx_subs WHERE id=?',id);
+      else if(path==='customers')row=await r.first('SELECT * FROM nx_users WHERE id=?',Number(id));
+      else row=await r.first('SELECT * FROM nx_ops WHERE id=?',id);
+      if(!row)fail('not_found',404);
+      if(path==='orders')row.receipt={type:parse(row.receipt)?.type||'',note:parse(row.receipt)?.note||'',available:!!row.receipt};
+      if(path==='subscriptions'){const {token,remote_id,bases,...safe}=row;return json({item:{...safe,has_identity:!!remote_id}});}
+      if(path==='operations'){const {remote_id,payload,...safe}=row;return json({item:safe});}
+      return json({item:row});
+    }
+    let rows;
+    if(path==='orders')rows=await r.all('SELECT o.id,o.user_id,o.kind,o.plan_id,o.total,o.status,o.created_at,o.location,u.name AS customer FROM nx_orders o LEFT JOIN nx_users u ON u.id=o.user_id WHERE o.id>? AND (?=\'\' OR o.status=?) AND (o.id LIKE ? OR u.name LIKE ? OR CAST(o.user_id AS TEXT)=?) ORDER BY o.id LIMIT 21',cursor,filter,filter,'%'+q+'%','%'+q+'%',q);
+    else if(path==='subscriptions')rows=await r.all('SELECT s.id,s.name,s.user_id,s.node_id,s.status,s.expires_at,s.limits FROM nx_subs s WHERE s.id>? AND (?=\'\' OR s.status=?) AND (s.name LIKE ? OR CAST(s.user_id AS TEXT)=?) ORDER BY s.id LIMIT 21',cursor,filter,filter,'%'+q+'%',q);
+    else if(path==='customers')rows=await r.all('SELECT id,username,name,lang,balance,banned,admin,last_at,created_at FROM nx_users WHERE id>? AND (name LIKE ? OR username LIKE ? OR CAST(id AS TEXT)=?) ORDER BY id LIMIT 21',Number(cursor||0),'%'+q+'%','%'+q+'%',q);
+    else rows=await r.all('SELECT id,kind,user_id,node_id,state,phase,error,retry_at,created_at FROM nx_ops WHERE id>? AND (?=\'\' OR state=?) AND (id LIKE ? OR CAST(user_id AS TEXT)=?) ORDER BY id LIMIT 21',cursor,filter,filter,'%'+q+'%',q);
+    return json({items:rows.slice(0,20),next:rows.length>20?String(rows[19].id):null});
+  }
+  if(path==='orders/decide'&&method==='POST'){
+    webHub(r);const b=await bodyJson(request);ident(b.id,80);
+    if(b.action==='approve')return json(await approveOrder(r,WEB_ACTOR,b.id));
+    if(b.action==='reject'){await finishOrder(r,b.id,'rejected',string(b.reason,500,1),WEB_ACTOR);return json({success:true});}
+    fail('invalid_action');
+  }
+  if(path==='operations/retry'&&method==='POST'){
+    webHub(r);const b=await bodyJson(request);if(!['','absent','reset'].includes(b.manual||''))fail('invalid_retry_confirmation');await retryOp(r,WEB_ACTOR,ident(b.id,80),b.manual||'');return json({success:true});
+  }
+  if(path==='subscriptions/action'&&method==='POST'){
+    webHub(r);const b=await bodyJson(request);if(!['toggle','reset','delete'].includes(b.action))fail('invalid_action');
+    await adminSubAction(r,WEB_ACTOR,ident(b.id,80),b.action,'web:'+webNonce(request));return json({success:true});
+  }
+  if(path==='customers/action'&&method==='POST'){
+    webHub(r);const b=await bodyJson(request),id=number(b.id,1,Number.MAX_SAFE_INTEGER,true);
+    const u=await r.first('SELECT * FROM nx_users WHERE id=?',id);if(!u)fail('user_not_found',404);
+    if(b.action==='ban'){
+      if(ownerIds(r.env).includes(id)||u.admin)fail('cannot_ban_admin');
+      await r.batch([['UPDATE nx_users SET banned=? WHERE id=?',+bool(b.banned),id],auditStmt(WEB_ACTOR,'user_ban_changed',id,{banned:b.banned})]);
+    }else if(b.action==='wallet'){
+      const key='web-wallet:'+webNonce(request),amount=number(b.amount,-1e12,1e12,true);if(!amount)fail('invalid_amount');
+      const reason=string(b.reason,200,1),old=await r.first('SELECT user_id,amount FROM nx_ledger WHERE key=?',key);
+      if(old&&(old.user_id!==id||old.amount!==amount))fail('idempotency_conflict',409);
+      await r.batch([
+        ['INSERT OR IGNORE INTO nx_ledger(key,user_id,amount,kind,reference,created_at) VALUES(?,?,?,\'admin_adjustment\',?,?)',key,id,amount,reason,now()],
+        auditStmt(WEB_ACTOR,'wallet_adjusted',id,{amount,reference:key})
+      ]);
+    }else if(b.action==='test_reset')await resetTestCooldown(r,WEB_ACTOR,id);
+    else fail('invalid_action');
+    return json({success:true});
+  }
+  if(path==='node-users/validate'&&method==='POST'){webNode(r);return json({validated:true,doc:validatePanelUser(await bodyJson(request))});}
+  if(path==='node-users'){
+    webNode(r);const id=url.searchParams.get('id')||'',panel=await setting(r,'panel');
+    if(method==='GET'){
+      if(id){const row=await r.first('SELECT data FROM nx_panel_users WHERE id=?',id);if(!row)fail('user_not_found',404);return json({item:await panelGet(r,id,url.origin),doc:parse(row.data)});}
+      const q=string(url.searchParams.get('q')||'',64),cursor=string(url.searchParams.get('cursor')||'',80);
+      const rows=await r.all('SELECT u.*,x.up,x.down,x.day,x.day_up,x.day_down FROM nx_panel_users u LEFT JOIN nx_panel_usage x ON x.id=u.id AND x.epoch=u.epoch WHERE u.id>? AND (u.name LIKE ? OR u.id=?) ORDER BY u.id LIMIT 21',cursor,'%'+q+'%',q);
+      return json({items:rows.slice(0,20).map(row=>enrichedPanel(row,row,url.origin,panel.api_route)),next:rows.length>20?rows[19].id:null});
+    }
+    const nonce=webNonce(request);let result;
+    if(method==='POST'&&!id)result={user:await panelCreate(r,await bodyJson(request),'web:'+nonce)};
+    else if(id&&['POST','PUT','DELETE'].includes(method))result=await panelMutate(r,id,method,method==='PUT'?await bodyJson(request):{},url.searchParams.get('action')||'','web:'+nonce);
+    else fail('method_not_allowed',405);
+    await audit(r,WEB_ACTOR,'web_node_user_changed','user#'+(await digestHex(result.user?.id||id)).slice(0,16),{method});
+    return json({success:true,...result});
+  }
+  if(path==='nodes/health'&&method==='POST'){
+    webHub(r);const b=await bodyJson(request),n=await r.first('SELECT * FROM nx_nodes WHERE id=?',ident(b.id));if(!n)fail('node_not_found',404);
+    await rate(r,'web:health:'+n.id,5000);const info=await nodeRequest(r,n);
+    await r.run('UPDATE nx_nodes SET last_health_ok=? WHERE id=?',now(),n.id);
+    return json({success:true,total:Number(info.total),max_users:n.max_users,exit_country_verified:false});
+  }
+  if(path==='keys'){
+    webNode(r);
+    if(method==='GET')return json({items:await r.all('SELECT id,name,secret_ref,created_at FROM nx_panel_keys ORDER BY created_at LIMIT 8')});
+    if(method==='POST'){
+      const b=await bodyJson(request);keys(b,['name','secret_ref']);string(b.name,80,1);ref(b.secret_ref);
+      if(!strongSecret(r.env[b.secret_ref])||controlSecret(r.env,r.env[b.secret_ref]))fail('set_distinct_panel_key_secret_first');
+      if((await r.first('SELECT COUNT(*) AS n FROM nx_panel_keys')).n>=8)fail('too_many_keys');
+      const id=randomId(8);await r.batch([['INSERT INTO nx_panel_keys(id,name,secret_ref,created_at) VALUES(?,?,?,?)',id,b.name,b.secret_ref,now()],auditStmt(WEB_ACTOR,'key_registered',id,{secret_ref:b.secret_ref})]);return json({success:true,id});
+    }
+    if(method==='DELETE'){const id=ident(url.searchParams.get('id'));await r.batch([['DELETE FROM nx_panel_keys WHERE id=?',id],auditStmt(WEB_ACTOR,'key_revoked',id)]);return json({success:true});}
+  }
+  fail('not_found',404);
 }
 
 // ---------------- Telegram authentication, bounded client, localized navigation ----------------
@@ -1263,7 +1849,7 @@ async function send(r,u,text,buttons=[]) {
 }
 const back = u => ({label:t(u,'🔙 منوی اصلی','🔙 Main menu'),action:'home'});
 async function adminIds(r){const db=await r.all('SELECT id FROM nx_users WHERE admin=1 LIMIT 5');return [...new Set([...ownerIds(r.env),...db.map(x=>x.id)])].slice(0,5);}
-async function isAdmin(r,id){if(ownerIds(r.env).includes(Number(id)))return true;const u=await r.first('SELECT admin,banned FROM nx_users WHERE id=?',id);return !!u?.admin&&!u.banned;}
+async function isAdmin(r,id){if(id===WEB_ACTOR)return true;if(ownerIds(r.env).includes(Number(id)))return true;const u=await r.first('SELECT admin,banned FROM nx_users WHERE id=?',id);return !!u?.admin&&!u.banned;}
 async function userRow(r,from,start='') {
   number(from.id,1,Number.MAX_SAFE_INTEGER,true);
   let u=await r.first('SELECT * FROM nx_users WHERE id=?',from.id);
@@ -1297,6 +1883,7 @@ async function membership(r,u) {
 async function home(r,u) {
   const bot=await setting(r,'bot'),admin=await isAdmin(r,u.id);
   const text=await customText(r,u,'main',t(u,'به NexiUP خوش آمدید. چه کاری انجام دهیم؟','Welcome to NexiUP. What would you like to do?'));
+  /** @type {MenuButtons} */
   const buttons=[
     [{label:t(u,'🛒 خرید اشتراک','🛒 Buy subscription'),action:'shop'},{label:t(u,'📦 اشتراک‌های من','📦 My subscriptions'),action:'subs'}],
     [{label:t(u,'🧪 دریافت کانفیگ تست','🧪 Get test configuration'),action:'test'},{label:t(u,'📖 راهنمای اتصال','📖 Import guides'),action:'guides'}],
@@ -1373,6 +1960,7 @@ async function usageSub(r,u,id) {
 }
 
 async function adminMenu(r,u) {
+  /** @type {MenuButtons} */
   const buttons=[
     ['nodes','🌐 نودها / Nodes'],['profiles','📡 پروفایل اپراتور / Profiles'],['test','🧪 تنظیمات تست / Test settings'],
     ['plans','🛒 پلن‌ها / Plans'],['payments','💳 پرداخت / Payments'],['guides','📖 راهنما / Guides'],['channels','📢 عضویت / Channels'],['coupons','🎟 تخفیف / Coupons'],['texts','📝 متن‌ها / Texts'],['bot','⚙️ تنظیمات ربات / Bot settings'],['panel','🛡 تنظیمات نود محلی / Local node']
@@ -1405,6 +1993,7 @@ async function beginEdit(r,u,kind,id) {
 }
 async function reviewOrder(r,u,id) {
   const o=await r.first('SELECT * FROM nx_orders WHERE id=?',id);if(!o)fail('order_not_found');const rec=parse(o.receipt);
+  /** @type {MenuButtons} */
   const buttons=o.status==='pending'?[{label:'✅ تأیید / Approve',action:'approve',id},{label:'❌ رد با علت / Reject with reason',action:'reject',id}]:[];
   if(o.status==='processing')buttons.push({label:'صدور و بازیابی / Operations',action:'ops'});
   buttons.push({label:'🔙 سفارش‌ها / Orders',action:'orders'});
@@ -1464,6 +2053,7 @@ async function usersMenu(r,u,cursor='0') {
 }
 async function userView(r,u,id) {
   const x=await r.first('SELECT * FROM nx_users WHERE id=?',Number(id));if(!x)fail('user_not_found');
+  /** @type {MenuButtons} */
   const buttons=[{label:x.banned?'رفع مسدودی / Unban':'مسدود / Ban',action:'ban',id:String(id)+'~'+(x.banned?'0':'1')},{label:'اصلاح کیف پول / Adjust balance',action:'balance',id:String(id)},{label:'پیام مستقیم / Message',action:'directmsg',id:String(id)},{label:'اشتراک‌ها / Subscriptions',action:'usersubs',id:String(id)},{label:'بازنشانی cooldown / Reset cooldown',action:'cooluser',id:String(id)}];
   if(ownerIds(r.env).includes(u.id))buttons.push({label:x.admin?'حذف مدیر / Revoke admin':'افزودن مدیر / Grant admin',action:'setadmin',id:String(id)+'~'+(x.admin?'0':'1')});
   buttons.push({label:'🔙 کاربران / Users',action:'users'});
@@ -2001,7 +2591,10 @@ async function housekeeping(r) {
     ['DELETE FROM nx_jobs WHERE id IN(SELECT id FROM nx_jobs WHERE created_at<? AND status<>? LIMIT 50)',now()-7*DAY,'queued'],
     ['DELETE FROM nx_states WHERE user_id IN(SELECT user_id FROM nx_states WHERE expires_at<? LIMIT 50)',now()],
     ['DELETE FROM nx_limits WHERE key IN(SELECT key FROM nx_limits WHERE next_at<? LIMIT 100)',now()-DAY],
-    ['DELETE FROM nx_flush WHERE id IN(SELECT id FROM nx_flush WHERE created_at<? LIMIT 100)',now()-7*DAY]
+    ['DELETE FROM nx_flush WHERE id IN(SELECT id FROM nx_flush WHERE created_at<? LIMIT 100)',now()-7*DAY],
+    ['DELETE FROM nx_web_sessions WHERE expires_at<=?',now()],
+    ['DELETE FROM nx_proxy_imports WHERE expires_at<=?',now()],
+    ['DELETE FROM nx_proxy_budgets WHERE day<?',new Date(now()-7*DAY).toISOString().slice(0,10)]
   ]);
 }
 async function reports(r) {
@@ -2031,6 +2624,7 @@ function page(title,body,script='',lang='fa') {
 function dashboard() {
   return page('Node panel',`
     <header><div><span class="badge">NexiUP / Node control</span><h1>پنل نود · Node panel</h1></div><button id="lang" class="secondary">English / فارسی</button></header>
+    <p class="notice"><a href="/admin">پنل کامل جدید + ProxyIP / New control center →</a></p>
     <p class="notice">اطلاعات ورود فقط در حافظه همین صفحه می‌ماند. Master Key را در تلگرام یا URL نفرستید. / Credentials stay in page memory. Never put the master key in Telegram or a URL.</p>
     <section class="card"><div class="row"><div><label for="key">Master Key (Worker Secret)</label><input id="key" type="password" autocomplete="off" placeholder="32+ random characters"></div><div><button id="login">ورود / Sign in</button><button id="logout" class="secondary">خروج / Sign out</button></div></div><p id="status" role="status">API: Bearer authentication • API keys cannot change master settings.</p></section>
     <section id="app" class="hidden">
@@ -2182,7 +2776,11 @@ export default {
     const r=runtime(env,execution);
     try{
       const role=getRole(env),url=new URL(request.url);
+      // Never serve a credential-entry form over plaintext HTTP. API writes still fail closed.
+      if(url.protocol==='http:'&&['GET','HEAD'].includes(request.method)&&(url.pathname==='/admin'||url.pathname==='/admin/'||url.pathname==='/setup'||url.pathname.endsWith('/dash'))){url.protocol='https:';url.port='';return new Response(null,{status:308,headers:{...noStore,Location:url.toString()}});}
       if(url.pathname==='/health')return json({project:'NexiUP',version:VERSION,role});
+      if((url.pathname==='/admin'||url.pathname==='/admin/')&&request.method==='GET'&&!url.searchParams.has('sub'))return adminPage();
+      if(url.pathname.startsWith('/admin/web-api/'))return await webApi(r,request,url);
       if(url.pathname==='/setup')return await setup(r,request);
       if(url.pathname==='/webhook'){
         if(role==='node'||request.method!=='POST')fail('not_found',404);
@@ -2211,6 +2809,318 @@ export default {
   }
 };
 
+// ---------------- Self-contained, bilingual web UI; no remote assets, framework or telemetry ----------------
+function adminPage() {
+  const nonce=randomId(16);
+  return new Response(`<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><meta name="robots" content="noindex,nofollow"><title>NexiUP · مرکز کنترل</title><style nonce="${nonce}">${ADMIN_STYLE}</style></head><body>
+    <section id="login-screen" class="login-screen">
+      <div class="login-art"><div class="wordmark"><span class="brand-mark">N</span><span dir="ltr">Nexi<span class="accent">UP</span></span></div><div class="login-story"><span class="eyebrow">YOUR NETWORK. YOUR CONTROL.</span><h1 data-i18n="loginTitle">یک نمای روشن<br>از تمام شبکه‌تان.</h1><p data-i18n="loginIntro">مدیریت نودها، اشتراک‌ها و مسیرهای اتصال، در یک پنل مستقل و امن.</p><div class="orbit" aria-hidden="true"><div class="orbit-ring r1"></div><div class="orbit-ring r2"></div><div class="orbit-core">N</div><span class="orbit-node n1">HUB</span><span class="orbit-node n2">NODE</span><span class="orbit-node n3">TLS</span></div></div><span class="login-foot">CLOUDFLARE WORKERS + D1 · SELF-HOSTED</span></div>
+      <div class="login-form-wrap"><button class="language-button" data-action="language">English / فارسی</button><div class="login-form-inner"><span class="tiny-label">NEXIUP CONTROL CENTER</span><h2 data-i18n="welcome">به مرکز کنترل خوش آمدید</h2><p class="muted" data-i18n="loginHint">با کلید مدیریت Worker وارد شوید. این کلید در مرورگر ذخیره نمی‌شود.</p><form id="login-form"><label for="admin-key" data-i18n="adminKey">کلید مدیریت</label><input id="admin-key" type="password" autocomplete="off" spellcheck="false" dir="ltr" minlength="32" maxlength="256" required placeholder="WEB_ADMIN_KEY"><button type="submit" class="button primary wide" id="login-button" data-i18n="signIn">ورود امن به پنل</button></form><p id="login-status" role="status" aria-live="polite"></p><div class="login-help"><span class="shield">◇</span><p data-i18n="keyHelp">WEB_ADMIN_KEY؛ اگر تعریف نشده: SETUP_KEY برای hub/all و MASTER_KEY برای node. کلید باید حداقل ۳۲ کاراکتر تصادفی باشد.</p></div><a href="/setup" class="text-link" data-i18n="setupLink">راهنمای آماده‌سازی و مهاجرت دیتابیس ↗</a></div><p class="privacy-note" data-i18n="privacyNote">کوکی HttpOnly · نشست ۳۰ دقیقه‌ای · بدون سرویس تحلیلی بیرونی</p></div>
+    </section>
+    <div id="app-shell" class="app-shell" hidden>
+      <button id="nav-backdrop" class="nav-backdrop" aria-label="Close menu" data-action="menu"></button>
+      <aside class="sidebar" id="sidebar"><a class="wordmark" href="#overview"><span class="brand-mark">N</span><span dir="ltr">Nexi<span class="accent">UP</span></span><span class="version-tag">2.1</span></a><div class="workspace"><span class="workspace-icon">W</span><div><strong data-i18n="workspace">فضای مدیریت شما</strong><span id="workspace-role">Workers + D1</span></div><span class="workspace-dot"></span></div><nav id="navigation" aria-label="Navigation"></nav><div class="sidebar-bottom"><div class="private-note"><span>◈</span><div><strong data-i18n="independent">مستقل، در اختیار شما</strong><small data-i18n="noExternalAssets">بدون فایل یا رابط کاربری بیرونی</small></div></div><button class="account" data-action="logout"><span class="avatar">N</span><span><strong data-i18n="owner">مدیر سیستم</strong><small data-i18n="signOut">خروج از نشست امن</small></span><span class="logout-arrow">↗</span></button></div></aside>
+      <div class="main-shell"><header class="topbar"><div class="breadcrumbs"><button class="icon-button mobile-menu" data-action="menu" aria-label="Menu" aria-expanded="false" aria-controls="sidebar">☰</button><span data-i18n="controlCenter">مرکز کنترل</span><span class="slash">/</span><strong id="breadcrumb"></strong></div><div class="top-actions"><span class="secure-status"><span></span><span data-i18n="secureSession">نشست امن</span></span><button class="language-button" data-action="language" id="language-toggle">EN</button><span class="avatar small">N</span></div></header>
+      <div id="preview-banner" class="preview-banner" hidden data-i18n="previewNotice">پیش‌نمایش محلی با داده‌های ساختگی؛ تست شبکه و تماس با سرویس‌های واقعی در این پیش‌نمایش غیرفعال است.</div>
+      <main class="content"><div class="page-heading"><div><div class="tiny-label" id="section-label">WORKSPACE OVERVIEW</div><h1 id="page-title"></h1><p id="page-subtitle" class="muted"></p></div><div id="page-actions" class="actions"></div></div><div id="page-content" aria-live="polite"></div><footer class="page-footer"><span>NexiUP <span id="app-version">${VERSION}</span> · MIT / Font OFL</span><span data-i18n="footerNote">داده‌ها در D1 شما · نتیجهٔ تست، تضمین اتصال نیست</span></footer></main></div>
+    </div>
+    <dialog id="modal" aria-labelledby="modal-title"><div class="modal-head"><div><span class="tiny-label">NEXIUP / CONTROL</span><h2 id="modal-title"></h2></div><button class="icon-button" data-action="close-modal" aria-label="Close">×</button></div><div id="modal-body"></div><div id="modal-footer" class="modal-footer"></div></dialog>
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div><script nonce="${nonce}">${ADMIN_SCRIPT}</script></body></html>`,{headers:{...noStore,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src 'self' data: blob:; connect-src 'self'; font-src data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,'X-Frame-Options':'DENY','Permissions-Policy':'camera=(), microphone=(), geolocation=()'}});
+}
+const ADMIN_STYLE = String.raw`
+/*!
+ * Embedded unmodified Arabic variable font from @fontsource-variable/vazirmatn 5.3.0.
+ * Font bytes: SIL OFL-1.1, not MIT. No runtime font request.
+ * Copyright 2015 The Vazirmatn Project Authors (https://github.com/rastikerdar/vazirmatn)
+ *
+ * This Font Software is licensed under the SIL Open Font License, Version 1.1.
+ * This license is copied below, and is also available with a FAQ at:
+ * http://scripts.sil.org/OFL
+ *
+ *
+ * -----------------------------------------------------------
+ * SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
+ * -----------------------------------------------------------
+ *
+ * PREAMBLE
+ * The goals of the Open Font License (OFL) are to stimulate worldwide
+ * development of collaborative font projects, to support the font creation
+ * efforts of academic and linguistic communities, and to provide a free and
+ * open framework in which fonts may be shared and improved in partnership
+ * with others.
+ *
+ * The OFL allows the licensed fonts to be used, studied, modified and
+ * redistributed freely as long as they are not sold by themselves. The
+ * fonts, including any derivative works, can be bundled, embedded,
+ * redistributed and/or sold with any software provided that any reserved
+ * names are not used by derivative works. The fonts and derivatives,
+ * however, cannot be released under any other type of license. The
+ * requirement for fonts to remain under this license does not apply
+ * to any document created using the fonts or their derivatives.
+ *
+ * DEFINITIONS
+ * "Font Software" refers to the set of files released by the Copyright
+ * Holder(s) under this license and clearly marked as such. This may
+ * include source files, build scripts and documentation.
+ *
+ * "Reserved Font Name" refers to any names specified as such after the
+ * copyright statement(s).
+ *
+ * "Original Version" refers to the collection of Font Software components as
+ * distributed by the Copyright Holder(s).
+ *
+ * "Modified Version" refers to any derivative made by adding to, deleting,
+ * or substituting -- in part or in whole -- any of the components of the
+ * Original Version, by changing formats or by porting the Font Software to a
+ * new environment.
+ *
+ * "Author" refers to any designer, engineer, programmer, technical
+ * writer or other person who contributed to the Font Software.
+ *
+ * PERMISSION & CONDITIONS
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of the Font Software, to use, study, copy, merge, embed, modify,
+ * redistribute, and sell modified and unmodified copies of the Font
+ * Software, subject to the following conditions:
+ *
+ * 1) Neither the Font Software nor any of its individual components,
+ * in Original or Modified Versions, may be sold by itself.
+ *
+ * 2) Original or Modified Versions of the Font Software may be bundled,
+ * redistributed and/or sold with any software, provided that each copy
+ * contains the above copyright notice and this license. These can be
+ * included either as stand-alone text files, human-readable headers or
+ * in the appropriate machine-readable metadata fields within text or
+ * binary files as long as those fields can be easily viewed by the user.
+ *
+ * 3) No Modified Version of the Font Software may use the Reserved Font
+ * Name(s) unless explicit written permission is granted by the corresponding
+ * Copyright Holder. This restriction only applies to the primary font name as
+ * presented to the users.
+ *
+ * 4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
+ * Software shall not be used to promote, endorse or advertise any
+ * Modified Version, except to acknowledge the contribution(s) of the
+ * Copyright Holder(s) and the Author(s) or with their explicit written
+ * permission.
+ *
+ * 5) The Font Software, modified or unmodified, in part or in whole,
+ * must be distributed entirely under this license, and must not be
+ * distributed under any other license. The requirement for fonts to
+ * remain under this license does not apply to any document created
+ * using the Font Software.
+ *
+ * TERMINATION
+ * This license becomes null and void if any of the above conditions are
+ * not met.
+ *
+ * DISCLAIMER
+ * THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
+ * OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
+ * COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
+ * DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
+ * OTHER DEALINGS IN THE FONT SOFTWARE.
+ */
+  @font-face{font-family:Vazirmatn;font-style:normal;font-weight:100 900;font-display:swap;src:url(data:font/woff2;base64,d09GMgABAAAAALTkABQAAAABq6gAALRxAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGollG+Q4HJNSP0hWQVKKGAZgP1NUQVSBGicuAIYmL2wRCAqB+UyB3QYLiDwAMILybAE2AiQDkHQEIAWFbgeyKgwHW8eXkQLqZEkB2FX3HdVtCPCTM01ZLm4LpnDtoPM2va3ciQAV7JgFbgcESqU/wNn/////vyKZyJglab0kAdpWUAZDdG7vEyRVFc1UgELVwz10GKfiVEDV3XgrI6iHG8eU6Zo6p+ACFvEGERDuTlg5WoSIjF95W1SyTUS+Pe8aQdtdjHxz3qAg/eYH8yRnB0gndDJS9gBTMF3Zafv3o5KDJp+qCFDlwBB1MGfPQ1Kjoxfme5QI7qMIiIAIpPbbpgs7W7TeGmiI5erLTsNQ+Iu6GTemAhgaXfvzR6zVUcbRWZCTmVK8RST8ilD5LmiWlXYJKbiYbV//2L8Q60yaOH8A/fAbmeU5V46VHmRcCYLiVOUAyFUwV+5O45czsz6SwWlP+l/8OhUWMUYEi/HFdmYmAiKQOgXVSSXtbi/lFXac8w0Udm7GGtitsgbeQF2FozGlMq3eV7YMQ7A7+fIuwR3ioMmDVPM4rTPfLq+LwJO/C82X41k2ac4wGvvkqOI6wHYtEIUdxbCKHuMTvqe6/zoRNzPr/WqQI7W0GoFeNVzD83Z77/+b3zrnnMPFZXUhIWlJRkbsrKyRkGSt7MwjCdmzrFlaGnNzZpIUB1/8Gv95qrvrzkP4iC5AEsiF1aoQqVUbR0bHAykXCWxZ8ps7zUO0X9mrru4/AZKJW6HiSBJKskSzG1YH6NwZi0KeUGdMpn/Nk5v1SYAEqOh22pG2s2Kaytrt72nfv5z+4ZoQJOANQTRogpgEatP6dMT5Yjb8t2n/BwJpSsQrK8mKSu8+Uf+Uv/e9MN13RbxikXbTpI2ig/kAw6BzZhhRdBCzyraqmD6DWcMXU0mST7L34fm59UiDyMGIXrOxAhYwWMbfWLCxjY1YwOiBpI0OBQUBBStQSvGUb+R5VV61ceW1cZFS4O6+JZpwhClHnlI//ab/nRFs0LQkbarXbN0l8FS+dv9N/YpTMSIQZNCBCNfIySbZHOADkgbUIvBFp6pMK2WHp20+d3DEUSpg4jvsg7W18NgaFsXSWrg//Jv+zUhMUs85h4tm2fzs+5m6qDOKrU0KnnC/bbf7gplHYqSS8FCjPBB1Uxij6BN4YNIh9PZTQjDMf272f0dE+qTTEa8jpQyUGDEjBBIgIYEEsyAW5pyev1v6ZmW6E7eibIxuqcXLkKK1ldY1OKgPzyKcQ7hZTSgaQgIxopMQAgSxBKqBOqXr3TNT4FWlJ2asWFeM7XVbAupwj4+KsqYZKFTb6uYvNfgIU5Rj1T1VtUFKHF2c2E5frUogGyBDcHCosimlCf34f2TPmXDuC75hM/WnkCTJvXtxcua3gLBg25cbS47khNTA///v9/uFWWOQTJJotDuIlELohDbfOSWjZt/3FzOK4X1uqaUw991lzUzaZckQRHa3ZFg2htjezt156n525YdIA0GsfX8nc9eJIq7oeGtSBwC4AI2ABgSwdN4BVnOATVhb7KT6BrFCVdXbUCHYHMF1PxBZSHX/v6r2te8CBERNlCZFec7X//TfkIqGCg4bQiyqLcGHBz4CIEgla0TDGmusidIEUXJQmADgARBIgnSSHOUJDvmc/THI1vw5sv2Dw4aUoiudrUIsym3aVKVui36bdttyy912zxplapZOw7AWsti3A9mRH7xdfhDx9D7IPwoWho8FQPIAyAE8mT1QZo+UGSx50gJyPELGed4b42dxbmhetaAc5HkyLsg+c8ZG6YcfZZ8FPsveKtUyxXQXSyQgg719nHnjIEOKCS7P7kG8Xe4Z4ngOt+/4K7dvCTm8SSMFkbGxIimzV6ppi9PhrCOB/xdEJzqSCrkpzFHlplVTHfYWPBDhmQCKFJ4KpEJKAB2YnGInVXLrNqbqXbp0ZbeuWje1efh32c9ScukPuvP7WGtgJkNooUeupAvXN3z1D1YC/Ls9vp5r0Y5lbchbqYiIn92NKmqibM/uvT00TdEMoRARTyTkguSCJ0Fq32dZzkggFQ3jqGxLBWlPH89bxHPqAWdIMdXDp2PV2Kt7nrd9JElysQhFBaYAU2in18z9GFMLjrY/xsj7K40sR6hNEKmcBwrQW/509uQQdArom/FsLrrgMzwlBArV/T+R+RCCNAgOCB4CCGTIIPAjCEQUHUSMGAQGSRAmaSgsMiCyNkFgOwhi4wgUP34g/gKgHJUNJIccUDg8BnniCYSnloAswwMJQEAIQnOgLGQBIkvFARWveBCd0AmgEpQEomQlA5UiDohygwa0aDBBgICUAREQ/wLiRUA8DOBbgAsBTAEYDgcCAkDNeJIbPZDaxIKqJgGchQGCAAGccqbUa6Vdq/haZ6/Vfq3c2xXcLvVBuQ9KfVTFs1Jf1fiq5lede9Xg+5I/lPahrE/1/yx3PkitQW0nQAdBAGjZFXu992OjBeL65t64qKZ9lWcSXKaSvIOHy9a6PMLqKJ0XvpcXbl7hMRWeULGGlXC4EoIrIRTnMOjcK+gLwAB04rfxPzY8z/gkHcZGikvVUx6qkWqh/LTNAtlaHa0i1inPCHAECg4BiYRGjjwODTp0mTJriaZsX93Frnf/IE43iBBDjnyUoxNT4x/CqV0/RoNsDQQKTyCSpChy8gr38Km/d1d6Xbt/sDP1MpiRWa2Z8MSkMjlffe7O/BT/xL28mBJdqZFqzae8RE8YoEVBJSaLraZBQqtKPY8GPZ9oksrV3L+hYW0Tv1FwYWCJwiMDUVAZokadOfQ9oDPjxfEFHWJkY53YYtLlilVUUIoMpZWRrZoW5vOZRVZvRzfcMS+52HLPnKEVqzZsJZELKaaad2XdkR7hwJO57OUufPQzjPpkizAEo1CzWYRFGCQKjRHF4YkkMkih0sQlGNKy8orKTBZbzSQN/Zf9SnixmLiE1OJlqxxyqcve8LyTSy+9QT3Tl0KqGU8jyzmUN1ZPLaWVXoUaGZHBT3rCmZ7l+4CX+i8lLaMkVFFV0zBtwbKmlkNeZt6T9O74Cp957NEPj3/Ug1qWoZ6pt9Jb6633nuw903u291rv7d7/rqCT/YqcNJ788/X/jFHkgAsTMYDS84aeYc2A0yX3/T210adum3omF2PMRR+OPunqvfnewuNLR1fCYmCJhZr2xjMvP4MeO/vVpZuvvrYxCBuPABNAAAIMXxwwm0tArBgMCEA/vV2GUj3Li6puBHLJCtMNs0NSNFT0pJHOmpY9A2bEYECA4fjDpwuQrWV5Q73MhaXQCSDIi0wAwDQ6gADU2GsDP+uj9+7TehL65CnlZzGftlivQl+8w9p6fjnAggNAIwjwmUuggnisIhpLgLjPlz8dsHjyxprO3D2fRvTofkRZ/p/2Lgw+QFUvJMhn0sHQ8/0GaL/KJ1U7htEqu5UilXZKjlgWgkFDDpFA/m8UPU9ilAB4/4MyLpQCwLG/gR8cTHQUGBC/NRrI9FwDUDobDUCpznOVtN8zSblY3wfPpIQ7Jk0YoY9ztFBHBcXkk00aCaKFCuTLgxNbFozp0aIJWmz099LGZWqDRShh/cWgpmvZrGt4JS5IDE7wdumOT417VIo+QXk6AhKiL066IGF/XHPxo/AUYkKqDtSZfvos+VEWc7Fe6Ql96/itC+IX+48uE0ALL2eetWGhX3KsMI3g6ZhfXX+LjflpjZ+8hvCoLfYvrEgCAgE6NOIabjoYzMYpCKDau3nlEwBIbsv+XJj15unzzCuromT9BuP1h/yfc3LjADYoAErXiU12ZKuex4uqA/afjSyncdKfnU4/gqN93qRPar2/tbyqumpLliWzk+F0N7oxfSedTaeK/pdxL59dTly2JQoTCYvBba+x/EYYg+Hp8NP/hCb0ue85Gywz33Tj7VvVUJE2Sus0ToP6X7pY0e62rdnQvKY1tuXyxRqlMhRN9uHA8bFPHRwicRGB2E1ygQyTIFmYpGOvB+z/HLVbKROyu4tNPXrERCOZiBAJh1dGGCzBmu+756+AMuTvkT7x00d168uDdDb7YS2MEb2TLn+J8531Wq7g4s910HF/bxODlzz2MHw1Uuo9/737TuZOmlIcTlISnebUxRIo4pTGjJFSyyDUuELLhsbt847rzHEK6d7lJxTUbH2li52zZNJ+rK+mBBGKyaNj9ahCHMXLJ6O4okiQO3hg8bQl31q35dN2F3y+cbLiid0bew9dz1auOsHBmS3czKobXi+6OvXJj2fuTFlK95TM5qPPrYc5DA1/83Oafx7p0Eb7/sPFT4PjgHVyn1F8xBA9tPMeu9jGBlaxhAXkMJ1JjKWfdqopJPv3Y6ciBbrdsO/wObe5inGWssBZp5t0Zassc7y6B4b2byostO2qyiw0T/b0yeNCCPFXOIe4k3wVYd1Z9amSKVQN5dvwFr+Xe4mJsTDXJGCeI8UVvoez9qvFv6QyK6H8VVf6EqZHgl160eWm/x49CCAQwCG60IRiJCESLkA/10UsieMRck+gGCpYYJHu6P9czB/5KMeyIyuyIDMzIYPSJy1Se7TpR1up5gTVlVI5vQoGivvPIO51o9SgIMu00MkmR5Q7oPv/17h8NWRyRZiMJ9Z0rMsB31S/b18Np/r5RZ2rZ89shTcvSKM+Q6glgF/9aRDGBu+6QjpxBwd3OP0RkUg5zSnGgIGpdwnUXV4WaQYAB2v7JOXe8HxBmU/TNLyXC9cIHjGd67IfhL2ux67iUNXDaRENppWuEEBibfHmw9cXYGNH3SMI0OlJXL5NWpOCpy9EoR2espjiWRdMxBcB9O8DnR9R1+jnTj7pTrDY/Y62x2l1hD0qJzn1cvAEE5fLuu9pDQkv+vr20+LQBQX/Mno40B9HvXWrmigCvd0rkx6Oxdq57JpaeNKhFLCjyd84wO2pmGJIJELDz4GX+V6OPqNbvQ7osvbVxzGd/7yGb1576JVnTPg++KQ/HWE6lgrdDgCzU0279Djg2Edu0ZXEIFhTXJrlVwFDRmeq4CGCLR+tVRGDmgvxQoR6EtBp2m4pyRuPXIQ0XYEn2hE1v4pUdr6XdZvzOZLTeEQwu1BhtSZ6OHa/WJJRYJ3okbVuLGPb0hMGXn+GfDPARJLOfYhFEmHSMQ5X/0BTsEEupTracAp/lm3sxoef9tWd7/DdxyTi3HY/KaUCLzi18v6nKDfQLpFrVMW9nXZ3Qc9XZHXIbHh3Vd/LC3/pSM03H+uANt3mXVNNULNJOwbjsTIoFnwqAzg+MmwmEElY85Fi88YEEN4k/foL1jFhuidxLVYFwtLQFkxscqeimRGCHYadZNMZiEW17AsmjBSO8utrjQoIj9l0iN32MqoNrkwMkci3uA4vFmY1oPPeNQ3Mqn6HWQ+MQ3+OcswEgbTUMH/0q8WdCM5PYB2YmH3dXFT2DRJiMX8LcBeC9Jc2fNvE4sADbMAfTC8Er5p5SCNDvNO1OycjANP9qpnXkQT4E5qyhbpLGTSc58dCSsTHlTNTCzlhHUtjuugsNRkrHF1NbnFxaBOri/PdLuG0/H9E3WYKXrDIYuGHhnkYe/XXjjGTKMufS0q1ZpRTm+suZdS2XFYKmaSMHElDpWYaVb5/X7aA6khJP3iyfzk2373L3cr5NxluBPVQ3WfCYfTNrDK4QcedzeJLtkxv5esvUQNAx/OoqqI37JfknQ2wEpSXUn7hIzQrvWU91jFx2ICY9VobJxLm807L3fcyjuBeeb2Ae/DER/XC6lGNFKOHbpwcVMfAXTfn+BmJCe+zQxRAjWkshEhsuALIj4U4HVL3C8PxHR+p5PvZ4dDidpXnwiC9nWgUgHrL5Xml+XIFtbi9Oj7B6v3ARZb+S/9+h9LRx2y+VxJWVDi/aN5nkDFbW4wWp+69BIxy3JathzkBoFwJ+gMyPx5ReU7yHtUo8rD1yrA1D/JhvGDGYnnv0VBv6fPic+/GgLD7go9VXVXKBBdYrQDCnG2JXi+pnHTU4VMNfCzzlroWozvGAOjzmWEbiaLZp/lF2gEQwPQlmfktWE7jWzVbDK07bj1BfxyPXLgrF8R8XDWnLSixSDNXaLdud6Weo6q49ezkJQ/zltwZlWxcfwAzCjXqaP6Mdqy1BrI5L8m6LJUZwyH544oCJjpxsjaDtVwyfuxGbjy5ViYVug3jt1hMR6wXmcBL8ACL8oodyu17JhMCgbh43oWRU0iTi/IdW5EJ75G6PJm4CR2bNF7LYHULbnoXDHYH7sfFMXtWwrUMwmdWFKhU854iqUrFTosNxzh0eiUb37a6HmO18ZS0A4WI4rWSES6owWa3z5FZxxOmAsqFooucTlZ0bF+zG3d2E0JNyznas+Mz9rpV7LoRbVy/SHNt+/q5cSvFNZFLKpqgI3EnQQTNSTJS+8CKMm88zyn/s8ndBrwvRj0xsg2Fbtad8ZXjhN6Y+gbK+P9UFJ/zlis/y5hBes+tV9y71OqLt26l685fDoCebrWLtNatLioOD9WLC2PCgzGzS+FWMMXdRruQoB73ukmDBI2I0xcHXePAKKWbitPDk+JmF/cyIiB3vGJU5G8euX68rGZuCcKOIW+7hYN1W2HfwP/F8lyWdi1dq0BbnIbZkkoiD2rtAP/BLbBcd3Px97N9zS2s8sszMoy1vaV9+eNqtgJ1d92bU4qCSC3Ic+kDVFcXbO47126iy38lTQxU7A3BHtAoWliXn8wAlf2iDOh8Hj0xSq+1wKvXD9kWLFcBl8Byemr7axmCGdznLkZWcrWBolclhONChysa2ysuIHqecfNpBQcupucV0+sOIL7VpD3inmHRyT41D5YsIr85At6ZI0WRuO7AoTRguNsyMmqh1HLM8LgKDNTKJxbmlQtUxiLWQiJvg26/tCb0e5UPzlLtCjTh/g5+FVIfciMayCi5NRCZEBQ8oh8FkOiYViOXHzJlmp+sgbM0qS9XyOVN+6vxxlu1qptyF157uw+z1UgQdg3vU22wZGyTBYVAoo3Bx/8Oqgrs5mBX2wpJCxGnO6QSsk8Hz7PdA3AEC4VISh5jLxdMZcY39S0AMMsBezoTO1IEv4+8mmwA67kQ/2tr5CQNpy7EHRdSxOZNdj19wW+rVBLdTzwlStjT/0dnLpdIIgJ4PirKFiiAj68oOKv2aFo3zxf/zzvwTO/znO6K4Fj4TdGRK2CpiQEBQ91Pa6LdvhwapQsqMDtvKc4FApJ3Qzk05E4Dw/BqQeE3cFYFGxTz1AqG+zhXV4vgPGd1E69mgsaDGAkr5Wsj5bwC2B8UOwvPHkgF1EFGAGB/qMEr2jXRVdmaTbIhPaI5Gw6xk0wiGq2a6LqMZrUM5B7p/uh/bTudxtQcHaiU4/xMCY1D9byKqMXv6M33A53AKLc0CPzoas5De3ag1F9q91Zti3OUtvd256bi+HIClr5UelLjoNb0w2I07x7LkRAWSqr1FPNARENeRp1F53jchYxdDUCIpXuoRC8GnURMt8NXEuSjdKZRBbDtMzSxba8INrFcRiLdFmcNjgBUPss1ChHJXkO+T4eC0CxEXP4Ds0wspRbfBi/w53XWbwPr3SfNtu9aPToOxeK/oFGnUw1Xx5jduJx+g8YYC+PS6TJqWqrLmVMtLKGlttdlHPTiKWSjhtP+/C55LLHbMv+pZR0e/FBMOdMmN8UwFfHpuxBgQtBEvNRftwv8f6vsYYPwg4cAGbEmGvQQC0aIh0RIBhN+kSAJPDNAGuInZiLxBQITQSvzMcyMR/DMR9lAEvSXt42xLc6ejDG6mHNp7sz6qkgR1oIO5gUJj3ExbIJLXbLagacbW7cptEitOl6BSmLpOp7VAZqRto6A6AnRTNlgIgyKIIToLySFhTlmi0Fhon3gCe8wfNf0BcS3thhtLtr/tD8N//z16PgcH+bfFl7F83gSD+Ne3I4bcTUuxfk4EyfjWByOA917g6ZX3zcgxbqtvs85urEbdIN8ozPzUk0qt5q+Oat1HHqnplmK6C/yoW6UV3X9nF9lltdO+KOb5zddMe/qDsnTFatab88h/Ui26luKHR+rwYQF0Af6Si1M/l0vQSB+2wY/wCbs4HDgyA+KMx8YRwSgySEHRgAI6PNNNbSTF+3lUcweviPfzoN4ci81KU5SIuOK8Zsharmw/dRYqGfGMXtuT9+xe1xhjiPtMGSuKVbNGsNWVRenorD8tq7rnEqUpzTFqlUWySVU4ViVkn/uuytbX2nT+e19XfDE70RZ259NO1bv1zab5KQNWP3KwS1SvkHCAqjFZJgpDzEBbc/VsY6JVZM3aZNAUsTTPHVDlsOMpjRNaWNb0fX+MnRmCicz+tDz3ewO9KmwSEyNKLfZEnsf+Q6UFVxbnRhgND3Usd2JUjIlgQINauRIrk/W/7bUTJfDhtLt6Xvd1DVdTOHZzT08DH9ThqhscXObXae/HL2Fpps2v6q/9cdJYL/uyxf7PdpXlNLxqmnMQS4l3bule3WzHpPt1FJJmUXnqSZruqQx97AVcCXp0kqZMcsk+5IkFRd5O/t48cNQZLoot/HLfIPJ8uASQo4N6NKmQZUSBTjSJYlVR0+OnVso3r+DYLTqN+miOlWvfCXquDqqqWqqzNSFlVdpr6fCq6EcZSl5aYi4uMW+E0KaYbn0xoSwRWewhcMFv4Z1azvtK96pAAccCfiwjxaUpCRP4ktIQSjxcX7GY/DV/IwGjw7eDyvIwfYnFFLBKyK0gABd/0LmIfQndA5Sua6vQFARTZneuZKz+SWfdOFeXsgWR3nd7pMsSE6mZPxBcP4Y03d/Ja1SR6qpoH5083N/GfWYcHjs+zcfifDap2CXfHuWJ9osAr8nN8xEgNp2qgPQbktSRiPLetMEgAF3WAUb/Gt+0zWR1RpQGcGWed/ctcQLbYv0UOPPeX/j9yG2VBtPuoC//9nd1N7OPS4oj3ffyFTXChgrOHwag7UK+2KXV4WDJqn55p8cbqLLHmoMrwdo2blJZNV9QPgaaa2v812LiEPjgb402dLVZi282AhdjQQ6VFU3GtzunaRYjcxYBB/MJrWwdJbThG/+qJnGUf+MBCCW9nKQeWzSEK0Uz7/g/OTKxmKlNk461DGPvKobdjA2cCzZmBkDiuHpWrKr2SwtnWfW+VZ8Ja4RHAl+tONUi6Bt+d7MgRpLYoh3xUeOnRSFDTtjO/SXYUETVBC48r7JeKvLUsxsnfH5ua7Y2ZjwRca2TtLmeXYQk0jzUT2XxkcjnGlJucHOro3dXAnn6GwKKYl+Cvl7H6BS0/WsWKVCrKx5Z3bAfl/ybnhousGq5X2p+/h5axiwWryNEw7fS8oFtcZHdi3asxoCouvluhu0tJJqttrUKkqh7VLH7cBCttuRlJFWoOiozS1xvKE1ONk1iy/CN1pmR6oBuJkq7Uizrc1MpXcAJ9MbR2vksurjHDVCT/VuDjGYGuRXVq1/gvEkzRezc2EMzhlOf6Z442P/9MX8cKtvFY/ZVrxplSVPM43fFDN0hF/38Mzfi7pdfJm70J5asJYOz30A0zfKkJHTp04Mcw2Hmy0/8ljYNY01oW3JxrAFohYSobFxBJ/eqmq9rQrXtxw/L2qctKChC29ygo7iWspWqjoqjavqXFS2iA6Sjq+uz432kBiwqFDqK1JTJ9c4sr4GluVQ5qNu/ahTtRvw9K0j1KhMjyirLuVXlGiC/izuj8B7oBWnmc1CXGGDRei+zHfI9VRMPD492zq19+WzztiAF13Ud/6/BrBMo7qudM9v9miSkHdmd+eVY3g+R3GqNmFKub3DUlT4OsPZOa85xBPGu1KMp4WAKWWZDYnIXJnQJagVUB9JE0WW5pePzz3IwERvtrGWovI4yDFTQhFWO8EkaSjZlWYbWZy/bByeP3xsAeiSnra/XigVV9lz0vC3bk4GgP4yw0CVsKU/XatPUBHW37ziMwfFGIRtM/4lJpc47tbqoDZhljiqGaRikW3Ed+1E6TU1BKLgGSiGw+hWEUwexJYmTcJ4U7Iul9k1ZfpqhDcxz2YVLSwlXVl0GwNQQbY1f6uADxvDxhaSoFeT16nU8e5aj9KGuI9LM19V6LDh3hknt4wQxugAALHzMpuhCS+v1q5oGN2S9M2H8ebl4tYrGqcdZ1ziWj026ayDy7nNjIgmd2s72ZQZ7lrjsNxuZAOZXP36vjKINynDgVc78raOCOAbH9+pbcifiyoUvWbNjVxGAswFCf+cVOsU87DoPAkeFKWTkE8FcR+7ORBj1jlltlXLj2++E8TYui1b8jUqFbbk52e/Br50ZVuHHRQFr1x45k2aJVhydhHTuKvgdGjXTr527IP2vToakPu+cvOB4sUchf0SO0qJOGh9/l0fK6z3uBhpEZ7MITSC+FbaQKdDsSxPd4vEFUE6ZCwHtUP3TAISev+tiDK34uePun6dApMFEOkojVWdULSQCrVNBuHyPCluHAgQLyCBh6vatBlNKSKfyoRO5xVEvW41ASonxLty0UiAu7YW5cjAi5lvU7sDxrt2nGlRaF43RzItnT431xN2+Kid0zmUz5kiXYpAoQa08HuZ2dmMInAVs5IEJfH5AovNwddH/KztcEH3O5fC8t4ZvmsdtSe/8nKH6tzNPazjj9jOaRIbEsBdwRugoP+vN0BXkGP1BciXegwUZXsNIGs9EQgOe04O8/0eClOVBRNhWtcmt3FtJbrqJ4X7C9aUtdseHfkaiHp701c5Cm9bRZPNd/AwIaTcTCgQORAqUAz5e5pIP1divwxlLBPNAyGgSi2O66IuBamuMWYW7f208iGLHeVXVPbK+EcQqpuGi5EhS448o2ymSInyPz5LU7eNxg1SNWjIsBFNMnIKSipqGpAdjMw8fDgpRSUVNQ0tHU4uKA9MCiLhH/9ZF1NSYklGGtLi+bFboipVq0YtatU5nVefhjSmG7qjB3qiF3qjD/qiH+JqXkta0V+tB4KIhliIhyQrmeCXtJY66mnQFV1jGn8DvAgdmVHmyL798bhpuH6Plq70ecV7gXgFfAMFTLmbQz85eQgyIVWuzGYiN3koT/kqVInKPhJaytVsZ2vHfIgsMoCn/Eox2gTVDSR1rgzB5miCcqYKthoGFPOFq6Q/9cfGX4VP6gtPZXIVUnUPm76XDPkxDDVhxoKV1NpVWTsULKETBSjNMnjXsh144AUumwwNlcgtCyuVwDo3ez1stivBSQXLzVnqXD83dDzqKaxLa4x4fEsCEe5dfiEdFfh9C4I0VOEsFFTgDxtAplEBoa4CvlFSxdYDOOOl9c1sMVMsGeGGZdNLBEv8J6rLMEsR8kw5itFJLKtBjCvgpBAqWHD+9pQDXzr4xQBGPkmW3DDfam3t0w/0xgzu4khOJQp2oFXNuEHWp1R0lu6lUmy+ALI0UTmoafTLVpGK4WYQqQRnuRtIVRcCkysBrPgoBJS7KZAzOXT4ANSAP2TkUo4Q3o9X5ZUbV64lA0YPBTf79LU9gCXwTW63HAf+B37gVPwOuS3HAf7Z0I+N7fL57RfBz57tfxDwlH/+ojY+PzDyBNy2b149Yb99/2zL6hf1yTH59HeM/V8Ovu7T7qELBB7lYZD/h6SYAgEe8Lj3KwHBymuEe8XnilvZcSjYIaElFdNEJlKFRNhf7tXRBQoSLFS4SNFixUsIPCRCMuSDQlAQCktEYqJLXJJA6I465rgQYSJEiRHnROAgAZIgBvmhAKSIKppExZBEF/wdFucXAFEhCtT48zeCu3Y//jNECgmiRR2bFBqPQbIAwet1IZuq5PknP/wJKFPAIoFGUBwQPCIbBOfIBMEp0kFwjDQQHCIRBJsfcNOvAOGwqo7rRRaCZ8SD05J+xz9OrEWTKkVypDBQI6ctn8Vn8Cf5VEjJ2UeS1dpFgm7jN/rFsRkvtbaDja5B5opZbaEMoxG1xM0qCobVng567SkIQfksL86L8aI8fikEoYsgjT+wCHnwo8vQtHkpSVVhila16kIQEQH2rzaLoishAD8hhNCm74eZYGuLHOSkYEVoRauBInwIBQJkiEZgl1QYIQkLNFViRQFVB810XJ1ZpGml2trhVmaVam9y1YWqgNYHTJCPfmmPvHVY/jqqXg1qVO/1OVCE0AdRz1UhZJ3aevBpCrjrfo/d8Ie/4UL8IP/2uBmZUca5yCXXXMdDGyStjZLVdulKXwYy0gGZykLuOqXTKlK5GtWmLl3TtGY0pwX90m/xYIjQgxESwQSCU4vadE5doEAk/ANUGiLKMYGoMzbEsLS0V4YZTO6xVYlKK9/P6lO/hjSsMY3rhm7qju7qgR7qiZ7qhV6uQPVjPfpX/dBPcTWjeS2oAI9qFa2LByOMq3br1StfXx0NNL0PveORmdjCdKm5Ipxdn35pLXx0UWxkVgkLFZqdmMReX323rOM6GyQEs7esGKsiPyRV0Ogxcs8DXAussCplqSlcMapRvVrVrvPqDiGEBk9zM8ykPDIZywRRm+zUKiggk0g+nLDRIfBDCPMQHHkXcZgW1RwynbjneDfN1sTncD2fi44rCTo30rzK6Yn35t1wYdb2VeUquOikb5Lk7cEp6DUTajXh+mQwCJZHzWxXeRQlL4RcJbatSdftb86zwxHjdc12T+ug7YXx7ac9DAw+cJIsaXBabIopkxZtnKNHO2XIEGNMhIdMmHTT3WDLVla8iGB++CMpyfSFcLNUtSb5gtSvYY3rpu7qoZ7qpd7qo76iHz81owX91qp4MAqPBYV0srWdAm3hLOXaSzvn6dUuGTHMOJfCU6Zcd8v92CI7WfMyIpjxV9KSBQJlS7msA/IKis5S3tyK2XvGqlo6m6j85sw0O7eIhIyCn+quaTn6b16foLiklDQKo0miMjWf7yeDaq6qraqeuoxLTi28WcqGOppXUFRSRm6SnUE4743vmtacfumP1gIiBMu8B9PIlLy2ka9NFFGqPdpHtax6stKllU66tUMGDDLKRbnrAFUzt/AZh40sZMlzr+OwvHVER/kY/jpuSvMXyzMHT7e7NwKpwdnNupNSjpyKRrc0T+JlofdC3ftXHA8vH7+gME5OHXt/jxLyCopKyiAKjVGvuekRoRPfNYZPO3/FDWB1yOXsHNv5IYQCs+0UgKhQjZVY5z6FLQQ/LupPiIiepQ4xI3DjUfBDAJJCAIctYwiIB/kBPinhte4rg5iv922X+WOxOAbvnWkcDyMDCCUA+BxyhL0eSEGhNgAFgga5Xs/lg7mHkeSC0yYEqvlcNtPIyOS7UypHf0YYlTZ8FNSccNCRTyMkml7I4MPCAbKHFRPkkhPnZfm6CRdTZAC4BY4q2Rr3F3NCYVQ0hT49DiOqINBbTnXjWBks8gX9otlbKeyNAlczpFjDBySDfBBIR/jbH3KNKylS7nZroPejjSPuMlu98MCt8EHAiSflZznnLvhGNMPSDeVu408DOTBAzgYNCKovu86ogqk0VFdZPx3Doi5COZhTSChCMHk22B6qjtp7YLhjXP8OT/ARvGQ8slGuCei2WGm3fCzgVwX6Duo/AkoxMmfw6U8c71/74TO+/XDRtPjM4muL7/8oGPpvvaf+tJ7RQ689/MGja49+8Pgzr/7Oq//12gfd5e7qjylxtMe7z3Rf27m2ZFpa+dEdPtAH9L01xz9LwVoSADwAAd//S4axgQAEaLY7p58coS+lDOUX3yev5lKABh5POb7At1G5v5ITYWUS1S1gMP6PxCxfSRo3752wdaVpAKbvkQBIE4Yvf+qq5JkL5NfYH3LEV19/CfjSu5KiSJMeC058hdJbRQY+wOflAW5cmqByvYWH+U9CBS5dXiGHLm8hY5e3oaxLazQNPzWyFLFPH5SZ+mNyJsBVe/xvnzdfFgtOutmCFUi5KREZlC7gYBCXNhBxBlFEFF7/85yA05lPBbwwRIpRNevpVarSxq9Hv7U2SJfltDOKlShTq0Gn8/qNuOCKgJiUIl437/O6+nRrmTUZMIkRlpbVkVdC4Y1n5qO5W78c6/7jdGlz3VVD51J+D4i96xOUDCwcF5+UyRdBjdB6pDETPIIS8ulUqnmdV9WHG2Lk0ivAm07MyWg7UwRxBpM2td/mD94it4LtwLyv28z2+32qZphRvu7oVcHVg9W9Va/Gqv72WAjA4pNVsfXdXpWtSm6tAFAvXj0CQD0hffGZKOqV7n69Grsa/v+7Yw/8E0B+1xMe8Dm3uoUPcKVznO1MpwHSpMzO5BREBQCIHklPMUB4AjegH/nOn8pjXBv4K43LAzlBBdwI6Ldep+G7/GTDYrdz3s2c8yA2X39ID568LkvGSJREMineycyB0x27JeyU6M3BIdl8keWyhdzwTXZJYwURgF8K2rQrmUE6vi9JZWiDGtWk5q3J7FDn5jQTHiEgRISEkBFsi4qFADpDZKNrJJNH+WCbnhun1goi+KzHlK4BStjSbcoliQ4F5qIK27hVLYdnUVt1DIaaWPe+sPE7BoCHey+mCQD9Ahj4GoCVvgOg0+eA+tw3Lf6hNt9KVTbGrjutw5R8BzLWkQePIGg0QSmhn/YoBBI70tpkO9IYH7ZPCxGCSEgC+WB2ZmGFF40IsZHGEDVYFKG8wnkCt0oCs4QtHVj3q+zs4SmLCSsflJu8frbJD64ySXEdUeSdawl/YMAdPQi3EcJEYxbuFHnjSoHyJS/6kSamKTMjUTZv7Du2gqXc8sHoZJHBQVBHc5CDlaPKcY8Bsu80ZmFLUquhD2d1FqJjFoq+GMrIZfxTHj/7czcSBfl3KbP7lJjv9SXH2BS4VACGVt8mUqbWKDUzuiaNVRtgIABkBVrMmazQnodIfTGORnOJhM6DGZFwrWVsQzUFskCgmm2dBYY4gerpjcrq1mhx6i8LMCFD1AQbtGtAYrAyInfe8S6m4XmkqdonqX/MAJGI5kEnZduy3njpeMJ4EpIp/c5xzBxb7W4566Ze0KaJrkC1imyV2YiVL8e0JsoUn1Ml0HAcglZaW/GtyzidfUGtKHO/QdZytSg9Thjto9Wls5PY1Yel1Hu130tZk0NZkSk3u1rXVKfdLHVqbHVfZ2Bqqhqxaa0mXYHOjFDddLbW//8RFEn9KXzEh7OYfb3VBFmOW5CGlFxkiBcuzOxNRnqyBfYYEt9d7eAsxmbZ4cZW3BzlBsP5bfW+IQknHrhhGmbF0TAhKYJj7GFfsx6JIhkG1FVHCBn4BP0Kfmnox6qX8kXEPWyuMoX6WSEXGUxJJO5ItOPP4nFuvlfEd61LNlNwFMw5ATdpDmuM9R6lK3fiLAbqa9nA7W0dRZHrGuBxJrXGf+pRKPgirc+RerT+4RF1sPHhI5nFxL2ButWwyaA0F07StAEFvp2gLgcEc1fj0hm5ImdNWFcdv6ZTW8QLdj2WTLVDqcIBhmq74NvNFM6Pg4WJ+pnGXPTnT0DnrfmZ2gU9ILVv2vTjM9B3fZV1KFAXH4bn+XxqypXy2fmiKJIkUs6zd1Bk0AC73+Y2tNB8TKBVonOVUTIQwg1XiWJ/tCzr1lCQAa3mZmnvPTfeMWkARRvayiEOAP5G0nwhsOLN2urZiglAijsIOsjc+Tpc9H6vD2L5pXUWmvTfRLZSjK8Q1aIsINgSwlFva9RgkWBeHmv1TYWi6ECbzhVbHh/aypkibveONKVQwe53eb6ur2KHSJKkuTqRy//qcoKSQlEgtBNjHtF11jvUHXzEjdVbIlWGp3YSPFTBQ6lYFE2kwMJ7SnO1W5rFnVegmSNpV0N7jnW7TzX+0uKQ0vA9NX6s6P3aisjQdhVy+y9gtSvv91UIyewgntkvrh0iKGz+9Ac6mlKI0LWOdEcY4FCYV/DjD9DeQFu9Llhvc9BZJeJ03yvnY7a/r7LfBveXZDbCHr4m6LA+R9dk7Ig0lkvxcBy19CD3J/YG1JwEziNomD6/knN5lhuuxmpH65LWR3c7zPkq2AgmE+l1bUJI73xAZLaqKwZZSR7vrA7MnxBK6cc64OGdQ7A2UHcDNymTdr/rjb0Q9gXxLK6ykTJKciRUESuhk+MkQwrsr1FQ+FFjXCtw8/9v/h7r+JZFsNWGh+oU9QLQ7zvqocYCutSbFfOWru9C0X0i7j1r3fKlMLmzgyOjb2KugaTdrn1gL+y7d4s4Q3PV0qHZgpeZ5dihn2okOgoS6NBN83AD67uM4MZZd2qpxrpe+Z5BGd03b+A8eFejBr3RYCYbtN/AswT2g5QRLp1s3Z49JO233uQHzmkf77cw6N3Hk8YZr37WVsKe7nNr18mPc0GuSn+4Mhh2BWu7LZRf7Q2yO2lIshwBQp8Hju3z/kmIFBtR9NncrTeQ6/LJXJ/PbqUWr/7netaM8cPT+Fwf01p2l2ff5gHJhY163zI9+wNIMlcQYFjBGr24k2hkQKcHbdWhoXecUWzRyDlP0sqn6hYBYh7MOVd5a8NgCa/lH2Q88WefQrLwUFrTXfoI3dpMSzairGGjCZe4zrFoII4nW7V9mPZev+scutbQPfO7ZWpzfMLvYsJSmpy2cjulklPtTCJlJCiD6RIMa2tfm4YL+aIL3kbtafgVyR/AVs8uFh6H+q55Z0ZTnhzRsTtbDjmFNti3EGL9tG/4H9JBm/OoQSragRqEfCWIAK2KNKzEYjtvVVIsghUJyCsW8PGR2V6NkvtPyr+JHq0TsvQfERM5I1nmTiVwlhjFZ59vKq4rIDVIBsKIR/I2ktyT0dfFjYlMpl+DXeBMsLWOXKhIYEeoeHdULHmAePB5IP/ZnTP8+i2n+9PUSL1JBeIuR9psk7da6S97fNHMhjm3Y65vNtvk3dYINnoEbbg5M3bU5gS9xR+INvcW/Er3gwecHlDa09DuxHfQAu8btbckR6SQAXAPvM/9J7XZs2jYENsPGNz8VB8j/vHqr7lom/Tob2lvZZnbsM859Gq1rZ1vY/GQqn2aanmB/1+eydpmWWReYRSV0bg7Nx7LdcUirpxINIc0e8kkl/64O5oTccVIYzJHEUIEVLnAfltYDrJWgHllOuc/UxWPQg6y0LlVmAPso3J1LJR29yaw2SB49FLCFvOS42vORCJUrsBjF2CsobWkb4+f7FbbAkRiYIelnyAnEaE91hCyqhjnT20lTOxB0afKk4pw/PRLwcy98jRbc81B3z87HgNzwBp6cNPUhbcUQ8layLOXnQY4aDVFL1g6NJQK2Si2dFPocd+5AHZsYChSFX8O8qRwFNmvTYVcbz+Nuc2OB73VDRMmq9yQjZpT/0AZ5fChAqRKoT8gRavSh8PvZ8ZzXyI4vzXYzlWPtkATj9EPu1p68UST1J3pNQjtF88mTjalubPXqQljKzq8pHKakKd6eNCmMDjIHW2xlHdIbv7TZ/DWwerFnhvRyekVqDd5B6BlIK1veL+9RKaVVSF/uhOzCjJUPzFLamFS6mIv9xC9m+ilVt0jy0ztxlhCVvuSXpFdDddehIp9HEIlVI3bjilbVHuszagqeldDSofHulI0jQ4zfURKKzs9SqngmBjPN6JCOEbRKOUl5rmqO9lqjuBGS7nzXJSqwhVanmjdjAZh/GgpbbT8UUQlAuPldHIqtEUZNDXwLT6L0zE3hRzDV+FaSwpL+235Ii99Gn3dXdPvSlhEE3En3C2aEDtlpB8MaQDJ2/bQLz/CAEnYgmVofrBIN27EWTZ7Lo+UoklZ8wLrzkTaQq0YXfbgvFtCQPeFGFS+Wuwh4X0nnXoyqfW+w12n+HdAeKzH+05fwR8/q5dWI8pEcon+u3Ge4IkI2koaknpTnHWLk+m/VGmNccHcztE392AF7w1sRc1vNM4qW72p6IMYOkmwl7wkS/E7XUV8y/bGh+kXaQHOyqtdA7sMLxmU0/gynTR33Wt3O8gMNbuJLfNChlH6nYPiR8PWDtDhEvWxq3EoGdDh6111EMy7scG6C337WiFaGcUb+pM4o9R2+J/YgWJfo+NWMYuqy44RF4nbwy5hluhGXrHE4hh6dyIT0IidA8/0qUQsEi5C8lmfaPsbm2e6lFkWT3e5jzincZwE1LNXtToz5h9QNnJdEa+m4CTtjrMCGd21oWBxAKu2kmVWjhTvGHTotNvpcEHp3IGlNv0lHZvGUkjyRmuirbYeZq23+mIYsVH+lqlEbUdkfIM7a0M45ptJMac+OzcErMzLSI0SHC4oARVZHjXCdIyjK5x2RwGJN9cCxlZ/52+m3oZr+R7VO3UYYrD8tKWIqKdNbDH6P/fKBuRMNPmF3P6ldSmIpcwicvD6+tz3l75IraIdBOj73zMefz+e8WSkJ3FiBHns58iDVRkTIx+cnjo/BVYVPmS/vvzKjRQ4xet2jrBB5HPucZbII+Xy+VxFXGocWcnrzC0jCWJeJxyqtsQXu/eXmjoNpGmWPTUohazTi2InRXHmuXoQ+VRiWF5j0jIIeVj0TF0UFKfryLakdGzNKVULFPW1kGZjFxRIOvIqkKK+nP1iFszMb9u2bXj78Ifb3nrB/+6G+468TnDeZ1ukQ2G+sU1m9fLoZiAIVcj8g95cfggC2sMre47tAWcZPLqg0LOBNVUlF5o0ZRwxp6xJUgUNAMzyC3maLdsp5SdTkBHmVZLERkcFFUtyE3Bf9UkcWVIUxMZDMZ9bhbipfUfJumqppqlRXzk/Zpp4OHY4w2rIaEbYyYRoAYhFRGKa7mOTsbUP2Drnst1pyhimXs2LvXMSqShIZEWxPT2Bamoe3+p4OEo1dkMmZ/uH6YFCJTZJBHLzHsfaby5F124k8SyicqhxZ8WN4uaVK1wftmGN+PCKjLxyrxA3UIG/z+rLTpSmdHmTxl8h3n8nva56w3xZa+KGBq85ux7pptr8Y1uysdrDqJ2v9+5K9YMUg1sOiCJjtY6KJbrx2K96xYNAqzOy9zBZa5dAHq+pxMfL8BjvjZDAaBpLpWAwVCrHqacUn4DotA+ucI1gHsEk4Cs5AiXBp8WexNazhvW1eg1LSVb1GQyFvtyvlHl8/FIqUtQu6BumY8Y7K/7UDkjzrDqLBK9HNNAGr3TkiYw7DBU7DLyiLimXm87LIaTM3HBj3H2psx+qqVVpfIQcJ6wBCMQX69n/O9PwlmIuf59FG/i5gx6x5v317GIMTl3A81u0JO31+Jj0P+Tp35+JaOcsCPOYBWpqrSZ4MXlBeVi+lUrremaNpOPbKfmRj6u1OcguwsFybc41fPqOq1dtd/rTa26dG3hUOro9kuahEGdc5B+JIfP31cH7/I6q2YUdvzYRJQtRQNRLbY3iRi5n9Ubwrv6kD5kd0HB2949dH1rHUx8Yh5Z3VQyW8ytMs0RQkHId9eTFUubJatRLud4nGNkO1GVDj/GlZ/OO5gJrDYAyJQwIJe3UODpBILzkmk+B2B3HnyOtjbNE1dMYqfbvGHaK1lAo5vZMIoudEt+oaGuwtZjSjCVX54RpsvJv1xyWLsG+k4eWvcqzvirss+nOB8vR3vwvGirbw4Mr228TxmqDwcyf6mywhHz7yYC8hpTtMZaiS4n0Cw1VR5oaa2fP1LQb5yULY6e/qDyL5qgSeZi/R7aGdtjaOirLROZh1rtpp46Imrac2NjcXwy4da2F7YdBjpqGbrr0HSy8lFDr/7kAviDnqaXqLnZrdlN5o6OIWz5HKjgI+N2Hx47mqSej6qNOXcep6LXD7TbG5gIFkTdu4cxyNF7Y27JQX5Rkp1ct9XJ2HSm/VLOt/rnTfZ+zYvzfUnxIpBlD7qekoI6XymMnNzjUe041rmZci8uJAwnLsA0GRa3w2MfI/DJZSyUpsfafvazhzE2itfbFqw1p5KsnPvpP3deHutTfNutXxvl1qpvY89T5FoM6HCvwp0uk/NQP3syDsrWxrXFJWFWmNjYrvDO/Pa2ZKTGVUT3aDG1ce0J2VRKbZFwJpB7+n2afjgnwIUP3hv2QZIp3/19N008P0i4vfr+hOxqUOAkcvlSAhJAtJGnWE5yzUCkmktmmcqpPK7DEuhsoRyNfaT0YdphVtRDCC3cHNwg7Vu2NsDAIWVXoZko3usSzRcsbtvQ5rp5obFD3MG0+yTRYcNDVaJqbnAY2vcBmqn2l1MfBd5hsnR19L/vTXps73T4L2SZcMm5gzdDRsRqtNwBoS/MNpJeqqodt1dCAwthPnJDvvzh9HlMbVxXjGjx8p6k0g33wPRzz4o5Mw8sub46MlN4s1fIpUiK9MnN9aMWCORIsrRx6Ip7pMUzrVYQut8B6im0hG8q3dWsNJG38Zuae3e1phe5jio4tnNO15Wm1HJELJT9KM2WT5ZWDovO4BikbyAhpYMx2Vj/05pdfYUD2+SzqO1yi4GHc6FufSZnYLBKJzSFgFcuM6HfnxzFr2s1ISTG3ELHyElfnKo5K7U5D/PSAZbQ5+BU9uiedi3DlZodhc3/CMP4Eo/2VLguldd4dMv15EpFf9ddOUSmldmWkWX84vIIipL5jt6/q3JE/P3oBYjBVuypSe4WOmY99AU0z0aDI96mmAreMXEn4nrecAkl8ZgHZElcVIchBd+TiV4XbgxUNu3BuHM70QIaV6zVYqcslzTn3JwWI1riSYszXE5OzVWQ5b07KA/aD8ZkGIpSfnGtmViivy3hBfz2mAIT9fuEK/q9xY29+TjdiX2pA34O+K6jCnHuXmLhJHx0/oxkrQR460r1KUmaXycptq6SucBm71yNVq7xSdg/IQdzwTjEgbP9/ff9psYBadFN0eacZldRK20800BJ/880H9+7eBe9/UJlke78/wORtkXDSu7+8D4j6/Plo3SoNsTSrsUKokdflic0ZkA1jbdrPOOBXlI47erjIvyCsPetbjR3a6y9/ZZ1MiAiU6u42x62lvdXNCuZlz0drVxqJbIS3kE8lDaU1hNhD/IfCwTqXDOe7FPB60jglXYxvzVRj/GxnRvei82i7VZhL7mNkknuKwe7x2qLBfsGQsrEj8DY3R7wrWhGNWL6zOUGh35AmL6Xic42VlYdMffjEE1BXlCbbTSiSSNahK5Lu1hBPvxuXsfFVKHzKp2Y1u3kg5/5MmVnD6Udti+nJ83eOTE66Vn/e62S3lfZbNCGPP//tG3OXdDYsli/X7x91OJwgzRJ+9khf5D77+hwIP08tV0fwI1dk8EKStoRfEl3h119JnUFKn5mOpUftPqtPmkt3Vs2laZLOKxEH00FYBx4zSS/0Svz79UTIe8dNMiCTtyK3GpDulZ47RKv9eql/vnf3PaAwxGJjQAJdCsV7LkZuTea9n8Il/oXeyXs4IZCRkCi3IIeoWVdkBZvcv3TRRHOrBz0eMXzr8Qnln7YOC7woWBTDOSqznwabeLSuRK/2R+GrHzx8GqqHde6KtQpDX/5OkZHst4uHMwHpBZrc16GDxMd0sV+V7FYpmUy1hmFq1EzGnWnPbWWrd6AC1QejRg1cV3KWhBtKcp4XgcvSxtIRMk/Ne74yirVLPXkU5Ly70E74pN2d9JFtbXNfv/8JdwBu0idpDRVVxwJl8TNxqsX8aAViL1Ol1W/Im1gh/N6gfzuYSr4G7D0aVqgNX9lZd4dQffKg37c5+U2wTlddYBvVtyFhpNNRG2aPfQDsCZMNvCvd4oTpWM1ifpQ8eZxnFnfUHYFBgZodaqB0+drWOWCH44ysSH1YIWjMkyfDCK4xn2wsj3kAnMPsEirOj/vU3DPm8Wr75Pre/F3S7bPDi2X2uLI1ltnXK9s03ofzw4tVzgIhKcenUHGKJKwCW2qL/jMbBSwht5JiJ74+2gX7g7ZMf70+e1Ckhvq19Qtm79Wp63PH7s9/j2/Ii4sN9lKx1v5Y41JkBLo5a3tYNQjF2ZsbzSDK526TYpSzf3dUzSZyNi94zavRNCk9P9n0C9jSdTpX2dVkLCELBtGDdMLJFb946/cJRvlwLhzOqLlGmbFKn0+pbHxCjbvla9SFdSHBNeHxp4iTe6jk8gZsU7T88fL4JnI2etTx2LqCBGsNSViQ3ShXlf1L36LN+h/NlPFhW2nltpQu08hHyDNlCml7D1sXLzekkW8qsq5kt9lp8GRb/nuWluHaGuH48aFkeHb7HLsuBpiRMdzAYhsIZIpTp0af0GmKqgtITIOOGf+JEP/sY8xqDd8mHo6YUKYeyNoUiamGncnFd7V5LEuWraicta6mYR1XLBjgOhtZA2WFmdVMy9q7OgiBknBwj3KtIYrY+Gp8ZqGcsvXDrVsu5XTYCxt6hMbJ9cobju1z22eLF0y0G7dyWwpIHb2bQOBSrbMdEQaz04fhYfxQ5BGgTOtrDmZt5uyRhz/+BPqRHyTB0/1q/kjr+u0dk14hxf//2TfzFokSPCpH9NfpzfaBaldNaX2RUCo/mL7xX+fu993Blvi7saP4bQpFR4Ws3NXLfwb9dfT2BJ8qIYBuGyQsDmLCnT94h90DSJqVSKDwazCKb+QTIeelnRQSnstozRmPOxlm7JW8FPaksz0u+UAr8rPU8YgAlAG2xHwaP0wQoZJH2H4KTCk0R1kn09LwcysXlDzdB6nDEdsgNKA8+3ISCq3tohAjbduNhxPYQfibkBjAVNNtwPt6DjxJgApTCyujrJMRaSW4lU83mefEKL8ha2nzlMASfgLyJXmbOF4TNruT8qhg/ZQCK/3beQyeXBFOZTJ6497bP3pPqng9jzwt8zftsWT886r+e0LyMmU5FVbFQ43VRiqEo6jZRKxSXf7yt3b78zUvDVURnqnab19jFRoxjrWWHpx75fku7sGc2jJD9Y79JovjCOSc9JBTq5gV78F1YXwjXNv0gGKf9bR5Yx9CdPGTc2elpsCZkdXT75oAU45eCt0Uu0Sruekyfzzn/4ZeCt8Uu0R/1HnioezgGuUwP2PwJ/xAftRBTmp1X3zihE0noBDa6z+QFR+CvYqzvqLY6fTag2x0W+JZIfrAp6vcHSOjO2z6zNsLCCCWYTm8ZblPNnRtAhbFvwXchoco7slhpv6t7cZf+ZNIxfFI/9IoHF2g7wybFg9G6qiotAt6gdJG5OH5P+1r2P1pl98P8gBHm0dNwglLSs0M+9FvDcZaZXElU2l2TfFu5N6OrMO9QIyPCe/NjAxiiZKBpx/eBYPi3WtrU2eipGkMkJFXkBiKxSXURmQWR1CryYTfYE9Qd31uc4qD3KRubG7TOOuIibbYKpQntY05sXny8Oj2neHbeJfDCaKs0fKbBBfJhkpMNATiw+oyHn2Qk+lTwMtNckfg/d/kmpYWTbraNlSrbLoAK5uGaqxlaX/vTHv3fa+snC7Yp5pb338HUWuKg/M5lT74giJnq06H0bXFNLJAQCbznxC/V8C3O37IW84R8HfM7orffzLmUVywoqVRlRgIN/TaMUeO2NHzSSR3JyqbvaFyd4i8xatMcK3QH3N5EvSEuxNUqR/CwQrxkr2xG8q0HDiQZSnf/XlPjC7Xdvhwjg1cX/ry0YctZmHhREK4PyKCD4vrG1UipVbTiDiOQ/XxJ69zwgMNVT/99NVLQ34fvKU0+1BsdFthniJonJ7eO0113i2rOmi+ufegyt25W7ZtY67TEMhl1I+ukFtzP8mjrGnAH29fVVhHRl58yUr+TmvqgwpbiFa0J3jYzZvcO8Wl/5eOA36kT9z7WDd3wYdhmO3o3btfvgLyrc5icFCt0xkJg7qvriltSRUsOfkXPKDr15focUWM/bJWprPzRLsJrv/As1GZVaF57wDD+YoQ1dxfuMOA/WFD/AlUI1d8rYwUBJIFyUkLM5uR4rIWhIiIEjL8bimI8KnJi4GOx4hSbsTETNzvvHObujHj1s8njyeg30Ap2Epq/dUnsY0nEntYzyqrqcL9erJJ8Si+L63KfKxn7R6ppcrTDqIt9cLXdv7ROtHYsvtbzdcWs0ITK/d1imesqz/eVeDszy3kmJWuVWKROZM4uPPUqeHmYlDz+jX//MvqxsF3HLeKJqraJmc20Q2Z5SLw2QZ7241o6OK+Usnh68if7nKUxCMrxRgh/r9YSrB1xXqgJqCyWFxfk1jA1GKNxQcYfrxsLdzjvNFYQqy3aANsUEaBz8br638+lng3M3dwU//wyFPzZEOoHgSCTcJuQHAzxQObcHmobzm1PfBW0zOBLb3YWkDinbfgS/AOlPAW/xs88hZbBw974MmORT1+vi4k3AnTiPz6jA4hfCqzwOhOOWnbFxyrOOnEzru11soDJP1xFgWOOhZGEUtVIkI2em9eVqo36SeQ5xPePElQmoVKVy1UWFW0UFh90ftSaMIn/USwbIJPr2aT/EKlWRN849wI5XsGkhyYHH3QU0OYdp14s6xcDWtdIylSR8OqtqjahenPVRfX8xreRKdL3CUI6WbUU5Nl7UHdqYWPRCnBRwSoOHMR167pLbXtNbSkgWVJiZMu9eUZMiT6Xo+327nRKvDEq0nSxoW1/49+dI60Vfh7nm3xSkPqZJYsYtZf8nVpijgPxuosvHLZA7fx18keX0XcPfn2ddXQVkdLFpxdoiyj1/iHmB6DQMhZb20/ofkicsP+vKg6xlFZh4IDBl7gzNiOgy5mIa+E/HWByo4iQan18sq++7j8cjy8ZHhNmTkPzmk4yHH30y/171e60H4+MUfDEEe29Am92vUFlUKYX1Sf5B22fHz0hLe0rzs5FlDvjpa4/Dki2PfK3LFW5paxSaacHr6iLleA61N7mbuPfrl/ssrD6fjQUm9aNy47Z3Nwd3ZDhppAW8VlzGeN1Ldoz2jaMkmldmLIrE+sTjlO6RULgfoBDO+B6Wd/L9+zclLan6UgZcYJ2P6yUYLKAGub35Y2d9RsLvVIeO53SXZ+jjifLYlDnXrZTt+WdC0aFI5xy7Wp88nuqOAIIjzwsMQnoOuY8FUtF34vgKSvf1YnTwZ/Q5SDoQJi6H2CJQbeP7CTOjhVv2USVLzFKobY/B2Jyusxw9uNGIfZqTgJiTJmp3RBE94nsuduVxd0kdsL1hQcYtz9xqfCgO5pMUxl4RY2b6WjV+8mb8YtTGW36Fv260NDqF8UGkkLn3hpH/18MkjOZotLSo595s44bRzk0G8Xf0pTK9OlK93T2VgskkttfvZMZ7UYMHrAsFTz7qGiu8ldBQ/+uSE4NQm+3tjkpLiLHnDnXfXiRRVAkZkGlsEQCOh/Pk0cPJEHZ5ksxgiTsf5QVssW/POOxDbOJlXg2emd+i2c6RiNzh/gJPzO4ZsaSCUqs4CPJ0jNwmGhIxc5k5XGCg5nw/mMhxn8FTW8wGzAFNXJLVGR4HyRJeXjdZukbnbTMpx5a9enr+q2CuSpDVKmhPr8/JKnFucUqJluq5zx7BmOb07P6HjbC197nTPCypbdLEW7Mfk63Lmb6JY/D334feo8CC29IWQdtoc0TvA2Dy0lp5waolsgIWPHyc/+HcUM9dqxRzC8fl/ZMsm1KwR8dV5RzpVPL7+aVJG+6huYB9Sj9+FnDMDU9PA2A9NxcQoZT3p38Ft4GMZOcpKgQzUJ8TIJ5mA9yr9mVIp4MEo4mAROTrgTS57QBJ+RZPTZN2iCv5HNk+2qZp2Q8RmJkJtC5PkvV7FMPehxxJqkF/oTctKMHZNdr6GYkPWA/CfXTcXNm/XkyD3KK3uiwMs4IOlATSxem/9M8hnlMfmQeBpZv5OEqM8NFO0pFaesZb1eNyJ7Dh8BIL18yF/VzMEnd4Lyv1s2SaKsDt85UqAEZlQPxosZ4dzMjtxj4OjRUrX2IL6H7ol8YzmtJVLsm8lbq/heZqSoQWsIMCGfTxB2kBrvIcqlS6OPk3QgNg3GyKpFiIqi24kgR2YfuIr6ern9SXT7gBX1r9hjMkeAv3Lk5Gt8GrwsRbld6U2HM6vqnGHVMXdmEjShqsjBs51cGi19pAnrJgcnVqLcY7Y0hVX8+k6Vnl7diDPaYevWMXWBDCXrV4OzzfKOLdtBoacOokku30rPRtC1pIET9HXpcAYHCpWitOg2wE15eeclKgSvdArKhBupLVEVwrdy21NHjb618EfAxr0UkiOUH/1gJiEzXEtpc3QN48Dy5u5RKUv9S4f+jbyRhBt+CebdVdaBbaEbHX9SBpzJ0RBEYw54IkhW47CYWLN4mdOe3cxNvLmF/B0sJBY5UQUNrZk9XQOK+DgojUmw38ZLc3B4Sk8jNTDLKMeqn5u9ZA4Ojz/OYbja/5V39xScjJYh/63zGNQKANLNNm3kQjLkTLRv/+aNNn+nfNx6eOL9KO+5tjdzbTMxM+aMC+mm0Zty9yFbEcVpta23aIhuCSxdRtaXwqWBF7Js6KpKk6lW6siHkvEm3jDpGFKlPoYcJhl4+GSCSmSrqK4wgMxlOtzkeSvuGeoLIw4Nz9TtilsRZVrGb5NzedYGOoexqUBB5E9YOHMcjXe5vmWxsTi9meIETZ4FJ6OaWruBq10eRZyv4YMLp+CbNTatLuPTXqw9OPcQfFB8GrFA5qHrWLep/vvg/fSBFaK4jKCUcBvfjFVQ6CWN6bvUW55PLRCdSddshQZQMMaskyC2u1KauqOuvLrw9qZJ8Xndj+Enc3UCjxxOb9jAGmDYKh1Oz35c0tDt2GgD/rkNz4tP7hB8sPOUIrcyHc7s0bW3vjz7dEyEDxnWpFbhQeLDuuLWufduj81ec1Vs7QYR/YuyO4x8vR42ml25fAEYNRE05Coy4WyViYtql52eXYn1Jgmk/GpW5f2PxES6u3ZPG63rqyaf5lyZ9amtZoCX1dRF56TBaUR5Id0COiWrXJs9MqlCkSFP2fvOO/NHeF4t30mrG4ZkU74Wy7njDS3WfqWpRxyQ9FQpBViYKHPmagSHX2kz78S0aN8J4aZ69CDy2/cCQW2fdL+5p5CbBqfmS0h0SxQ3wW6eHDN5b7NDTR6TLk4O3ONtD8oJLX9WYpaxrb3kydLfcaC+sWg35xJDO1rcCHruIaJG6517lRwy+mCyc/P4R/XF6al8D4THzR8gQofgnpUkGyWh0kM2yxKyeEiC0xVChj0IrO+BhJ9Phaz/MrsP2jAs+mDPk9mHOwQznUZ5IkjoJX4s29AgkczulUiPe0sk8fi34yMA7Vm8kiH03YVzhhAgugdxIf3mexw/+rAQ9jG0CKXS18syY2GU0mzCLq7D1PM1YJoAo2Aw5JqASOINIFelzM3+YYNqv0B7qqSqKOU2I9yIAF8skrn8d92q1PT9z0DEjrQ1tryUWp+gps4WjJb6Gx6JJUCFEJe6etJTX3R6fClTWmYMU5WT1PawjRsU41MpayoSLEplMlVrbwpS9TJl1KYr1ShRN2eKbgJNIwv1ncVmWL109yCgAtdiaA3rhtZLLYRE2Ai+UkCB+c9YIUB9WCjlsDB6Qw/P04yDEi2peTKMBOrDomgKi6YX9BhOGWKx19Qi7SoLuSRvhBlsLINwoje2CunOmn+eM1RFaL3N2YxfqTWrChEHKuULFGqzrXPCBlGGi++yq0dqgoDzsedscEDifq793+CIFcnNuLd9KrcZ7wPD762zPm50qCmxrYX/zClHOA2UHGz536agnANY/DQ5GhsZJcfi7GEdlzMohARKwlxMJBFOhiTK/Uwr5taTxP1QxQnPARfQ8+b1jmgNv1zAFn+KTeEa6Nq7NUdSg1Equw6iXOI47yIeMqXl2nt+WsEJ4Va7dQaaWs4VmddYobIABy21dq8cosMnKWFY8jUKfElA6PvnIihA2C5cYa6/+qqwRxfq+BTBi0XF5k5jpv6pjrUP8vDKJfzXO/9OAQUqfT41dFce44XHVway6bMqeYQi3bwwXDhb49EzT9/JbjVMeN1MbyPldn+D3jxFiWs1akdE604UawG+t9TKmH2wgnJK/3g0eaxvhtguXOqlTSb6wYQGhnwr58MFOl1WLfAyYGrCuaJ/zqic9xeUFZpOrd7Zejs/K9JJ6z/ovA1/2PJPvwOYIRP+KpY4qpVL2m9hBjgZphP8ZHNvtLaTMLZP1xmGoAnNr+g3TDcF05yhao1GIL9YevIpTeTrl8fHVoiWy1tcgMS20Z01S/nEqf7x/KYYratY3s5gseFuj3SrItyZPdV64rfYdOzNPTUl/wpZe66Dc47Gmqtxa4502mxrQIWvPd2jEOei1kAIhBJ0gZp9j/qX1vo0fJrT/4HZvtG/1GcnAo1mobSGhdEXejhnomCjfzmvhSLQWhZFH+vRnJDUgxU2Q2nMKWqY5yhtIEUJ8mzPy7/1YN1BrSmp/Fu3VsVyruy7jvxzBpZD4KlKOPArjB2btjkXNXOJ1eQdFAngnnl+0xblY9UFKrUk5kiR6FtzmCChaZxDiprJckVZR50x0Y/eNzSwkYRTlE7GD9QoAEAwlFXOT1uY++L+NNb7U8gM4iRXkaSl1gNCIrj2vnR6mmAo9tzC+d19gh6rNwwvIW0Ek/QKgooe+Sh/GxxCo6Y7QmK2Ls3zERPWCe8Gr8x6BZhGoVASJaGaQClkQgNDYcU8BDUHSiRujfttBEbv8dNAEIJKhaX1hugLBK9TEHRonYfCtXKco69whKPM7yBRR80JJwhlBWUZPGfMAolIF9akJooKmE7NX8duF5FSPslnKMWfqx8m877xK0Ll5NZ7+WSlBtiIcmNNwSwomzPPlN2FnMb+NNN1dWkVDgg4nhvhC6czfoDoyAbseNmDZSUgBCDTIwGywbPmzX9FV9QoJ+6g6URfrkDULJeOQVsVGLBceXYn7L+w7BO27wLYPj4dZqbN9yMyqHjtpD1+htPKcPxSI/2cGEln+/8jzamZ/glQf/dWCAoAlN9S+8L9UVU+G5WrmnAUKJg9eb9Y+YzwoEHRfGrnSCNlxenJe4gKJvqDEf7xyj/6f6qcnrq3qGCifxiRj6r8p/+vMHPanhNEgH7aCA8mz0T/LEzM2ItUOGDR+3uwjUFh/zTYGPs6iSFzMykHRd3brelvF8Oef7Y3fAf5301PeXeHkSMPSa2s/6zgkAu2yF39nWPInBtNWn/Jky6dvmz/SfuiDD+U4YOUx1FuQe1O6UVrj+v+MriGo/fYRt9L30ffTz9IP0Q/vPwR43Z0uT1aoXAp9N9mIF0NCp4l+edfKkD4B9kTFxji+9LmiT3+9Ofol2NAftMJIdRxp/Zy8pdxOe2b/gPvBF5/3y/vecrJyTX++9/bJIxH1g989P274/3HiGt/dD8cM76mADF3fDx4+j1P4M8slnA0mlvj4JtMkd3/rAyozoUAvOePVLIGzHlFzfbEeyXi9SqWksGoiPvbwYWDZTeBcm0+/ZFKxHmaF495+E3mVoNEiBN76fctDhUeeM81srBkWFdigQGQz2pt7/bz3dbDE8z9Bt4guzt+/UBI1te+7CSKTJFqwtVf8zwgS9b/q+Jm6kGmSADh6k28RCTF7rn+yU6roTfV8Doiav0X7fytF2tIZEbsHx+h5evQHvGI55PQX1j9PDvDfGFH7dG/aljDyIbQW+jIZ6W6nIFStmthtCGWuvqymEKZbSrvS+isMZQ2X/RYEhkaQ/oLiHW9ixkgbemdeKP9khP75EBLMZsqlo22lntanNLufd5JrnnRo0iDUhdvb+4gZhcLfjB1QvX6DtCQ0MjNutYk/8dIbOWX1PaMGhkG71rgLoLaYU74StDOdHJsmn1kQ8HQKBujWnzl5vPysOzy+Wh7HZZkw4E4FBvzqdT46kYEB9gT+gRqVgbrmiaMcnX/5l2au+mYy8dT1EZ7JEPyyd+4F94agit3umuk7dEB+15zbOTVdbIk2Ah4GishOcQ/co9v4x/mSBBCiEZ9Cz5cL1opuHSHBI4PBhh6/GIJ+g1D/Rb38ZWvhzfeU0lL13/1y8TzXNvvFa8Kvq1Fpau1Nq5Z2ysvy9NC0cg6zMznfnJecfNhdemCWayvpnDmR1HyRo7JBsoWjWo5LNhRF1iou7SA1GMIIi0Wx5rVmAB9WjAwWsgxWug1GkxHnq4OsNPsNDvNToene7MeW9G3sz2HxHzLtoGanyJYBvyB+3sNpAl5W/EMxq3EAy9Aj3mXZZBXNN6j1gGvwM8WqmZk3rneQad6pdQujny59UXtqdLwVqyzutsMppdvYzVrgTU6TKhqMY4rjwlVqzlaCBI0JXyEZiBnLvFCCAg8ja1as9VT2hFSVrQ5uqTGXcvK2gOnmE/LiINbVhcgCKozVnDJjDIO3XJomfdZ8yogbTauW8sm+Z5KUVoUsRBSHmUR5MpcmStzDVw1HCFHR/U9oxlVIN+RE6GZV3DUarB3tHszd8RXu680fEeyLYYWFJ4pVVrLQX1QGg/qQUGtHsQsUo80665ghEVR+6h5Q82u5Ao1DbDK2bLvaU9s8pnW3IVWCiCnLRD5rF5FG4Bd/hSPtYxxWgcZbznLrcf/vhpAS/3QrmFi0lHPawjX6o5X8bXdAbTHMOzPAJ8ytqxYX2aWqFWLVO9fua6X81DGYFbsTcWgFCi9FK5iiI6G1Eo+mib42GrGcN+KRtyppICzHrRkbgbGZpC5ynEl6LImbtms5U5eXvWovbw5OOtx9TsaDPAhjJlvWtZpGfx7CFU9QpQKIW8BjmnLXLgBjM3zECngZWWIUfoUOvloj9HJKa/hrBJdyfQ2s37G/mk9HSz4/TLwDnIU/aLKyOl3Ytziigk9Vwf0PJda7nHXa0CNXA0mwATgDEQtvC1eazTe+R/nJyy6ahWX4YmpfBbgRq5puS07k7cL7+3COwuxEil+9oR5V9JgUpjGlWUzaOl3m8DZQsWeEKtvI/A3UXBQ2vAXoiObZu53ZQxLzo6KUysUUmUv3y/+1yZFDZrUC03rf5AQWsiGYqiFV8TF89yd8VmXv8qmamreAN/ZUlaxts3sbH9HO90rg0SwGK4jdyxs5dv3Nr8f36D/tVv7T04FOBocYoMG1rGD67idZ1nP87zAeyyOea7uO9vc6f0rs/LVrn5resF1bnad+9Psm3ND+GOuL7m+9vqm6y2Tv8y9OPf23O65w3Mr86fdME4dnXpn6sf5l+Z7CwPOOTevvNldOLh4ya0bbj20+NwSS8bJi29ff/sXsx/NKag8ddudj83dmHu0YtPfmv9jFet+aIHVC7M8m2Kr7O33P7RwZOHqJVX0T5eosy+e3X72yNm1c6F5mctyg9xD5146t+3c4fNIn+jLfJYf4efXzlq7au2etU8unVi6uvTJ0s/nXz2/7YFrP4TifR+5lkjpw9ek8p+WJ8A/LFNrL65tX9vpakDKKIqSUYaVJkxwoQMDeA0ZlFEfVF31w4OeszEtZsbemNLsUNWeltTK2ri2mdVs4TruJMM029xf/7I+WMzSJOunJ/WKPiNINnnVqfUyyauE9oTvJxI37ZdrPfnl4qpSfMWuf7r3eC59ufc46LQb3nHKpJXnb7sE4SrhFcKz/AP5hvzl/Fv59/JXiSuICcQsYj6RQRQS9cQ6YjtxgDhCPEBcIF4kvkh8RvxCXCTxSOOkrws0C7YW3CXvJU+Tn1DUFDulmfKAGkLdQB2jHqGepl6m2WheWjttI20X7SjtGdot2iPaO7of3U8foI/QD9AX6ZfpLxbKFtIL1xXeLlItKi16o+hl0aei2WLL4plimKFm2Bk7GR8xvjGWmWHMOGYOk8rkMbVMZ/onXxtzA3OMeYS5yISZt5j3mK9YCqwO1g32KnY828O+LuadG7vqvf/9U/f0SFu70YOWutXtWaon6h8/9Mmdeq6PZ8YvSUv6MhRHoqlmN5nQaf6AfvCTg3hhvHweiyfhDfJe4OP5Gv40/z5/URAsiBVkC1oFN4VMYY8wIJwSPhLJRWfE8eJsMUVcKhaJteLPJHskC5KrktclryRfJQtSkVQvrZO2Sk9Lr0vflL6SpctXyyfkx+Xn5bfkd+UvFaeUK5RjyiPKs8obyleVz1Q2qnNqrJqhlqgNaofap0Fo/JrHUAiUAOVARKgUUkIWqB7qhDZBY9B+6JTWpl3URetSdW263br3dC/wi5DwPRJ7wR6pGXbDYTgNQxjHB3Kl+qks1KQ/Kn/V0/yl/nn+c+pb6mfqd+pfmiGBsYFpAR2oCCwM/BtYrdmiOaS5EGPLohPnJh1JBvxsBBgGAm6f9v9YAdzqL86+//nu6+/9H06dxOZ3YPNryL33aN77PtAugTMd3leG4Ps/em7sv50++9t/cBgDJXwmCK8B1t1moaUZABQy8TeVYt+9YA/8Eb1p/3kK3/gkk8j4Lu9/PP4WMjX0f+/RN//99vP/tP9+8ckESH3GPtnclfm9ogAIEMfIU4hfAmervw088NYwaACq4zwAADSXQ/h9ffQAgEhElYRy+HdORvCkzKWyROhnVLKISLkUH0AmXLEpQytf2gm8CARMrb0elh8lBnGdDmQi2zFOWRM6fDGyFZvuy0MIZGYckIIQCyKsKIGKnV+Dpj6kxIGfEQSlDVofqga5eLyaKs+SIkG6Mm6xvzBkIjwiCUhOkVg6TK1P4gvyIt+eJtMNvppPkgY2HddKqZt8VK0KISawTWbOMhQqMsVKzZhTy3pSmu5Rtao1TzFShm/Osqd8Fi+jPjIimcLbvBr64CkeiZrn0wePYgpg/ZaclB5Uoi3sI8EiaYHCdG023JEOefrcHYQJw06i7UpgAnJFiYSJJPKggBpSoNbaWOO0aLwgnkkoNP26bEpf6gIqdoGksZbTneeYZzxhdryqTwNU4rMJRtgF6H75x7z+8THQ7/+vBXCFfQglku4A/OjSo584S/OhzGbafgR+H1giN6f3sS4Z0qv44GAHjgN3pYoeBRGI6NbYLASVf6tP///bVfv7EKlpd/GxfWChwHylS+ljgEVtGvXVwmCxI40eWJ9QwGPBIR5Afzny1+HZ2w8ctI5F9kujfUigA1nWwC/wNy5ZAooFaq65j7cB1WEq0EYCAghkTPcmY+gIAPUyuaLsJyTPHzWyPPumL8Ed4XKJ+9bSz/on33h3jR8/47rv00CpwPaakCPH0dH3Gd62rnT0USHNYYbBVU/8vu6PDBJUUAlB/YeNnhLar4Q36omBG62kh5ZXPd0Vaw4IC3zfvUVrKYaY3XzJf0yWzun2BQ9GtXtt8B1gRgAwV1mEtqNtOLRQPcWScUYRQGSPDUCc5GOXAArUTAbmvkls9DP9+P8Mhg9AAKle/JMJEKYH67D2WOP8ty8hzhuGiBXh0eO1ba4Vmqly9jhtVgwz3eOqB5b7ZLljsCze8A3C8DF7Wk8mUzGeWaBG2VYpX3lqMX6lljYgMf/BwOVwkIq5FMVUYrohe+Qkq5IENlbYcLxRVE6a+sa0Lh1SAnnU2MTTcTXOmOU1ULZRVTdgnORTCGpbmvFynCs/uReUCstOgrwVssq6QMssYNtg9TneGu3z0mVSrNfYRbKtDPkux3C8PDApawQluVJtak3Y9q4K17lSz6i2tUN69EXbBJiFaxGlCisTWARDo1Bpto4lnVuSlWhCeVJMqepnbV6Y7LNVmorbOzaZYIpSpmojtWRDVjA0wzqOR1lJkX8UA4x2xWoJWrmVnjoy7DxlxVZqgbovHn+/lpSwb3DMvjQorOGOYlBw9f2MrHYdwjdzx2Vk9OzOd39KBvaiFI3ukRWelw09he1j2KQOCKFZKVzIKv1p3q1lLey+q/bdI4Cz5PHYKQ/eT/ijgjZzCQaeB1eyWgOG3jyZynp9yDKZ/q6GT7jL9H+tN7goHfy1Dpvoh7KHp2GduBKL8ZJyEvouZ9ZtONwv6V7w65wFvue4LlPFbZAJOyvoBGYNMyDYJc2mPhoiGcpv6JLm0lMOsyKvw0vHgo0lQ0S6VNnoKrgpAtp8yKmqvqUm2OgZLQ8FFKfZi01mkBHKsNLVZVEgP6URLhz6XPdhIV24lTqE0hTtQcGPrEj9Yk3bdF7i0Uv9HEm1XXODTE7/Ywe/JDVqiZd45XYWTydiUcnvUQI9sqViUOvA07H1UMNkr9k1I9G0l+fYNAoAK658KJStzRq1WiYhECiR/bsw1vyfblbCr74ut+EIa4PDMMtdLMSCzlEj2VOYL3l/1TyBtT6b9zRZe6VHdiXd7rDdUYCf33l+4pF54bds+n7KmfruJlOsRoNXGaO/rrOt8VmKjbAS45k68Wq4mbjcFF+xXm9mLN04zfTyJ/mUpcNMYosOfoCiCaKwYvgil8GdcthYtTAt0NLPS0bsw97A6xsMV7EYC5cz5jSRKVeYetN/z3u0UyB5RSkTqbDv1qiv9CBx/VrkjwGK6x8U8ymT8627M0fZXpzzhufJ6auN4U6QvcDY8XuxekySSK/WrqdldtcLz3GCksoZFTq4qEnaZb+T/wt8hzIbgiH5HTMVmPVb1AlHCL5HwZo5gdygD8UPekkEJzpI2+0rOgEhoppzc0z+kAKxHV7yHXEQiCSCaG+ro4tYXgdE2kkI1LnthL24CyGMAvSC4z0QUEM+As5WZI/qvgFk53jDZgAn9LlZJgARkegZl+5vxIg8G2+R/J5BYGs0V27tYo0DxepTR6X2efX+0wDjGpTObGR+HEXUH8PwTVetl4ZybAMVXxLCl4BvuWK3Oi0GEj5+WlxcqeJgl/cLPW40RENk04NeMheccdysZTmUngE5lFx131etTXFIKKXiqfafpxv7hiq8+1P5zqAJUXQUmuWrZ24VuRMvnyIRaIAAJ9doljXgM66Ue95wMoNXUmuHzjrMYIvDk7hW1uA34QEP8hkegIC6refz3EsfNfGITuJ+f5FvyUUCiDqaBzWZIwfhJk9DSB6FewyrIZg4G95nrb+4fAejgAIiSRlqYYf6HptGUVshQKIGwaMBehf9CUESl0F0Ca5nQOLkFsPL90Xjsxvt3/z2pCuAAKzzYSDDbGDRdqwDGyYoiPIRN3CEmCkWQUjHP+5/glaAWSrJvhB/ZzTiC0qonMDY87vxYsXGK/FSLRI1M0UY1XdtWWagNglOsq3dg2jATcxAInNGMZn7ZkL4RQjuHwI1ouHOzvDe8zBQsi+81XhX0aa9CZeypIsYiBpwAOdks2zGtR71k8G9RHO50kuqBPSJHC+7b7Cx6xhUxjXSFo+2Xk+ROd8e5IO3WMCDBMLliWMBlTD+IeC/AX4Eh6ITelvY69hi5KhZ6avWcH14z0nSnOiYTVyti26Bv3x9MdQweZaM725RdYOK4a0x/zawNqT5wzsWAW8hJXzgC8xQeEWHVlNojiZ+UKjIMk2Xq1tl9hcML2I0KPl5Af82I3GKXjbXpZlVPz+qPj6TUA50PQ9fkA4AAQ7BQXeA+CmroY4goNBt/apEqd0x0AJm+cEEwHzpPHdYOzX5o8pEMxXSDW+ihJJurMo1MERWdXuiUMS8iwWQbz1XW9U1hPwYdhAiqschHJpjhjHY3QDrpNyj2wa6/mIqHsPIYeNW/fcbEaHmtan3XtAJf8MZUsFhJR8CFLhQuJLCGoTbFzoZbGz9f5OTG2wSjpahNHHZXQPyCP2lDDt8LFA9a9+/+HFkoGsvZMSwAt3GvRYkCduCri3eIOea/OP9VStwYCS4UAEkBkDpc48MBaiBpSHLa5/v0WtNrT1JQ57QMaCm62/BIMdIt7ZwjtSmsp2WeDvswptrY+OYOEggUUezkY1NK7kywieWO7sP1Vb112uwe9to4Vg2e1AJXLc6WfaqnD0sudezT1ROV1v2wc4rE/eFrdvbZnW+tg0uUQdzcPdv0YjrO4SY09DWUtcgXHOb994qSchmTCvUF3T9JxTXFsAgGyHYdvXEjUHmcyWLBVJVm9Okh98vmlZu8UMkhJtz3jGPK2KoQYNsRmN9r0wkIr49Vp1L2odK2fODyCFsz0C4sVNom1xX4JyBkRvOav0Chu5GUZyN5G7adRWgENn1Ggoq30E+c3tyfN4yj8z/hiEN7irzd0xGrsMLaFrpe9Ar9gvOGD9sIJijxNOA1QHgzsc64iHRIZX0hIQ0bswmrIv0Axg5KcHJJT9dC/1rjS0mm3oolpGz0xnuape+Ip9gdOVEzQoD+IPEQmNbVcsQm2i7gXPjFAEGELyvyRM4ylnFkhrL0T4PZCuPBvhgGPmCYys+Xoh6psvEiuhQkkGFvo09J1RU1j6qsr9OcMHNmyM2BjjLBuDvmHAACJCC7fxvRHEOjsZT5Y2QCSALBAHcQr0iEbAuYRDVt5FrEnGOtH1w4IQgscaG61qYzyESr0iz+VCQ+xaqu/t0HfKW9MjOtZEO4TyJB11wJ7Vyresxul0OhxtNqToK/nZ473fK4hjgiEkSVwSH1jCDGnuNKd52LCLI/fsJXolfX9NkMP63vfeLZXvMRVC323WYTFT4EJYtkpcZL1vi/alCMYHeYTEEiC/AnG1IzC79Lw+NpowJ4S7u0XPIT6RYRFhBmaYb3aTFGpUM9RJz60htrGLCoKqBArucbBlOBGjRBl1rqYkGJg0bAmpfzQWola7P64wLa7gq1aztdk5KSJJQwaZztcmiX686BV1mThXdbqti5jSZpcVco+9Qz3iAAGFHdEdWfLNoHwZ3bEgHdAQp7w2AYpLx6o6NrMD+1sAWD6BG2pgZZBse5IbIlUz9x3DGnNWQRGa5p0ck9aRhbbV08DU4AaF92crnbgzsTLrqQIB0dQVpE/VAICUo1d5UcESWj8Pg91Gr5dfcvvQ+bFpyyGFFKCeJP+JicWkktcsqtREDvdsspebdbSvbkgGFlLrZtHuT9gS6jEXyJP4lY6C8G8k3BsFPCzF0o/zYiKDcXhjdpske142p0X1XB8SZmKTWzs/yyA4Mvy8Oq2ibhKMr/3KRoUtVcpOheE2HmUkRBRWActhVAhupfrpgOeZdm3qGeZKQ6U53Mm8oyTst+L/q/Zr3DtWvRxWby53xhPWp5Y3jqQaRk7SoFhosFxWp0j6Y39C4x5DyaamchKwPw3fZNZHieeOhFyuzlPFdFlM3pZdoPMGC3v2DlAUeiKInOQZDuabnVp/Iw9WGVG75SCEK2ev1OJ3V9KTspsKsx3kYqAGJ84bOB92vIwNaYGfYzZanmUSyLQgozpVQoOUkx9nDlF5COrJalV1c/ZQmBWA/lMFgaMuCObWHXtrlRtnN9mnchJMJAwrho4OwTN0wKEk5e6qLpvpPG7jfscU9Uu62DyG8fLHjQX//DLWSVj1BvKSTWGgL4mU1lKQVBfuf57jQSRn991y4O9kEoQIw6ply7JgBBIvquVx7KtfUsDiJPLhEWtncH/0tja1JgGOymWiQaQs9ptqtSwjE4lALm5Bm92xOTi7Vx4vYNUW8cRj22n+c3QvhDV2ApzxjCMfh61qls36VP3zH2xDajbgiNkYDzMOn1BEj2OdMZD+jtzjINwXidiLbJpX6oDYNHFYX4CVXPgnalJaBL1VUyInQq1FydUdBQWYytshexUhPCIpziNTdAhwu7HuvC4Rj3afFAG3DiiAouLmixT8gABsfHNQhAR5mVm53/R1hCFCBr0UrLBa/1iMhE1MaxnjlOEV8zjyvY+1WKYDg0+gQpJCOcXxF90nSQUKpLvswt0va1UdmMA5M6y+6thcM4gML8HE2XF4xmUUVqZKCGZ+UxpCXaJLkQ3vgpd3cjBdRCuhbjGA2g+SwEVRnzpGXF0JmYhjldtFWK3erIX902UpRBxS1OqnBlCpUgGSmpyHHDGHCFxPkhwVR5YNGrS0scbtpvo3UeZQoLtcQzUhlhTkhB9ehEmqyfvFQVKZCOmuBVkvzZMAU9UvTsoISKKkcKy/G/dFaVZMlhjFQzZ+CaEqODUPBUMGYokzjKKYcC8i04QymK9C06h2toDb5fKwvM5Y9mdbnuSWB8/Kj3VTKcykDGRowXd+Fwla4jefjVM/R/YJcgVAI7YHSm0uQZXSFJYwsicazRHOmt0HzxX2Msl9WVHUAedWdauYMqpqMpbNilCQjOyHTAjVF7oecRlJGzXQIkzWlULcWi0ORU7SibqmiFEI5sTQ57qeqp+QxgoHeiqKtClC1m6cc1cZV09RlCP5eJtVZTahFocb5XfKuf3Q9n4mtpr3nOY7FcFrabGVZjEOYh91tV1vxllR6ROHFYDYdCkjqxO6TfMMWDdeTPbqrhSZrtlUK+oRXFVquYtZsIWOQlClnvAJZp6ZZ5A0lNEOiSkuVykmSmb9MM5ifWgVCkiSL3FytUySoNtlRfWsj5FaRkSDzN+c0faSIi/zmfG29dtb9xcKEoSKGHsxJP1gk3eohUF3aX4RnTging4pL+3godTSRyknvNaUEIyRnUpVRlkqMSam+T5Ej1RlI4wxePPhRGAIIPn1hFBVkEpkCRJWhNapAO7FsC/nLfX7t/kV5TJwpkDAw18LHjTjstEK6XSAdgXVUGhDyO4ZKZUXdWouLNfCitYS6AktMJaXYY4SaeQaGK38NtOda279tkdpf5+RmnOWjMDaHYaOkGWYunmF6G3IzM+wZuteSz3SMlFazbXEON4pCZeyIoarK4qnygnydrPC8uMozvmq6oV2v6FyLo16WJHkhFSRYi3VYTmRCTKGiqhmtt1mmKS2ZiqI4TnOejAze4ryoRTEZ611M0dQ9Ua7zGmNcPRgebnAI+h2111cpP3BZfEjhg5CxECG+syL7VGkZDbayCyV/nrdANC3N0hIU3cDGmMaKqAX5WB2pjTRmQKplK7pqAum67xWLHidDZGvLL2vu+0AO39uFSHE12gfNX61Zq8cB4/l2+GmlovC0QBZOguLF/9p2ERYldID/rKTs7p4jF8imxQuOFeU8+Kec+xqwwUDVttNtSGxSBjgEiFgKORQGiFX2GmGIKAl+FK66/UZeh6m4FIf7XLsPi3TjWsEGORL6UoSgUlc2hYnpwVLR3fSTADmHN3x8AIpVWOnE961Gsq0IxDCwm86Uer438nFI2otvdNtU2VF455mP3vTOfbmXqsHuA7RdhCoV/HvEpT6EPgMGOuzV9piyFArPj5HnF/+Y5lBUNFeobFI5GvlShICQfzRqeZt4C3PToi8LPmU+hvOPYX3p1qRBGfC1AtVe8wSdQbc90UyVKocPLr/XYWJAIEpRXJ9qiXt+oh1bkbP9XSFPQisbZqPXAJTcV6PHhVy5xZZfyE3rSrd1K3zObZTPEXaByPmwbQ9ry/0SWsbBcfG/3rXECfS4OMUXwi3VRC/ew0xjKJDctGjFOh+Awqwk4+ifQP670lLoWHloqLIkisO5mDkjqCzJuF/BtLADJcFEo4pRPu/MVPr+8lyci3rahZxdngLl2i8CZbBbayzpy6eTXUHGE0nHL+PrEdGwmWyAGHkoqic2LMTJQ4eBANsLF5unEE4VW3YqmRu5aikdDfErQ+x+NFg8gcMeVSZrAdT5WF0sQGOSBXRrj+ZNe1EvtYHjS6Z4IvqnSi/BaV3LDqtPfMGDdkgrWqgMfNkZfpCVD3TUNWtlfNx27S1K+xDQbVYikDusSMhVdL0wPE3GspBdE1ly8nOAAB42COksVlsgtvF4YIJkdx5gt0Z+q9HIhaOlcIwzVAbdl5WLixHwvZEDw1Nc0F+wzgl1FmAZVolxj1lNIsWmeyrlDb7QS5Qqx1z/SKp2Qmkmr3AEfM8MykkZbmNIJdO+rUkoG0z+ZesdpRgLCiZV79lOLj4HQrlAQWhrpaHzuSwXhKktEipejEMeaxshacd8IwiFwmlzNnY1woZa82JzIXwNNU/K7PO6FTFWJ95S6RVi9Ad6cBsGEnJW4vRjJma6Ip9Qc6oIHD76DX+0fYO+ZOMMNi0I3UV6QMkcGEIjewha1gbiQT7li1mLDV75Ye6NaZPH8u+ecL5QYpxk+P86v8nywmtdhUQrSYbdgPhQQpIKY+jmkDIUX9cgb6WWxQWcMdZTfkSRMhb2DBhCGlK3NpP9VdqImmc+9a9oqIiQyODJwFvzIQZQ4KK7d7qNH579ik+WZ/2hODT/lfne2cqff3XnHrLQ/+en6JXBeV5PS0CK1a3BxzDIAwIcHiCYzv1GzsWAkZ/Upds6p7kRa5khhJ7vQ86BUxSd1n1AClOdDz+exDMEFBW5Vt4221zt6ZS6N+Jf60vBsyuZTR4CIvyhy1Up/4Z+bVo6Eqq64iHmf8vSWQomNDYgv6+ip2T1Sx7BqrPR1BJ7sGEBTtRZF7b2Genp0dmQ0gFybMYbzrgXQng7XCcLh31V6a+lSXRJkiWB+7Y/HI3hLu8XYINxQl5gKvBe+jMW503G+HQFf+Ndzydjv91gpQjnbc1BrK4mB7YC3giKcoehbnqscVxA+yNbmAPflbGUKZVy4rLnv2Vl7lV/c0ZW03VNZYIy7UokVTpOBYnMjc/FfOMKukFP1Vt6Vcv9KhUOoHxp6fcGQYjdce2R6mySj0pEMzW6E0/ZqrB7gBf4ZE0mMksCCOyBCcFoLoIQnfEt/DuxDFb81/7tA0HftR2ILz3NLpzAay79bzcQVunSdqEoYMB0988mgMyh7N7NIgLkuWzOIbfR05mBm9uqaoteyQA9Am6c0I6Fl6DzxoRLoV/GNukRB+IHaRkRWeBRo/jyDLQj+PLSnF/9caL/vnwF+Owo3U8/v9JvkEPuFVAUKy8VT7gU5mIrwVBrRWpg+zz6/zQyTsN4fAkOzin+GOBIXdSVE93I1Y+l9d6HCpOWpA17rE+BE7zz/0Xry/1X1/rk4tmxYN7yG9OPIa891fT/eJ9Uj7mMAP4n2zHdWWeswCtt/J/9/n70q+G/PwVwAFB76mswGn7WqerPTVN+H+Kt9U94Dx0yhLhH0YM4m7FM6SXV4uRlRmRE8AA8UEDXIAw5blNHaNNXXPXtO1YNySeRKYPDEzba5z0SPntOnhhuyjKe/TFb/zDu4BiEzbIZxrs3U6kyBGpwEa9vzRT6EFC4/EZe7CYBaWHMROpezMCCU2bpMHq157VjnWezQKDMhFKuB9mElLpoZbwUQhPzEm02HH3fp+3saXFbezOBQMwlbd1eY7SAEy/1C+XlaWZzRehRO7SsbL4uSnmLxIFlRCVN+mi+goLXMOwTfHiQHSf9PTcdXgHHeEfk7I2hYaHEb08fBpUds+kGF3aj+yyNmgdHuBL/KxJOPulezZmsmPu/N56HOQDjkuL4Fo9zx2131ZRLYFBekYxp9509XhsbG3U3Zo77QR703ubzZtEdlnCjPgSxB6v9H3ZHo0CaHI234afXlumYCdEvoXDuqoSIfM0KAgFfKDhgWoWOsKRCxhbqOFEWjNG1pl1H2J1yjkJU2KmWvtaG/DZRlvUR4bP1BVWL48hVyAWiQXYwSN+2Q/Mc9nuqpnM9IWsYp9ENsxo+F3uig+KWca7x35/NqIVjgcCu3z6e7HpIj+uSw6oh3k9oiBrIqAEjqyr/2ZyR/QWTTfeP2psDQKunDexBGQGZMAzEHE2repDGJISsRzTyrWl9oTpWWn7SHh+Uz5wVlpBP8THtXGR7RnjWFkqsc7ojCGBqhHJUzp9iiaN0egRvZ0/qxVVRRwWBb2vtHOeEwKprxQ2ev34OZ/JFTQY0OPhUNIMx1bUMJOpBsG+2mEXyUavN3X1084W2B/3xfdTYkOW9BKM8K6/DzSSeDGs4j7W8tW58b4ZvdzW+UeEWLhIX/bnIm7AJCI0EM0NOs1Fxl/hxq0vxGtWWpLa8eR0ajrahUeNEMbOtCtFRbN2JY5vkiS/kxoO4I/1dOjRDGUvJwN+es8ABHkpGg8BCiQ1tV3GbTmD9aaUOIvIOq0ddkefMdISu/JzwDg3LJcgBsnXk5EG2CAtKTT71BVatq1KWF0UTRsmO5jKxk0W2EGHKqMgcSVIU7UlTm5qpTnoP2aDClkNFMt7nwwSCpl62WVpPqlhUel4JIFAX09+8EqgLzQDdBeJpAGBsBWAAQ9CyChWd4XRCnK60AoXh5+lk+uDK2Q0HecPRTjNXlP9qKtT84gTVLij1+YoQ4v4rcCj3c0OYeZXMaJlO4vUk1w6UdQReTUheSFDK2Qhp+JKULEEDDkgB3YEm2KBoGAd4FGQPBgus0Ya9CVl22svQZRGxQ9LuYQFkWiVb7cbkWTgGsgryQjyABwI+ivPRjSh6td13DJ4NBSXqdG000yDTIRvluWzMrGWHhxbuMpNxonaKalLMNU2oRW+EydMsxENO2KlOgoyVkiN+ImTa9om0gFnxypLT5vgaVqgsAktnRc2Qk2xhEEMOXtmMXHSRVzZZGHE2WUABtJRjSa1q3u43FrfWX/lm+DdXUQWP95xL36y1aph+SV8bfMTxC7yRfAF/8er76qtvRIbzScF3xHlkk68xQYW1EqtBdNQVUlRroJqIvbmnMo6T8Jqxk+whwH4doQWMtYBMpYqNEyUugNpnlPjELNd4ylcrlCBA811ggM7vAzqKZgLmlpWSBcY58mM0QgQiVJYBTzv3NwY47gUoM4h9MzeUxjTyWLvmRlfesKjjLyIi9Fb4BMKKr1Qq5IpcbHqlsBJqoClFm3iI3cx3o3YO+64oQuroKkMUkFTKDq26KV+OvAcLwfs5rvJ+gVQNiJM6ckXTIC7pCzFS3oykz3PFbtFI/v6pnv1a1vCkWaikgpuzmXs4c0MvMS51PkUfOI33XYwo6JSvVGrw7gPakIEzZmHm35OtQFUrz8hxCdiOwvt+MuWsEpiA2sXLRtq8rPAcQcit6GTrLfyH33BR7g4S7h+sz2rAIGHYKEj7SoYYPQ5XcNOZ/KjTEeVO5kskev1yMrsmRmuS6qJjpP/owJ4jT315A0Lc0TJNni9DvHZCVlUW/qLOzyEg13rtyZ44oFn0jXajrk1KjhFbyX6QHY1HJovczd2K3Huk0BoMKD9pi/VPohZVNVhizf5N5dbyrpZ0mkcC8RZGrojN1RSlPCddDvJm3OJjb0gR29B/FZdrn8LCEgZ2GlZzExqJcEKm3Wl9MvyAy4/m4vS4wgkq1ubcH4J9fLSuRMSzYTBHiKdDOJalOJgnaNly3aKbo+Jba8NJNubVpXiz0F34K6RiGoICWbao3/hjzZVtIMEaHa2Vyc6iT8F3YloYAFkwbIviyIxKxZTMN7FJ7euXOkL1tvuyjVaTJDE/CgMbeoUKFh54sz2b+v/902v2ZP/Zsso8DwbOAx5PnEQWkV7Kgi8mwmD4QVjShr0nDjtaAlgvUr+qZ/hnbZHEOrszXIHGvPOCfdXaTLYxKdYzpT3jGEg3PE0fdah3jJshpVE54eQItm1KopzLFchWgUi9aVq48u7+5/Ucp0z6VQscnORB742AgK+uz2WRx7VH+sjVbtCmdQt6c/U2ZMIRqScQKxBPw2khEg4T9HSmUkqEFp4M74fh53jUn82RW8NdDPSWOHEuxiJ7roNDMwI51oXzGhXsNG10Zca2yjXlrbOQ77Rt2J0h+FwYj2qRj2KH070dqqVzAFtXQsMZLqLdOSPxtIv3Tc30et4PQzekXzRwG/zZ3hDqL/edKP6Af54mexg/XhwqMsfi6HWDIX/ksfgZ7DasbKJgi7f5HOeJBr/g7/UkHKoFhgOszjiyJ0Z6qvCX6ZJnxS5Tx3IB/y9WERzETpwWtn1RX7JP9+5GsjNnqMZekdvdp/R2NnLTmhmL+U9H12Jh/7Hr/LFNyY/ChMdZ0FAZcSFfiGMQVppScJlyntP2FdnUiJQLoo49zknZvcUdzX8l7swjR5sOJsXKJx2ZkVFNFodxdJehpjMUKrnsF7XqOgEIWUdmcgaF1wdAWgvu6DudOa3I5ysGdGcZHMDw+Hnldd49gYs1jVgKQsk1aq0f+Mp/mYpZyO8mjtUuxoGOU5zjzCvfZsmBI3Ogxsd87jteZj9HsfdF+GsjP22uUjt9sCKATDabYhcHOWADhCh2xoYdl79hQRaI0pRAZigq4/6Z3i2f+JOn0hbR7QndZh0WCe0ReEDQ482SzhIpVGqC2tNkiPcKVYO1ifvaBQUKQj6WhYoChy4ftQsGRTc8uDcF7ukHnTs1GIaTSzAruoMYnrzA3RC9MT2vZsXTqgrdk/bmUaQ/2ndHebzAN6grK8i71pebnCTAvS000pApkIsqwVgHJq3hyHQ0q/vY/3fiJZ4utu3ObfDdjsvad9UeF1o9zBfU5nIGoBlHJHh5w/YFkXWsPQ08BglvjzMr+pjEzSRcJUspEwF/7FlVTdZQxEGXaY8FDS5jmdJPxZkoPJYlY3Y0jjfAi4hxI52r8tCHXkS5MyVaXTFhHUWXhXKu+fkaRDlIHcSqDMbk8vl8IW+VxQsS6ZX1iCo6z25B2YxkHWTzJRJ4dZh8DTEWNpXmuL3uEub1lnI0LcYJrdJ5TqIRtVagkI83P/CeWYYekw2l82I7hMC/1i/1QXQbEfzKpp1KVVNAHG2YBGyerfub0v6gmXZNE7SsXBwCwDTxIq7GpeASpHYLUA2u+83O5LlT2UfSH8kA/cmPBUcIz0NUhqazuLRCdDWCFSDG6IZxYCNVTtAeVCsQYIsGurADNpnckoJdAApkGUCecJBAdw3S8JECGyRWFlB0yYObk5ExADOBNJA6v18QmDT081t7IR1V/Z4QPbHR7UNAq7kInlLqviWO624moEYM9CJUVPMRpJXUVkdoSIzHgBtFVc1it/7iAY4CQRijbA15K5hF1nZWVeRkCusWXQKK01iTXCQnrsQwBXw9z5I4fv4zYhWz2shv6cct8ODadI08mUWLQUA70PZBO02cZL+BQFIct1fJZPWIRts8mENAgPPFakjA0QIyYDCkGyAFlayyZ0UkGHk+HtNYL1Rejv7kx8SzMfarqePB9RssjQqhz5+hDluAd4BVAqVVYqUpC2fgfKgURG9DeI3dIwWjEGmfLNOea0/8PtIAkR6Ae9SaIs3E/jxcJw2V0/LLrl9CgJiyrtMGRdImV6Hvatpp2S3iyjWA6luOlLxdc6q7NRLb1aP8/oOYOm1P78R8e2z3E1DGsQOjYwsv3ViaMZ55/qPekaGpXQF+Y8Tj8dMl9zPivjy/sJf3tMILHyf+jsThtFo+Lis6BEWXxIXptZ9xdcAm2Fq8MSjXxweDYApMKgxccgolqNy/HgyaJPzS8VYQzohH4wuIWBzHMklOSY4B4ulUwrUxLT3HgBnYUpGhhQsGWWtqKtIfvtX2V8nTdNCvrbOlwaF3tVv3QVqO1lrj7eybmZl1JZGIpsA4SbsAjIMJsG2mp5LC1QiObu7T4gQIXhjHnnsWObC6BO+f8MSEmwLREK5xC/omstS0BepY8wEQwIs4mUdCu3gc1Lu2opQjRq6GtFR5/9dmQGg/nxVGax+VM0B4yYpLWoh7QaTBMNhfnPi8xyceTIsC08bHfHac1HmKaPxtcteeBvsnJeJHipbG7kpMJTODYXOepJFHJbClbc1yMiZxxUY5WmUsKUH+R+wyiU0R2Tx1cOAt1zD8X4N+GSwAjAVAXe/4geO2XEAZvHUC5DixWvy98isVaoxfzZIjTP0+/0/RjicCg+9SP8sYx9V8ht40y/LmdMM7AgxWCfBuAkaxrNOfv25a6Q0eDdIjhNzoPJo+IHUrRu6fKwR0Z/IgZb+cczw93XW64MXXh1ex6dNaAdE1W7b0On0QI8qNrHQVX9oxc2Zq/Mxi3WhylyjO2NAADuALgL4t+pkOAV5yNhhC6LHP8k1LO7K3AwjqHtw0R6uvvW6WdmYNGBhodW8cZQhkomeGcFkLomwcXQxV5dPx3b5YQx4OquxKfgUNdL9R1wZP/+YRVXU+R70DZEAAnfqKw2IOTOURys/ghw92ARnk2RZu+A7JxESQgyTPqMtBHvfqytdl8aPNMe2uX5yt83cw+B6I1ZfQwfEDlybi4K4/ZJ1RXIB+IgYBAEADC4pbHA7orcgPHDK1KsbRixPuCEZYn07hZy4383xFIr3hFtIkhFhC4/9sIQJYxa1gOVBEJoJAbBMRk5oY44WzewU/ngEtqtTRLdiCa87WlEIu1FSJa7Jh9p0Y1DZwqlAaJpOlIv092hkZFrgJhuyP1XA0yyWrfB86fhGKcoVDQPEsSeptbIUP45Qgg9BsTqGfDR4nQwTJN4tMkE00bhRmNFRrH1nhj6nVUMbyEcvk9dz4RqV7R1WRg6NWWlOUi0J8PAPRPIpGIg/3saWeqtw5xXn+xEgFPKKFR79faijMyI6CctBORsDaaKPHn/GoRwMS+6u8LTRqQGur+SGF3JEO/5b2egiqPg40oQAHm5/LXTi1C7nErfxoMSKZ1eDv7c0VigY6WXvoRd+LuAEfHH3UwXX/N34MSEW2UmH5B0UxNQC8MZaqYX7svhb/KcztrCbVXG423uGrMWiY0BQS8AGhGyeVhgDy5hm1NXBaqA7BxxS+AsMW5XOUNaFpx5fZNpB+aCyb5A/N5jK3NAG2HX1q6UecAG5QZUVLU9GhGaRPM01R4rg4AJTlHuWygDEEQsYJNbQCMMiHPqrv4lfUAVxE8WRIWlCCmiGeiBqRdFOWnwFt9ZhJ2TQocCRSeTL1+nRcP2yAoHBfcvrdI4dU5K01MCoEGXw5hL8UcQE8mL02JYM/X4n/Pfdt9vqcuHRZtj1DEm8JOQEYDbhY750Wotoo2exrgnYsMGKg6BBEk3ZZiJYlgFD1M4UqSWQgzsUxgqbPxw+UVw2g+D7/wKUV45lXDXoJ/9SzLgSiNY/rEBwt+64JMEbQ6uEHM0WWzHiUWmRbuU2zhFJE+4ZyQj62ZsxduVBOzLKsg5WvUpWl/bdqrykCCCOCnmXJayC8DUbni2WWEzdwG/FPl5pHj6KRWhsrazcI4eEQ8zMeITpkWIZvzRsfA7V/huQ4b0FUZRblVQ1tO7ZUDEiWmc1kGQHRrL++kYscTL3+VKrqnHwQgcjDeaIVJqrRZKQeIzQedkYIkntjvmC+lqamJjlUpOi8TiVWiIrKfKTNkxJWNxaeWu1gqFVEPNt7yx5yNAkQoUkLqIjV/FyY3wom36dz6ZHuUz1Cm/m9Cf09PHAjNvJoR1vOwaXu0z03XMCmDkwH4Ch8qrT0EFhXWPLsysz2u8vScUpXwb3BOL+9tMCw0Nlzg8Fh/VZzzSM7xO80KWh6z6p/z5143l0590Q3x7XV/vGzQuFbc2yupK7+5vw+0AX2hScOz9LSMI/NQ+Y8cPjh1ajfZnnG082FLwSHpGchJLQZxqiYfTSDIEfMy3kgRJuUuQrrUjmwZC4YN7FQ4jmoWea6qYCf0wtv87yCplXVFtlHM+jnyJwKCm5Lq9WUErqgPAV/NOWYzLlt8zKUU2oUpQLTIbunyKqIaSBEXoH0bhwkn9357juvqT8/TPgPOkOWJnsciNmeHfXDeWAaEsUMY1X/ZWzc6+zu3VcghxnziZKN/Rbwoh1ZqVR6iij6AN3t97VH25y1f/yqDRwgRg70S5pkWDp2M9EYVTTJg87ud7xvZFAvQTguHPC6uW4yuOPLhNtn1mggldT+0h6esJviD3OoaM0EuX743lCalywLXn2uN1b1tNsExcrZt168/1Be3Ov6KldrEzkrPZduFmAz8RQiGptfohO+enuJi6rW4+CRUTyTmFLA4llbrVQxkD7ijRuv3FiVibb7fDKBysP8SMH9GeOm0I/eGD62lft0QNkHK/3Vkm3vlpQW9svti4E2R3KCmJmVXbyz+uTsqdlpud+5BwAKYRkNfjMVsmr/E1+muFrGsxkIriUMRnWXWqWgeYUuib06L1msUdW3jPol3cLr1g9vpgZb0fqhkhLySlsmi+N5EvL3CUUQpF7DtAzJFf53N6RL7f8QP2pGUphezYAMfB25RBrzeal5/HaerUZbFcp5TVGxps4k3KqOaK79gKkmBJSqjxuq5/U+ZD4cirrX2RteHiDCVpR5p/REL5oXk83Fop4gcKAYD+C8gTU6KnjcMHoNY/Gm+lZ18igPAx2BY8CLYolqPiNMNWNH0T0NPBdXKhOc5j4XF8dJ7Yl+dL+Q9oNQj+tnUNECRmQ6b2XqZfHpmjtEINHUX7RqQJgdMzfqG6kEhHO6xuRz5pkoVAR4x+srAisAAgFhBX6CmumpHz9in48BXbmxd7lldrYxkOP9H37425zPsyNPmGKnEznj+Xi1Xxq1h9qgl0Fy5DD3AVX1RCL//+N8MrlfrpbyKsfqe6GrkVfOIS1RxwdFaJAVavOe3y75RRWHbsx5OzHtD62u0++y209KzQdjftFSYor5jrf3Yk/s8EDhROeZTurDmyGgOSwyYoN8f9hOJg+50sRKDm1Fo+bQBalAFEsoemaKTkDw4rdX+MU3dSu53N+eFotrGs+TqExJie3B0glEfPi9U9ybKa/b29oY/GqZsFKDAsYdS/wjmz9fZbU/mcgMZaM/yvjZY4wkd2Y0Glz/a8onPgjqRxgw4ORjzmCsEsqae1f8L/AdSNUMBizHQ/rpjnem7Dr0CSr4gWYPjf8+SHSJFGHOjSEXD5qWKlUA/J6hYh8N/c4nNo0pWRwQOIb5quEQsICt224Mf+MBHM2GdyIcgBfoqH0/0ChEBDAflq5rXQ9L6wJwvO4YGay2VMiteF35kgdbFpZBMSDtgW09AIVBU3ql1SAYryvDclCVs3nY3WlreqyXB+P19Zjb6z0HO/T9GWSS3dxYvvtLV2fyClZq65UkfnaJu3kUQKb5kyWUcDjryqfr5QKTo1BaMFHkaZkOpXeuZe7+/uFzYz14VABKtpVLmLFyw7Z0CTN2xUKIU85P2xjxmnOjm/4x19Jp/rPREV2d5Xu1d6wOrSqEtIOeMQwdylHitV797AqLAJViPCkYJQl03aXtJhx6ujJPrkDUfz84CpKY1dH2/P2V+ETcKtQybsKwNzvu8Zq3qYitklav32OVL8Dxvgb3aFzBTSfGlqx2OHYppq1iSV+ZJ5ddlWfOPomws5wnEyPNxmdojidRZk9gJF/KGHWDKIq7N80UsBTqOX4ljto0fAS5ioCE9XD8jHWMoyakJLb4qIRWBvZAguixZWAGVubJZRW8r4ThaSIQDjN1hUmGMaKq6QRnJCsqeqlUb9QdS6e1IcYzsNUORiLzt0gRBzh2WtXWVq6g7hsAw7wUoZgDXSE3uoj8xXUaMPetqIYT4CiRgnIZcXc+SdglDXl153Ymk48EcDLcsYZNNH613zn/zpXWP35uBWboe9EIUC9CYmRjWacDuuy9OhyJvdPmZXX7IQetF1phyUxcZ5S994CVS/fPvvVmI8gX2JcRGfbhO/KMqvDqpVmGgHQFN8NVcYdfs4fCUjJgU3shAzMVgCFYBBPpVp/cZU7IXdRcq5/XiTeEloWi4QpxvlGuLug8Fpl542AiamZdNyC7Ahhg1caeUDVsnTvogK54RJuw/5WPXJCCcjKhM8Uz+xB3WySgDprew4GPA8XmpUjIQUH7cdBd6N/Vr6uQAWenRok1DRQDK249pZUIVWltoiQmVwzvAPRQgXc6kWy/sO7JkM3ccdMW3LTfxD4h3lpgcBx+j09jvhzgAVdRIJRyU5Q0QIGDD/jCYTt1IrEEb0SWl5+SOqHE1jlF0ns6U4kBb697AUnlPuuFKh4kIhy8/bbvph0/xT4gUalb42sIaw6FDZrzDkK0V4l0U0D0NbwHbJ6t+xvJECOGsZgGayCjaDwYEXs+fnDs0AdhyHGTdUpskh4sEK6kIm0hBr4g55rY6PODvNYDNpIJyPRN5fW8F+gmzQowkGDNa8UUXfcWyH0tOyZ2azjiC3IMgclCeKIFWIAF9xWztsmydHAHJUn3STYWi+ZuwBRl0PSHXLuxVidsErqyRFG1IHQyZzKZcWzwX3U19k2lP1nvRqiLKzHsQKpoTDb4oVXmskU7mzCcB7kK+w9bsVAa4MB+R+HT9EBnEieDm5acmR9e+NARHckkuPGWAljqgKV7k7zUcWVts3USiTia/xsqukKldpOUBe5MOLbYZPl87yzPPvmrUFRPJcZnG55kaeP4m16UdIVxlOHbcFi6MCtgccM4Z/FSs/7Z7CYq5pmOpkIKMf96vHs58jkei1rt86RDIyP82sQ/G00C+rJwYYFIlr5pTguHOq5v3R0YBzyeC85YLWr17UEsS+JUZz/n3YggyVJ8/vRoOx3TM0bauz04jfxeHcgdyYvw3aNxaPnNqtWBtJuYHO+y7HAWMAjTrIZWTktxbBJEucKB++AvsHiYTWeU0b2rE5a8Pg0s2FszPtLasIjGZOWXPsbWylzbpwr3fq84IC/e9IUSmVRMvnIC6wot0C6cjMb95zaPSJYPxokblIbACPrz6sBW2mZY1zcslC4NMfYHg4jewFF/26ws2xbLhH6F/7X/dF3VbVqC6QNx5Bs/xa14AuYpO3NFxe1ENhk05WfVhEeeE+fNVpOGXYBPQfsaIWF635QYiO9f756g4bsg0cT8rKRIWW/vXR0bT4WwpDR7qYpzdNS/9B1tphQlWxtXtd+d3A0p3N477I9uHUGePolMWO3SO/0hGv/MwPywHhsquL1kAhW9zyYGlUZAp5IpOKrpokfVqX5XMRnJ7IkyL4VWpcIQql00W++rOd2FIRol1Z4Hu5vRY3lTW1g8FF9+EXBS2j7daXWrZfyV9XRJdS+avT0GM+n6ZqOnJkYm4wATT6ku6HfbKDJRS0Uh+WuZFs8xfuxBTKOTULWG3tBI4R9WwKoKxFJeCQnVZT9L8aYC1NU7MAD2oANBB4BZs2XKZTWQoMuZBPR4vRgkkyvHT0taE97YqbDJo1hil29v0plMVlssaSiuzfj9MFPNJgTvHbaT8jky6rkb+CZNmYyUPZPfl4XTv7QZ3hjuUCQoiPIX0SDzmE4yTjPRqGhANZgyWNKAAp3sOYb567WeJ6nSm3l/v/nf6yFuv7a470rZQx2Nh8zC4GnzqnTbTRd6zWar1Tb1tCijqGKxjLY3Dd0qtzyV5Q08SjC7BkBvJQBuqClEP9foTMQhEMKv3jv2lsZ4Hs3Z88GUZVs6T4T9KsT9flzeRIeZ2zOmAHKmDmiQaStQXD44zNXmDlBlbJtRef5yJ4W3I70YDDz68U6JQDiPtxxWRwfVrXAINg5qRDjQByijVSt1FXgDjKx+Bu6WWWGxtyRJ83EVFMXBh62VbGu1d3htPDqIBnSKLKUm+6W/8N0M/RhkvhM7vJZ9aNHZfK0XYLsg8wunwQb6svVVT/tgfkmNDTVo8jaCLONZVUrZDo9hQe1sRcKGeHxO19Cz0DQHFu6IfXycn53NpAVzufnWOqDJxWTUEoS8feacTCex8Mzdc3rLIUI1c9dnYXmxlRSiyr3lMDNdU3dWw05iglr3z43uRQVk6YFloNsEFg0vw56aFSaU+jOnk/nx5GNfHCcdWh6WzakVdP6Z6YiuzratD3WwLdaYOvnV6haivmeWfWecNzwUfdt+yNLG7e+ZvZFedurVTBqawbMEzeK0VlvHQzFzYe6EHzMoBHQz2jwRCnmzify+40Amtp7rhVJ1Av9x4YbehcDfYgvQua5TDF5brQFYirkZRz7sMSFH9kfoJlfh9PxwHRomCylYHxZc51eEXyFGowXhAG2tAEahmQT56mxiIeYKmKQxGkrWHFt3hPkvC1zSizPy6zfc+JVeSpZKS6dQ9KfhK+WU5No7yf4mFFEMkyRRoKIkK1SWOoxyqRyxymUuU9orpUO7tUnmGDbjzBMRkA8vK58096HNtZY7b8yY4RWaKTPHWuezGFXX/FE8JEFcd4RSKF5TNT2mA5SrG4LCEBkLoAnlVyR2s1vd4YpDNNsvorcXnlOHCJXC56zQSxpixSBJMeuH39/5a78s+YjOhIr6va1GEo1P7SxHvRnMD43okSrIEE9FQz4IUftBofF87Gk2uo7ScfUPjuB6GH48TvVg7Bqq++fKrKbFn4YwztPu66T/QNnTCGCjqUMy4IRw4pkbkmvNpAc/+qRhH5N+ngdoSK+045cC8Ux7+yj8yuShfTcdaR54Yq4Of7nYPph9J5ItDCOODUVjuJBUhZoov/WFYG43nY7AHsbVWp4E1KSL9A3z9IwshJ8KeszQe3pNodZeZG/vZ+7ej2RqJIjko3UbbKrjPehlnP/cJuXRseOfw01TKIhhkqJnirRclsUGqMdiqZy0ctIMxwnmrzpfKqQNIz22QcR/Si/G0FDljBH1PyTQSxWWO60NR0+jXzG3u9pI+bGKfaoOb/1Ovc4MXuZgXB8ytFmH/K653zUmQNGoa74xovnSKxrgCCI2NklI4Pj4DEZA8TGTWi6RBWFkbIpAkTPHq+MZN1IU4vq0q7S56w5hIMck26XH7fn+fE4ByiCk3eNVGWhHXONfLxkt0+FxLKG+Lq3DhYY/JMQKYc5MgNk9GVaYN6/a4s7hbgOgJRiEIBww+/8z1+fZ8bTojwckml+0OeIo2iNX50CIhOhA4+oF8oMkeECmqxgEVBtCKMHUyABmWR/CzYEBg6hphZNwQgewC5Ddngz5QsfV0m9OhZ2EXGUkSWLq94hwCtV1dniCcLqvArQFqVWvh1TRZSfjy01zDELAgwzC9cZ1FZJ8dAhJHsj2Cnb6wYby0Q4bYEuFGtdaUI62aSbINReKq8pmDe1U+7QCgyc5kTUZKJHXZtBVpe+ZT2s3KGTTvEiu4VAhVWnP/FnRwXUv1lJM8v0BdmGyKUOhX3YRNwAz29oMym9b12co9EuMXMZv7Ns0+AZBE3XAMxBzjoYJ8Huz1AxdBbgXU3IBNN43Ww0iALecAkB/0vs2rGyULUKtdhQoUvNhopZz35wuTJJjCUmLenjvS3Pec2MxD/AjVjdTzl3V3leJdazloR1poo0PkYd9KaCnSzNmto30PJOq2HapVE6LDJ66xPjpqr4HipjRrelQo5Vz2dx991qtd2a5mDutN+wqw+4vhMPu2tY86sZsdWClQxB9z3q+NXMxZfvtxQUebb6ODVJsbkh8OCRzabsxLwHFnjYRAWn8Sq9PsQ2oOgvePj90CDIBqaDeqGUIYsGwCjSIsYBoe6ZtQDUZINfpLHBsmK1p5Q61+74/4XHSoDt8ubgNqPrvnlUq0DaSs9MzcYsG1mCPigUJe0TMi/cUtEk1GuaUyOgsQ4/XjbLZ1lWEg8HDRtpMWANSIiBshUUVWWS9WgKQnl2U9xXHJ7HQ2srYJS9Zh4ibXn02pA3W8Wtqflp+7AXom49kqaYfcMwq6q8lRMfLumIP9wzBhzMIrAuxzho0/jQnQy27cA8Dv89Ue94anm6Nm+nUkUCZgAgBKyqwHkY/EiA/fezo+aRbSRHHT36GPmI7DRy+b4QQcKun7NbtleJU/26DFIid3EP/ghVzbDW9fxblS7RCZsW2wFTZdYaoq75V9ClRezg16hplG1W9Uy563Jkg+NDPIHPubuTiz6x8mgOP6RKwk2xBmKDzDNDzAJQE26K2IOsFHJn1yq1ebchngMizwAnyldie3quw/tEyb3ZhlHbZVubRYLrItUCpkzJ/KJREIC0/dQ4DK4ekkn7QMEskM+xpZ+vJDLzgTMWkwDZM6L/yZL7V2OmvQymPccF/UOnte0mSkK1ye6oaXp2pVMxCSo6gPJe+i8TzJCqfu6HUM8U9zqzgnbOUKcvtWI/cv1gsZV0w555Rn3u8vE7offSSOXm0rjtNotNBPuSFl9T4fdVB/GyhZPFrowFnTK2N88kTHkFNrZHYBIMRuhvJovs4zO78ol5Ilzzx820sPM7lILLIQdRb+HYFgT296XbHiXTg8RvwiBqvdARcRJaTyrKa0F3frZblM8sXJdeCs0yKDWyVES+GzQvl33gBOMopwOHBYlg5Kio/2YtDxRSZwvsIEi2yuxANxyCMbdBMvPc8ySUBDfy+S8OawjPx2KG+x0IWq0PiyO99Xjy4jfLcxXtRL3K9q5Jk15n9kjRkChNklj4XV3Agr45uDDwvPOgHGCJdtAIvGwYEVsMUbfUf5zqo/ZXNVj1tX+hF8tudKC8m+kDPyYUueK4kyN3CnyAFpkdDl+8J7iYS1QQhZvD/zTbcihcAmmn4tlLxziCZJsQoCXuiG5E/sOgaeVtqvcQmC/F4o3C6vp6LAQwcCLnaAWpF9XFDvJD+Hv8nQAsXgeQh2NgFXHU+gNn54X4UCTgOzpKzIKKn7b9BzQ5sxAJQUjOYzwGhy36Diz8Tta15zyrpuXnQnx6mnol9aItLrziStgvtmCQGQeFZrn1VSM9nx2xMNnn7pSeCvxHii3gieu0FMZKPSMj4spjPQ44tLsjcLzlpRb8jD32JssKakkHJzV9eAUdtEpB0GTQvNonVPPhluuYlIwG655Hw5dOAtbGToMR16o61DnY7AVihBMjpjNcq1TVkx3uSgcTEsN9porGRRapPeVDfx7XXlbbodLZdqJdfmumQD/M7gaoD3fgtmtE14lnrrh1nl0GCE+oHsNd4MCavQ6dLicka/7EOI9NlpNGcaeUf8wXDLK+A0OwrMlHz2f3VEocBSM6C8p38kVuK9O7MrjVbLe/K0KtyU42gAlqPznYCWFLbKJqffVRws4rsCVZ4EUSksuDaEby3NHjBWyZ3s6N9QOQ/NKotwn8mkFnVb3ar0GjnhRBBseim4uvg3QA2+S0KuWt5TVKDbSLzIKx+KG9a3wy9qIZb4Cwaq/g0Po73oBdNpm1dCJ17cRtq0voYx7KFo2g5LrzJqa2msePsIUBJl6MXftGvoQbPl9aZ5GLDHVviHIJfFI+UgzkYkLQ5+hyOlk0NsqtMVSaLmhxDR5SbOK/BPQ2KHg7sGaPmcHJTFzoljo7bYB4z+8BT7WuGPcuKqiOyW+iZMXTQDdCyUWwbH6S1qJk9ZXDgO+G5uXAo6PN/PG7jCKzDWF1K3Bg6ZoHf+nO8n2NS1e3B8BZ04Z9IAaz81aHJ38KN9lTNp7+QHxctHJOR5DmykoysO2/O3xmO2m59snwl+SgAvtTqkPlMIo6KQ0QjehBcprcmu+VFE2+CgM4dPw2wkszi4BU8xqhpDTmI36uT8fUX+TtxM2wj0RDlCZi0Bl6rFyUi/e0H6LJacqlsfu4x5t+zRgYomlB0e5J4SwhFiYYPaek1B9fgxUhxrP/ZOPMnGggf84aQ5i/FNrUCHeB4Vx3b/opMSn5ABGEHXcGteMq+NokSe5VICxhL6cl+JlmQbCiFyg7ue0p7sYP8ZNZKvV155LlidbLeeTl7WKzTeM/rSqSsHQgduzErahw0nf5FD/sjKG6EpQ6HMZvwXumMNFUDvkMaJ9zpTaKST90Ex3SywvGeizlkUwXeKfoWgA7J6aM+fF0hUZzoMLE1T1WlvID1XHZXL7XzvZ7eXRp//iNnbk21nvL/upnjXa6oOLHbvVvh0XdHLJzFcvZEqbIcm+jqad/+bKDosmW+W1myTFPHieSolm0vov7s6eU9QRXIg8KesP8SO49L7S6O7rYRnvPhupPeb3fUAeyjy2r9QtEsfZjw7VpY3uWKCUhbNS8a8a+PLbJzU6MjeDheySJ8XOqRgC+JndcNRpE2e8hvI7aaLAiGsLkCdiJRFE7jfEd+94FJHH5LRDBydUzjGnwg9u1GfR/JFSKH1uxhVm63p2+l35DtjkSGgqPuq3JXG2eW/xRX051N81DHMobf6NCG1L1ji7u/BvPOS4SxsCEydxtS/e+8W+161snWXsnFVXpHJdKrp0+B979fIeMXbOSS2WqjVgiYRRBzsFBrVjPRGPFWhPKah+iYq2JBCUnXbE16/oWHH7jIQUBEKLM8PX/Vk2NqLYYKFQtFzM/NGkWY1phTwgbRznqjUkM5KSM1ZdXv28rPrx9eB9iGtCdPeqczmho3G7YWrvo7eZVUyOFzUoJ27v1gGxgFW8vNkVvVHGpm5F+jV+6WlNM9ApVayKIVy63O6jq10yovptOLGcXtCgOyg3DBSHKWxUF78hLaKhLhyMBersYrx6qA9endoQREaZvW8yAgj4AL8M68l7HGuPZY3oAWzaDRl6530FTNEyDzv/KQLtmS4X8lwwjgYHp6aGDHy5a1S+m2iXUJLBXRIxo7FTWA6zLisSdBAND/NiFgMdtpABN1F/KL7aXZbollw23B0PCNgciYfarPZ+ILjZnyoQoVwYzb0y4om9QWAa61y+7ADsAqzFR6t8/y/KGrRdABgvYhDs+e9wZM94lDjVqFTaEezkmjYYggnkGzkyK5s9DgxiY6VKy3KzGfl3PorHNJI4qoWCZ7pzmPhys268UgrSZgSPpFolNueRLJ8KnIf8EZ5yO1dM8+Z9a4dxo+wjcIvP7kC4IXvEaWODyvS6kB/ypfd5QJZ7LU5u+FPvMoHPzgaDKwOJrPuoPx3OHpHgEslo1t+I1gWzfqOSpLcdZgMjpO+IaqJBqPsLBZm5GFKdBc/UxrBt3laRRGD8gcBDzYPjwkSsMK4ou+vlsiRN5wJJ80c65d1MI1eKfErFWQvuLBWQ3nSqqgZZezvqRsii+WnPY2yFSh7X4BeqyxN6v4Z8Jbj89mEN2rqmwycallyvApadq8mVIxMRspk6R54F7mIM8I547NtC2Wsg1oYNnAIDeCZ8VgYo+qLJ+dEPse7EOQ307Xl2TzYKjRA9DMI5kb4p0yZEuqkR00asaNPeSNgbRaDPkCkcTGaAR+MWvOuLEPA4qTEQDM4JHXXYtvKJU8ATPIqlOWjdFCbaLt3Qv39DsnRb5oFj8gHIenZHxDgRq+6/g69fDqAo9JT7SlC7On1LB5Wt+dol6cVIWWz/bN6VnrtDkM7JwuNX6bd1L2n9oXXfNh+xPcj9sUtbAcVr+0ONOvYpsx/3lQksLhG6nzNLY2A3CBC+X2/DtmpadQ+RR6jnJNXFJ9GiFkIjkObK+dnUzP6zSZx1a3NYQsMi01l4/dtGswxNazeN/qeBsY1kAOijtM7SvKHfR+B33UEp5DHqDw6n9NkgQ+NvSIjRZ7aQ0Me3abKAw4qstFoABTYMZpssbGEq7YzH0udqV+Y5MkzXBHKXbY/o7o60sa2/P8rPlSiWsjmmfVoxZEWMe3+/JmhE6RWoH9ki+SFI62HwJNHrnQlnydSkvdZ4rTQwEIUwmAhnRtykCRXuSEWr0/i/cKkQGxowdCw6+Fcj50XOtC6DhMRgF6h5At7oa2EgTKBrEENRY4b6FUbQufUqSDfD4gziYRhCK9fzwP78YKxIonqIbkYn1MsEcLPhwPkhjbCJYJml3WX/qJAzHSCloFHq6x9mYH2KIJm8LB5qXGnWgtexbw7FEJcxzUhjR4du7JaWU7jJTiSV2OtiRBQSZxviSPFW4e/x/dLKYxmV3ZWv2BZfLFaXTPmcynlQmDdN2UP7DMDqPMVmURPWvVpw7iYe9SweKDkCYBfILLEyIiZimoaJUEAAQsev9LMY6zh9Kmo/JB0j0YUzSVbH3q7bO5v2r1u6Gc6+L2hCzYVjEr/WTm1hcmKkaUChDFd2ZoyEoo0UWUAveKRiMPlIiieep+CrX705VM+iXc3vD0bjZqb0fwJ0NgGwqxKj6T9g+W4kEzMwqzV1I2Jtd9ERuj+WV4s2bbXKMI0IvmoI5y1A0gwPMNZDxnjXd08Hre24ae1ZXLp4MUGEWnx44j76iMS1uMO6ipuIVB0mx+ctmIfMGiO8FQK44vu2UDaTzZq0RawOzbQUB3xIEyh42YMJGJALm1jkA6ZJdUYjyYBVZ7n1AYG0VeQkswi4cSDJYzKPLMiQNo9YSvo9zYHx9OB8nx6bej413MuMvIMPhnGOUndmVP5IpNwFJjQa6CgYszxrD5AamAubgAzBr/L3wf1XbWXUAjWRvJ85oyLYDhZzmlocxYyqX/sJhFXm/H0Hu8a7eVPkhz1GrvX46w0nlZzt1BpqFG56UCrJbxj0fzj1mAsQ5SEShRCbPE2E8ywv2Jf7aatZSor/pT82JHujxYiB3xWnuBSGgr2j1UEJBn2q2x2Krx5HLgTRlMiYjvCO94W67Hlt+sVgyQpFz+cwlD8v5k52STww9LWfgYDs/vJWMUDL7MxNXzlVKK/oTrj1WoCKiFJs0qg4XujHcYjbVhFcQf0/AZbI0JMiHbwBN7OL1AsK6ncmX0/zv54gjeShzWiqAQwZf0NW8qlVGENBzJwxc3aUHu3Q97pNyNfJwP4Ds8GfAiFkxlKSc5xT7m2yvfNO7XV5v3mA1JFAmo6ySOS4dUzpNwDJABlwxKfLIO90XiT++N/hb9B8v67UbJHHzqq9ejYTJRKwPnrpHkWchGTp3T3bOuX6vSoJxOFz5TyBcUnvHtrNVwhzBYdN1MxBhJWAX6h8Czat2j+suRnB73SGdee6TsCMTSvFRlTBo3wqwhVzepYc32ZWRc0XM+NCT7vdWR16S8DM6ZY6lRaFiR/Bit/OmUoarZWP7x33f2ROiykWj+/8BOSVeVFRsDoCJCA2BuM4qcCC2pISINwGUiBs3ViAB0kDMwzlQxfcQFXTt1cufdfKXj8XterVgFIx4PVlCehJCY9Pm4lGvQDRTy9hzydQuabZl9UO2M3Avthpw0vWV0Wr32P+KaAQjqByc10E9ObmpkAwuHzEn1V0mnK5LJlCaguMQpd2ygoYX43ezY2evwUgLQXOYoB+A9dZqLHHa5weCjboWBEqtUz32zahUzVoNIPMMWMBSZWF8RfTnwTNyd0PFACEL//ShveYBm3dLa6RaooZ4Gj25hn81etOdO+dyJU0G8Tr9YHAVD1YiRWnKKIJNg9rBGAWCTC3HFW9f0hKOVJNszG0fm8pVwOnweSPno2erw47mZ0lNAAENc+/dZrgN3Ia1/cVESAMBHPwyXAIDv/9u8xN/fZJ+4kMIAFBAAIMBfUlZrl1MLtIxPtvv8HpAcfPyIzWuzoadDi/+AdG5P1aOeCgalfoBbf0RgPO9Hek1p5eDM+zMofffxUrhW91OkL+QoHGu8vZbEIbApAPLHkxVG7MQ4FmAz/YTUdH54515c43W7k4dM5uHtFzNHY01p4RVPcwTvLOw2nHDeKZ/gvVMb76WdI+F4R/5tN7jb9V+x0UjUArSEjkeu9uXg9lSym5vFqRTfRw3dEkt7FIBnbac85vZJdnnD70Qq1i8PBdCpZF677CMBMAF9kTER09F9uFsavUifWHMafdA7PzZiihHD4/L5zmDa0BZHRUc8fBMFPdlAj8MSL571t1RLzJAB5p39+O8kdmlxzOY0Hpy21gDWO1BK4zWuS5BGzpIXnhg3USyGDO2yljbHxTXj5kZPmq82koVsaW7+I02jJV73nVDBr0zVtBQ1RZNCxwLJKRdaHN5ZmI5rna47so04sYOOEn0dsFg2d1zq8gjVe6jKd71wLLg/pSdjFXb0svWQslSb8eLG5qKs1sw9UekR+BszSsPRRodLS7NQNHLwiKkUEGBcw+mJ8zqpmFqxkIGqHugjPV4Wzf8EJ9RUXuCUhl5EF0u2j68oaJS0IPW9jUJonRq+uhPwhvGOVIC3LOLCjxXNB38q0a7w7RbQPHy3heObD/j2doLTg6xsoHh9jegFePVpBu7qCGZnGtLZvK74SghH7ekmhGmjTOvNcQSOWNZWN6OndIW5QxSMx3+FKBgXv9LSO1x6Onq7gyYYGqTac9KbF2p0zBvoCqPFY1+pR6M+TmEscesSvIOm5c/aQNxr3NuOnaUi/tqjo/NyUB36q43ccaJ6rNoRKt5HJ0/YrLBpbj0b39FqvfhjCd3uLLlgLNgINC4mOad7EEZ/JopMJzLUEhGYhhfI+sPaS8ygtLB0RCPTmpsSPROTd5hFaUlN0pK68L4bTS3xzsl8oSnhTs2dFPI6c9ijd6EBRnDG6F/1EUXobuJjq7kZMVuH5r2ob2DMMA8zjTGHHbXjOLPk9YSorX3/XQ3sUFysb36hnqTUSc3eWmY9O0a6Jn3V2YDi9Od61BMO02g6emiwTaDA15JTQCxbwD0uF/2IPvDLOvMFgsxdAD9H7M96BNmWehe8D9YPGM1f76b5pt5D8qrqnQmnnoAb1L6KBOZyqA/8zq9PaPL6AjURcM9WjTOhUr8QhqrfwU+q34W0+oO+BwrwQU2WkoakCU+fBdHRVD7WTHG01DBwUFaHE5XVfhVVXq31rCq2ek1bhgPyQ9LIroEoMrKrpQO1NqheVbd7rqbpasvk2BU7NHAslWWmltXWdWZP2xYdR8WQfK5PDXq/Uu0schvorbYApRQ9NLJhL1RLILHckp52xCrNR3V0TYcke3MD7a9nzyySLY7qZCY5FQq5jvpKL1WYPEPp9A5HKRfHyWi61f6ZG7Lf1dots2VnHOoAs6Yhj14mue0dXe/Ga5+eY9YG6+avNbH6jCZ6LqVK1tCiHe1qT/s60KGOdKwTEWSxUWgMtpCucXgCkUQGKVQxmjhdQnPax31aRlZOXkFRSZnJUrGlUPggchh9F4sfJSAYQbEkTpCUfMPPCCzHC6Ikp5S0mslqei5fMMyiZZfKjlup1uqNZku32mfcXn/gDUfjyXQ2Xyz91XtcRsgVShWp1mh1eoPRtEWZaYvVZnc4XW6Pysr9/YGg0DU1Whrxm1R6OiSby+tDNEtlhYhmra4R8Uxa7Y7D6ULdHq9aRDMQ1ItoRqKKEc1EUjOimc6oRpyJyOULxfn9jnREs6vbJh7R3KnbJR/R3KvbJyDRPKA7KCHRjNFURKKZoVy25tASVahGjZREnS9W3BbBVD/b166xSRZSaREkCi3Z8z9cySCFKkYTp0tISjGkZWTl5BUUlZSZLBVVg4YMGzFqjK2mbtwEGAKFScIRSBQag8XhCUQSWYoiTZWRpdHl5BUYTEUWW0mZw1VRVVPX0NTS1tHV0zfgGRoZm5iamVtY8q28h5MhyCkoqZDUNLR09AyMTLZQzGgWVjZ2Dk4ubh5eDB+/gKCQMBYnIiomLiEpJS0jKyevoKikrKKqpq6hqaWtw8HJBeXm4eXjFxAUEhYRFROXkIRJScvAZRFy8gqKSspIEIVWwWBxeAKRRKZQVUViU4lUJscVSpVao/WtI0QhIgI55JJHPgUUpggxCZKkSGeSbKp57nskv/zH2Ta53dEqdU+j8lXWasFNx81Yg6Z1K2jb/6uldvUEJDwXztkuFlEmXgqs5mJOw2zT20VurXZbLqFXvPeEqao0+J/EfECtZO7XdbxB4AK/s9L1g2ldvnloHtX8VLFc037+52J12q06bdO8dvu23TmRCF/v+KyWetoQHiD/1XTcbe+g07zQto8Lwk8Xhu3af0227vZyAjaARJUJBIgwoYwLqbTjlgnaACJMKONCxlnrQm9h0ap56g/LpVTwFyjfg3voOq/l/9k89SfVrp5ge3APbeM8eDuACBPKuJBRHw+OL6S32hn3Ix03LjNkE/BRe9c+d3vntk5hJwv+OG51lwntBpel7uleT39UeW5VQAKYECXCiUkSmpQl48lFip5JaSfuatm+pJUWltzamjVp0uzOsO0Ai+i1dquFSmWi3IPD8rWdZpVKpTJk+dRskiRd4RFrbff8ywggaE11hiymKjRpd3ra+WyhDd/CEYfcy9dmm1UqEyBBggSdXWxDljJlTpUqVSqdOnVqp8ylkspKC5XKMZcqq08NU+ppVEr13xxtxdvzct9oPH9h26OU2qpsmTx6OwhcbdCLrbRwNKyjyabsG63OuIhcUxtKbyOcuve2InXpU39C3YedUL4H91DwqjvHZo0TbA8mmum9DSt9/qWfNerMWQ62WlgaNmoONBq1otHsmHHQEQ5Z05D0xin32o17s9fxln4MVEkAE6JE+A3//Husp36HtRlrap1MezGT5uxUn3p8f0vGk4uduGmKlbaolrDSWFeZysLqU7OJLtL7KdkAysKfmptzIWOma/wy4klzpzlypBiqMC6k0uV0a8QYG+4IqbTjlonYACJM3Kuzeq4WNXRLXEilHTfma7tgKmutUZuArz81KtO7lXEoYUIZF1Jpt0xcRLxETDtxn5pBcyFjpo3DzGNzp3ny7M7h0KVMDJ7ve9c2gAhTxoVU2nHLhG8AESaUcSGVdtwyETvgqbN2LlzDl4FPmhtn7AQmNGytHWyl4StNVXogo9bURO+UeptMIc7magAiTCjjQirtuGWiNoAIE8q4kEo7bpnoDSDChDIupNKOWybOBhBhQhkXUmnHLRN3Axi0agZVw4m7JMq4kGrL0XRd1zXm7KwEPXXVmwsZM13jl8FPmjvNnDlzFyjjQqpv+r9fAS0A) format('woff2');unicode-range:U+0600-06FF,U+0750-077F,U+0870-08FF,U+200C-200F,U+FB50-FDFF,U+FE70-FEFF}
+  :root{--bg:#f6f7fb;--card:#fff;--ink:#22283e;--muted:#8a90a3;--line:#ebedf4;--purple:#7062e7;--purple-dark:#5d50d4;--lavender:#eeebfc;--green:#24957f;--red:#c95768;--sidebar:#181d33;--radius:16px}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Vazirmatn,Tahoma,Arial,sans-serif;font-size:13px;line-height:1.8}html[lang=en] body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}button,input,select,textarea{font:inherit}button,a,input,select,textarea,summary{outline-offset:4px}button{cursor:pointer}button:disabled{opacity:.48;cursor:not-allowed}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #b3aaf5}a{color:inherit;text-decoration:none}[hidden]{display:none!important}h1,h2,h3,p{margin:0}h1{font-size:26px;line-height:1.6;letter-spacing:-.6px}h2{font-size:17px;line-height:1.7}h3{font-size:14px}.muted{color:var(--muted)}.small-text{font-size:11px}.mono,code{font-family:ui-monospace,SFMono-Regular,Consolas,Vazirmatn,monospace;direction:ltr;unicode-bidi:plaintext;font-size:12px}.tiny-label{font-family:system-ui,sans-serif;font-size:10px;font-weight:700;letter-spacing:1.7px;color:#9ba0b5;direction:ltr;text-align:start}.eyebrow{font-family:system-ui,sans-serif;font-size:10px;letter-spacing:2px;color:#a49beb}.wordmark{display:flex;align-items:center;gap:10px;font-family:system-ui,sans-serif;font-size:27px;font-weight:750;letter-spacing:-1px;color:#fff;direction:ltr}.brand-mark{display:grid;place-items:center;width:34px;height:36px;border-radius:10px;background:var(--purple);font-size:24px;font-weight:900;transform:skewY(-5deg);box-shadow:0 5px 15px #14152955}.accent{color:#a99df7}.version-tag{font-size:9px;letter-spacing:0;font-weight:500;margin-inline-start:auto;border:1px solid #3a3f56;border-radius:5px;padding:1px 6px;color:#a7acc4}.app-shell{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}.sidebar{background:var(--sidebar);color:#9ba2bd;height:100vh;position:sticky;top:0;padding:30px 20px 16px;display:flex;flex-direction:column;overflow:auto}.workspace{display:flex;align-items:center;gap:10px;padding:15px 10px;margin:30px 0 22px;background:#21263e;border:1px solid #2d3249;border-radius:11px}.workspace-icon{display:grid;place-items:center;width:32px;height:32px;border-radius:8px;background:#343750;color:#e0dcff;font:600 13px system-ui}.workspace strong{color:#e4e6ef;display:block;font-size:10px}.workspace div>span{display:block;font:10px system-ui;color:#8a91ae;margin-top:5px}.workspace-dot{width:6px;height:6px;background:#68b7a6;border-radius:100%;margin-inline-start:auto}.nav-label{font-size:9px;letter-spacing:1px;color:#666e8b;margin:16px 13px 8px}.nav-item{display:flex;align-items:center;gap:12px;width:100%;text-align:start;color:#9da5c0;border:0;background:none;border-radius:9px;padding:11px 13px;margin:3px 0;font-size:12px;transition:background .15s,color .15s}.nav-item svg{width:18px;height:18px;opacity:.85}.nav-item:hover{background:#252a42;color:#fff}.nav-item.active{background:var(--purple);color:#fff;box-shadow:0 5px 18px #06082025}.nav-item.active svg{opacity:1}.nav-item .nav-pill{margin-inline-start:auto;padding:0 6px;border-radius:4px;font:9px/18px system-ui;background:#ffffff20}.sidebar-bottom{margin-top:auto;padding-top:22px}.private-note{display:flex;gap:10px;margin:14px 8px 22px;color:#787f9b}.private-note>span{font-size:23px;color:#b1a4ef}.private-note strong{display:block;font-size:10px;color:#b0b6cd}.private-note small{font-size:9px;display:block}.account{width:100%;border:0;border-top:1px solid #30354c;background:none;display:flex;align-items:center;gap:10px;color:#d8dded;padding:19px 0 0;text-align:start}.avatar{display:grid;place-items:center;width:36px;height:36px;border-radius:11px;background:#e8e3fb;color:#8073cc;font:650 14px system-ui;flex-shrink:0}.avatar.small{width:31px;height:31px;border-radius:50%;font-size:12px}.account strong{display:block;font-size:11px}.account small{display:block;color:#777f9b;font-size:9px}.logout-arrow{margin-inline-start:auto;color:#7e88a6}.main-shell{min-width:0}.topbar{height:75px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;background:#ffffffb3;padding:0 34px;gap:16px}.breadcrumbs{display:flex;align-items:center;gap:13px;font-size:10px;color:#9298ad}.breadcrumbs strong{color:#505970;font-weight:500}.slash{color:#c5c9d7}.top-actions{display:flex;align-items:center;gap:18px}.secure-status{font-size:10px;color:#8b93a7;display:flex;align-items:center;gap:7px}.secure-status>span:first-child{height:5px;width:5px;background:#51aa94;border-radius:50%}.language-button{border:1px solid var(--line);background:#fff;color:#737c95;padding:5px 10px;border-radius:7px;font:11px system-ui}.content{max-width:1510px;margin:0 auto;padding:28px 34px 18px}.page-heading{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:26px}.page-heading .tiny-label{margin-bottom:7px}.page-heading h1{margin-bottom:5px}.page-heading p{font-size:11px}.actions,.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid #e1e4ef;border-radius:9px;background:#fff;color:#626b85;padding:8px 14px;font-size:11px;min-height:38px;white-space:nowrap;transition:background .15s}.button svg{height:15px;width:15px}.button:hover{background:#f7f6fd}.button.primary{background:var(--purple);border-color:var(--purple);color:white;box-shadow:0 4px 8px #7263db15}.button.primary:hover{background:var(--purple-dark)}.button.danger{color:var(--red);border-color:#f1d8dc;background:#fff7f8}.button.subtle{background:#f6f5ff;border-color:#e9e5fb;color:#8b7ccc}.button.small{min-height:29px;padding:4px 9px;font-size:10px;border-radius:7px}.button.wide{width:100%}.icon-button{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:8px;width:32px;height:32px;background:#fff;color:#9097ae;font-size:20px;flex-shrink:0}.icon-button svg{width:15px;height:15px}.icon-button:hover{border-color:#c7bfec;color:var(--purple)}.mobile-menu,.nav-backdrop{display:none}.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 3px 10px #252d4e02}.card-head{display:flex;align-items:center;justify-content:space-between;padding:20px 22px 16px;gap:10px}.card-head h2{font-size:13px}.card-head p{font-size:10px;color:var(--muted);margin-top:3px}.card-body{padding:0 22px 20px}.card-head .text-link{font-size:10px}.text-link{color:var(--purple);border:0;background:none;padding:0;font-size:11px;cursor:pointer}.hero{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:156px;padding:26px 30px;margin-bottom:22px;background:#21283e;border:1px solid #2b3349;border-radius:16px;color:#fff;overflow:hidden;position:relative}.hero h2{font-size:19px;margin:5px 0 8px;position:relative;z-index:1}.hero p{font-size:11px;color:#a9b0cb;max-width:470px;position:relative;z-index:1}.hero .hero-actions{display:flex;gap:9px;margin-top:18px;position:relative;z-index:1}.hero .button{min-height:32px;font-size:10px}.hero .button:not(.primary){background:#ffffff08;border-color:#464d66;color:#c9cde0}.hero .tiny-label{color:#9f95db}.hero-art{width:195px;height:132px;flex-shrink:0;opacity:.85;direction:ltr}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:22px}.metric{padding:19px 20px}.metric-top{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:11px;color:#878ea4}.metric-icon{width:35px;height:35px;border-radius:11px;background:#f0edfd;color:#9a89de;display:grid;place-items:center}.metric-icon svg{width:18px;height:18px}.metric:nth-child(2) .metric-icon{background:#eaf6f2;color:#76baa6}.metric:nth-child(3) .metric-icon{background:#fff3e5;color:#d7ac76}.metric:nth-child(4) .metric-icon{background:#edf1fd;color:#8ba1d0}.metric-value{display:block;font-size:27px;font-weight:700;letter-spacing:-.7px;line-height:1.7;margin:6px 0 1px}.metric-value small{font-size:10px;font-weight:400;letter-spacing:0;margin-inline-start:5px;color:#9299ad}.metric-foot{font-size:9px;color:#9ca3b5}.metric-foot .good{color:#54a28f}.overview-grid{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(230px,1fr);gap:20px;margin-bottom:20px}.chart-wrap{position:relative;padding:4px 20px 0}.chart-wrap svg{width:100%;height:174px;display:block}.chart-summary{display:flex;gap:30px;padding:0 22px 10px;align-items:baseline}.chart-summary strong{font-size:20px}.chart-summary span{font-size:10px;color:var(--muted)}.chart-days{display:flex;justify-content:space-between;color:#a5aabe;font-size:8px;padding:0 12px 12px;direction:ltr}.timeline{padding:0 22px 9px}.timeline-item{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #f3f4f8}.timeline-item:last-child{border:0}.timeline-dot{height:7px;width:7px;background:#a79be0;border:3px solid #f0edfa;box-sizing:content-box;border-radius:50%;margin-top:4px;flex-shrink:0}.timeline-item strong{font-size:10px;font-weight:500;display:block}.timeline-item small{font-size:9px;color:#a5abbd;display:block;margin-top:3px}.timeline-item code{font-size:8px;color:#a5abbd}.table-wrap{overflow-x:auto;width:100%}table{width:100%;border-collapse:collapse;text-align:start;font-size:11px;white-space:nowrap}thead{background:#fbfbfe;color:#929aae;font-size:9px}th{font-weight:500;text-align:start;padding:11px 18px;border-top:1px solid #eff0f6;border-bottom:1px solid #eff0f6}td{padding:15px 18px;border-bottom:1px solid #f0f1f7;vertical-align:middle}tr:last-child td{border-bottom:0}tbody tr:hover{background:#fcfcff}td .subline{display:block;font-size:9px;color:#9aa1b7;max-width:260px;overflow:hidden;text-overflow:ellipsis;margin-top:3px}.cell-name{display:flex;gap:10px;align-items:center}.flag{font-size:21px;line-height:1;display:inline-block;min-width:24px}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:6px;font-size:9px;line-height:1.6;padding:3px 8px;background:#f0f1f7;color:#969db0;white-space:nowrap}.badge.good{background:#eaf6f1;color:#4c9e86}.badge.warn{background:#fff5e7;color:#c59a58}.badge.bad{background:#fceef0;color:#cd8793}.badge.info{background:#f1edfc;color:#9c89d1}.status-dot{width:4px;height:4px;border-radius:50%;background:currentColor}.capacity{min-width:90px}.capacity progress{height:4px;width:85px;vertical-align:middle;margin-inline-end:7px}.capacity small{color:#9ba3b7;font:9px Vazirmatn,system-ui}.page-footer{display:flex;justify-content:space-between;gap:10px;font-size:9px;color:#aeb4c4;border-top:1px solid #e9ebf3;margin-top:28px;padding-top:14px}.page-footer span:first-child{font-family:system-ui}.toolbar{padding:16px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.filters{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.filters input{min-width:170px}.filters select{max-width:210px}.filters input,.filters select{margin:0;height:36px;font-size:10px;padding:7px 10px}.search{position:relative;display:flex;align-items:center;gap:5px}.search input{padding-inline-start:12px}.search button{margin:0;height:35px}input,select,textarea{border:1px solid #e0e4ef;border-radius:8px;background:#fff;color:#515a74;padding:10px 12px;width:100%;min-width:0;margin:5px 0 10px;font-size:12px}textarea{resize:vertical;min-height:100px;line-height:1.65}input::placeholder,textarea::placeholder{color:#b7bdce;font-size:11px}input[type=checkbox]{width:15px;height:15px;margin:0;accent-color:var(--purple);flex-shrink:0}select{cursor:pointer}input[readonly]{background:#f9f9fc;color:#9c91c9}.filters select,.filters input{width:auto}.tabs{display:flex;gap:7px;border-bottom:1px solid var(--line);padding:0 3px 13px;margin-bottom:20px;flex-wrap:wrap}.tab{border:1px solid transparent;border-radius:7px;background:none;padding:7px 14px;color:#949bb0;font-size:11px}.tab.active{background:var(--lavender);color:var(--purple)}.empty{padding:54px 22px;text-align:center;color:#a1a7bb}.empty-icon{display:grid;place-items:center;width:52px;height:52px;border-radius:16px;background:#f3f1fd;color:#b1a5df;margin:0 auto 15px}.empty-icon svg{width:24px;height:24px}.empty h3{color:#6d758e;margin:0 0 6px;font-size:13px}.empty p{font-size:10px;max-width:450px;margin:auto;white-space:normal}.empty .button{margin-top:20px}.loading{padding:80px 10px;text-align:center;color:#979eb4;font-size:11px}.spinner{display:inline-block;vertical-align:middle;width:17px;height:17px;border:2px solid #e8e4f7;border-top-color:var(--purple);border-radius:50%;animation:spin .8s linear infinite;margin-inline-end:9px}@keyframes spin{to{transform:rotate(360deg)}}.notice{border-radius:10px;padding:13px 16px;margin-bottom:18px;background:#f0eefb;border:1px solid #e6e1f6;color:#9587ba;font-size:10px;line-height:1.9;display:flex;align-items:center;justify-content:space-between;gap:15px}.notice strong{display:block;color:#7f71a7;font-size:11px;margin-bottom:3px}.notice.warning{background:#fff8ec;border-color:#f1e8d3;color:#b59a6c}.notice.warning strong{color:#ac8e52}.notice.neutral{background:#f8f9fd;border-color:#eceef6;color:#969fb8}.notice .button{flex-shrink:0}.proxy-summary{display:flex;align-items:center;gap:25px;margin:0 0 20px;padding:17px 24px;background:#fff;border:1px solid var(--line);border-radius:13px;flex-wrap:wrap}.proxy-stat{display:flex;align-items:center;gap:10px;padding-inline-end:25px;border-inline-end:1px solid var(--line)}.proxy-stat:last-child{border:0;padding:0}.proxy-stat strong{font-size:22px;font-weight:700}.proxy-stat span{font-size:10px;color:#9aa2b8}.proxy-table td{padding-top:16px;padding-bottom:16px}.proxy-table .ip{font-size:12px;color:#69738e;font-weight:500}.proxy-table th:first-child,.proxy-table td:first-child{padding-inline-end:0;width:40px}.table-info{font-size:9px;color:#a8adc0}.table-footer{padding:13px 20px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:10px;color:#a1a8bd}.pager{display:flex;gap:7px}.pager .button{min-width:30px}.test-controls{display:flex;align-items:center;gap:10px;padding:13px 20px;background:#fafafe;border-top:1px solid var(--line);flex-wrap:wrap}.test-controls label{font-size:9px;color:#979fb5}.test-controls select{margin:0;width:auto;max-width:210px;font-size:10px;padding:6px 10px;height:34px}.test-controls .grow{margin-inline-start:auto}.test-progress{padding:13px 20px;border-top:1px solid var(--line);display:flex;gap:14px;align-items:center;color:#9b8bcf;font-size:10px}.test-progress progress{width:140px;height:5px}.selection-bar{position:sticky;bottom:14px;z-index:3;margin-top:18px;display:flex;align-items:center;justify-content:space-between;gap:14px;border:1px solid #dfd8f6;background:#f5f2ffef;backdrop-filter:blur(12px);padding:15px 20px;border-radius:12px;box-shadow:0 5px 15px #3e296509}.selection-title{font-size:11px;color:#8b78b8}.selection-sub{font-size:9px;color:#b0a3cd;margin-top:3px;max-width:500px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.selection-bar select{margin:0;width:auto;font-size:10px;max-width:250px;background:#ffffffb5;padding:7px 10px}.help-line{font-size:9px;color:#a7aec0;margin-top:12px;line-height:1.9}.profiles-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:17px}.profile-card{padding:23px;display:flex;flex-direction:column;gap:14px}.profile-card h2{font-size:14px}.profile-top{display:flex;align-items:center;justify-content:space-between}.profile-logo{width:42px;height:42px;display:grid;place-items:center;border-radius:13px;font:700 13px system-ui;color:#a999d7;background:#f1edfc}.profile-meta{display:grid;grid-template-columns:1fr 1fr;gap:9px;padding:14px 0;border-top:1px solid #f0eef8;border-bottom:1px solid #f0eef8}.profile-meta dt{font-size:9px;color:#a2a8b9}.profile-meta dd{font-size:11px;margin:2px 0 0;overflow-wrap:anywhere}.profile-card .actions{margin-top:auto}.settings-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.setting-card{padding:24px}.setting-card h2{margin:12px 0 8px}.setting-card p{font-size:10px;color:#9ba2b6;margin-bottom:20px}.setting-card .metric-icon{height:39px;width:39px}.editor-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 20px}.field{min-width:0}.field.full{grid-column:1/-1}.field label{display:block;font-size:11px;color:#727b96;margin:5px 0}.field label .field-code{font:9px system-ui;color:#b3b9c9;margin-inline-start:6px}.field .help-line{margin-top:-5px;margin-bottom:12px}.field.check{display:flex;align-items:center;gap:10px;min-height:45px}.field.check label{display:flex;align-items:center;gap:10px;cursor:pointer}.field.json textarea{font-family:ui-monospace,Consolas,monospace;direction:ltr;text-align:left;font-size:11px;min-height:110px}.editor-actions{display:flex;gap:10px;margin-top:17px}.validation-box{background:#eff8f4;border:1px solid #d3eade;border-radius:9px;padding:11px 15px;color:#70a68a;font-size:10px;margin-top:10px}.json-view{white-space:pre-wrap;overflow-wrap:anywhere;direction:ltr;text-align:left;background:#fafafe;border:1px solid var(--line);border-radius:10px;padding:16px;font:11px/1.8 ui-monospace,Consolas,monospace;max-height:310px;overflow:auto;margin:13px 0}.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:17px}.detail-grid div{background:#fafafe;border:1px solid #f0f1f8;border-radius:8px;padding:12px}.detail-grid dt{font-size:9px;color:#aaaec1}.detail-grid dd{font-size:12px;color:#737d96;margin:4px 0 0;overflow-wrap:anywhere}.receipt-image{width:100%;max-height:480px;object-fit:contain;border:1px solid var(--line);border-radius:10px;margin-top:15px}.receipt-caption{white-space:pre-wrap;overflow-wrap:anywhere;color:#9c91b8;font-size:10px;margin:12px 0}.pill-list{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}.pill-list code{background:#f6f3fd;border:1px solid #eae5f6;color:#9687bd;border-radius:6px;padding:4px 8px;font-size:10px}dialog{border:1px solid var(--line);border-radius:18px;width:min(740px,calc(100vw - 28px));padding:0;color:var(--ink);box-shadow:0 30px 90px #141c3a25;max-height:92vh}dialog::backdrop{background:#181d335c;backdrop-filter:blur(3px)}.modal-head{display:flex;justify-content:space-between;align-items:center;gap:15px;padding:23px 26px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#fff;z-index:2}.modal-head h2{font-size:18px;margin-top:5px}#modal-body{padding:23px 26px}.modal-footer{padding:16px 26px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;gap:9px;position:sticky;bottom:0;background:#fff;flex-wrap:wrap}.modal-footer:empty{display:none}.toasts{position:fixed;bottom:23px;inset-inline-end:25px;z-index:100;display:flex;flex-direction:column;gap:8px;max-width:min(460px,calc(100vw - 35px))}.toast{display:flex;align-items:center;gap:12px;border-radius:10px;border:1px solid #dfd9f4;background:#fcfaff;box-shadow:0 8px 30px #303c5620;padding:15px 20px;font-size:11px;color:#9586b8;animation:toast-in .2s ease;white-space:pre-wrap;overflow-wrap:anywhere}.toast-dismiss{border:0;background:none;color:inherit;flex-shrink:0;min-width:28px;min-height:28px;font:20px system-ui;padding:0}.toast.error{border-color:#f1d7de;background:#fff7f9;color:#bd788c}.toast.good{border-color:#d6eae0;background:#f6fcf9;color:#70a38b}@keyframes toast-in{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}progress{border:none;border-radius:9px;background:#eeeaf8;overflow:hidden;accent-color:var(--purple)}progress::-webkit-progress-bar{background:#eeebf6;border-radius:9px}progress::-webkit-progress-value{background:#a395d8;border-radius:9px}.login-screen{min-height:100vh;display:grid;grid-template-columns:1fr 1fr;direction:ltr}.login-art{background:#1b2137;color:#fff;padding:42px 60px;display:flex;flex-direction:column;overflow:hidden;position:relative}.login-story{margin:auto 0;direction:rtl;max-width:430px;padding:45px 0 30px}.login-story h1{font-size:40px;line-height:1.8;margin:17px 0 13px;letter-spacing:-.8px}.login-story p{color:#a5adc9;font-size:12px;line-height:2.1;max-width:350px}.login-foot{font:9px system-ui;letter-spacing:1.6px;color:#697493;position:relative;z-index:1}.orbit{height:220px;position:relative;width:340px;margin:12px auto -15px;direction:ltr}.orbit-ring{width:240px;height:150px;border:1px solid #51506f66;border-radius:50%;position:absolute;left:50px;top:40px;transform:rotate(-23deg)}.orbit-ring.r2{transform:rotate(35deg);width:220px;left:60px}.orbit-core{position:absolute;left:139px;top:87px;display:grid;place-items:center;width:66px;height:66px;border:1px solid #8f81c9;background:#7164a947;border-radius:20px;font:700 40px system-ui;color:#c2b8f2;box-shadow:0 0 70px #7b68d033;transform:rotate(-10deg)}.orbit-node{position:absolute;display:grid;place-items:center;width:55px;height:32px;border-radius:8px;background:#2e334d;border:1px solid #4d4c68;color:#a19dc8;font:8px system-ui;letter-spacing:1px}.orbit-node.n1{left:20px;top:115px}.orbit-node.n2{left:253px;top:55px}.orbit-node.n3{left:225px;top:170px}.login-form-wrap{padding:40px 50px;display:flex;flex-direction:column;direction:rtl}.login-form-wrap>.language-button{align-self:flex-end}.login-form-inner{max-width:355px;width:100%;margin:auto;padding:60px 0}.login-form-inner h2{font-size:24px;margin:12px 0}.login-form-inner>.muted{font-size:11px;line-height:2}.login-form-inner form{margin-top:27px}.login-form-inner label{font-size:11px;color:#8a91a7}.login-form-inner input{height:47px;background:white;margin:9px 0 17px;letter-spacing:1px}.login-form-inner .button{height:45px;font-size:12px}.login-help{display:flex;gap:12px;border-top:1px solid var(--line);padding-top:23px;margin:22px 0 25px;color:#a4acbf;font-size:10px}.shield{font-size:29px;color:#b3a5db;line-height:1.3}.privacy-note{font-size:9px;color:#b6bbca;text-align:center}#login-status{font-size:10px;color:#b78891;margin-top:10px;min-height:18px}.preview-banner{background:#fff7df;color:#b2995f;border-bottom:1px solid #f0e4be;text-align:center;padding:7px 15px;font-size:10px}html[lang=en] .login-story,html[lang=en] .login-form-wrap{direction:ltr}html[lang=en] .login-story h1{font-size:37px;line-height:1.4}
+  @media(min-width:1500px){.content{padding-top:34px}.metrics{gap:21px}.metric{padding:24px}.hero{min-height:180px}.hero h2{font-size:23px}.hero-art{width:230px}}
+  @media(max-width:1190px){.app-shell{grid-template-columns:208px minmax(0,1fr)}.sidebar{padding:25px 14px 16px}.topbar{padding:0 25px}.content{padding:25px}.metric{padding:16px}.metrics{gap:12px}.metric-value{font-size:23px}.hero{padding:24px}.hero-art{width:140px}.overview-grid{grid-template-columns:minmax(0,1.4fr) minmax(225px,1fr)}.profiles-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.proxy-summary{gap:15px;padding:15px 20px}.selection-bar{flex-wrap:wrap}.login-art{padding:38px}.login-story h1{font-size:33px}.login-form-wrap{padding:35px}.hero p{max-width:380px}}
+  @media(max-width:950px){.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.overview-grid{grid-template-columns:1fr}.hero-art{position:absolute;inset-inline-end:-20px;opacity:.25;width:200px}.hero{min-height:170px}.hero>div:first-child{position:relative;z-index:1}.settings-cards{grid-template-columns:1fr}.page-heading{align-items:flex-start}.page-heading h1{font-size:23px}.page-heading p{max-width:350px}.secure-status{display:none}.login-art{padding:32px}.login-story h1{font-size:28px}.login-story p{font-size:11px}.orbit{transform:scale(.8);transform-origin:left}.login-form-wrap{padding:28px}.login-form-inner h2{font-size:21px}}
+  @media(max-width:740px){.app-shell{display:block}.sidebar{position:fixed;visibility:hidden;inset-inline-start:0;z-index:30;width:240px;transform:translateX(110%);transition:transform .2s;box-shadow:-8px 0 30px #161e3a26}html[dir=ltr] .sidebar{transform:translateX(-110%)}.nav-open .sidebar{transform:none!important;visibility:visible}.nav-backdrop{position:fixed;inset:0;width:100%;height:100%;z-index:29;background:#151d3b55;border:0}.nav-open .nav-backdrop{display:block}.mobile-menu{display:inline-flex;width:28px;height:28px;font-size:14px}.topbar{height:61px;padding:0 18px}.breadcrumbs{gap:9px;font-size:9px}.top-actions{gap:10px}.top-actions>.avatar{display:none}.content{padding:22px 17px 15px}.page-heading{gap:10px;margin-bottom:20px}.page-heading h1{font-size:22px}.page-heading .tiny-label{font-size:8px;letter-spacing:1.2px}.page-heading p{font-size:10px;max-width:290px}.page-heading>.actions{justify-content:flex-end}.page-heading>.actions .button{font-size:0;padding:8px 10px;gap:0;width:35px;min-height:35px}.page-heading>.actions .button svg{width:16px;height:16px}.hero{padding:22px;min-height:180px;margin-bottom:16px}.hero h2{font-size:17px}.hero p{font-size:10px;max-width:290px}.hero-art{width:150px;inset-inline-end:-45px}.metrics{gap:12px;margin-bottom:17px}.metric{padding:15px}.metric-value{font-size:24px;margin-top:9px}.metric-top{font-size:10px;gap:5px}.metric-icon{width:30px;height:30px;border-radius:9px}.metric-icon svg{height:15px;width:15px}.metric-foot{font-size:8px}.overview-grid{gap:16px;margin-bottom:16px}.card-head{padding:17px 17px 14px}.card-head h2{font-size:12px}.card-body{padding:0 17px 17px}.chart-summary{padding:0 17px 10px}.chart-wrap{padding:4px 14px 0}.page-footer{font-size:8px;flex-wrap:wrap;line-height:2;gap:5px}.profiles-grid{grid-template-columns:1fr}.toolbar{padding:13px 14px;gap:10px}.filters{width:100%;gap:7px}.filters select{max-width:calc(50% - 4px);flex:1;min-width:100px}.filters .search{width:100%;order:-1}.filters .search input{width:100%;flex:1;min-width:100px}.proxy-summary{gap:10px;justify-content:space-between;padding:13px 15px}.proxy-stat{padding-inline-end:12px;gap:7px}.proxy-stat strong{font-size:18px}.proxy-stat span{font-size:8px;max-width:55px}.notice{font-size:9px;padding:12px 14px;flex-wrap:wrap;gap:10px}.notice strong{font-size:10px}.notice .button{min-height:30px;font-size:9px}.test-controls{padding:13px 14px;gap:7px}.test-controls select{max-width:190px;font-size:9px}.test-controls .grow{margin:0}.test-controls .button{min-height:32px;font-size:10px}.selection-bar{padding:13px 14px;gap:12px;position:relative;bottom:0}.selection-bar .actions{width:100%;gap:6px}.selection-bar select{flex:1;max-width:100%;min-width:140px}.selection-bar .button{font-size:10px;min-height:32px}.selection-sub{max-width:280px;font-size:8px}.table-footer{padding:12px 14px}.table-info{max-width:170px;white-space:normal}.editor-grid{grid-template-columns:1fr}.editor-grid .full{grid-column:auto}.modal-head{padding:19px 19px 16px}.modal-head h2{font-size:16px}#modal-body{padding:20px}.modal-footer{padding:14px 19px}.detail-grid{grid-template-columns:1fr 1fr;gap:9px}.detail-grid dd{font-size:10px}.login-screen{display:block}.login-art{padding:24px 25px;height:235px}.login-art>.wordmark{font-size:23px}.login-art .brand-mark{width:29px;height:31px;font-size:21px}.login-story{padding:25px 0 0;margin:0;max-width:100%;position:relative}.login-story .eyebrow{font-size:8px;letter-spacing:1.2px}.login-story h1{font-size:24px;margin:10px 0 7px;line-height:1.7}.login-story h1 br{display:none}.login-story p{font-size:10px;max-width:265px}.login-story .orbit{position:absolute;right:auto;left:-140px;top:-44px;opacity:.2;transform:scale(.7)}.login-foot{display:none}.login-form-wrap{padding:23px 27px;min-height:calc(100vh - 235px)}.login-form-inner{padding:28px 0;margin:auto}.login-form-wrap>.language-button{font-size:10px}.login-form-inner h2{font-size:22px}.login-help{margin:18px 0 22px;padding-top:20px}.privacy-note{margin:10px 0 0;font-size:8px}.toasts{inset-inline-end:16px;bottom:16px}html[lang=en] .login-story h1{font-size:24px}.preview-banner{font-size:9px}}
+  @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+`;
+
+const ADMIN_SCRIPT = String.raw`
+  (() => {
+    'use strict';
+    const S={lang:'fa',session:null,view:'overview',kind:'plans',settingsTab:'bot',filter:{q:'',country:'',state:'',cursor:'',history:[]},items:[],proxy:null,selected:new Set(),mode:'relay',probeNode:'',target:'self',batch:null,editor:null,seq:0,preview:false,importJob:null,importStopped:false,modalAction:null};
+    const $=id=>document.getElementById(id);
+    const E=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const L={
+      loginTitle:['یک نمای روشن از تمام شبکه‌تان.','A clear view of your entire network.'],loginIntro:['مدیریت نودها، اشتراک‌ها و مسیرهای اتصال، در یک پنل مستقل و امن.','Nodes, subscriptions and connection routes. One private, self-hosted control center.'],welcome:['به مرکز کنترل خوش آمدید','Welcome to your control center'],loginHint:['با کلید مدیریت Worker وارد شوید. این کلید در مرورگر ذخیره نمی‌شود.','Sign in with your Worker admin key. The key is never saved in your browser.'],adminKey:['کلید مدیریت','Admin key'],signIn:['ورود امن به پنل','Sign in securely'],keyHelp:['WEB_ADMIN_KEY؛ اگر تعریف نشده: SETUP_KEY برای hub/all و MASTER_KEY برای node. حداقل ۳۲ کاراکتر تصادفی.','Use WEB_ADMIN_KEY. If unset: SETUP_KEY for hub/all, MASTER_KEY for node. At least 32 random characters.'],setupLink:['آماده‌سازی و مهاجرت دیتابیس ↗','Database setup and migrations ↗'],privacyNote:['کوکی HttpOnly · نشست ۳۰ دقیقه‌ای · بدون سرویس تحلیلی بیرونی','HttpOnly cookie · 30-minute session · No third-party analytics'],workspace:['فضای مدیریت شما','Your workspace'],independent:['مستقل، در اختیار شما','Independent. Yours.'],noExternalAssets:['بدون فایل یا رابط بیرونی','No external UI or assets'],owner:['مدیر سیستم','Workspace owner'],signOut:['خروج از نشست امن','Sign out securely'],controlCenter:['مرکز کنترل','Control center'],secureSession:['نشست امن','Secure session'],footerNote:['داده‌ها در D1 شما · نتیجهٔ تست، تضمین اتصال نیست','Your data in your D1 · A test is not a connectivity guarantee'],previewNotice:['پیش‌نمایش محلی با داده‌های ساختگی؛ تست شبکه و تماس با سرویس‌های واقعی در این پیش‌نمایش غیرفعال است.','Local preview with synthetic data. Live network tests and real external services are disabled in this preview.'],
+      not_configured:['آماده نشده','Not configured'],master_key_required_min_32:['برای سرویس‌دهی نود، MASTER_KEY معتبر را در Worker Secrets تعریف کنید.','Set a valid MASTER_KEY in Worker Secrets before serving the node.'],autoPreview:['ورود این نسخه نمایشی خودکار است.','Sign-in is automatic in this disposable preview.'],operationsTitle:['صف و بازیابی صدور','Provisioning queue and recovery'],legacyTools:['پشتیبان و ابزار قدیمی نود','Node backup and legacy tools'],legacyHint:['ابزار قبلی حفظ شده است؛ برای پشتیبان و بازیابی نود، ورود جداگانه با MASTER_KEY لازم است.','The existing tools are preserved. Node backup/restore requires a separate MASTER_KEY sign-in.'],overview:['نمای کلی','Overview'],proxies:['کاوش ProxyIP','ProxyIP explorer'],nodes:['نودها','Nodes'],profiles:['پروفایل اپراتورها','Operator profiles'],orders:['سفارش‌ها','Orders'],subscriptions:['اشتراک‌ها','Subscriptions'],customers:['مشتری‌ها','Customers'],nodeUsers:['حساب‌های نود','Node accounts'],catalog:['کاتالوگ فروش','Sales catalog'],settings:['تنظیمات','Settings'],audit:['گزارش فعالیت','Activity log'],network:['شبکه و اتصال','NETWORK & CONNECTIVITY'],business:['فروش و مشترکین','SALES & SUBSCRIBERS'],management:['مدیریت','MANAGEMENT'],live:['زنده','LIVE'],overviewSub:['وضعیت کسب‌وکار و زیرساخت خود را در یک نگاه ببینید.','Your business and infrastructure, in one place.'],proxiesSub:['کاندیدهای کشورهای مختلف را پیدا کنید، زنده بسنجید و آگاهانه اعمال کنید.','Explore countries, run live diagnostics and apply a fallback deliberately.'],nodesSub:['نودهای فروش و تست؛ بدون تغییر دامنهٔ اشتراک مشتری.','Sales and test nodes, without changing your customer subscription domain.'],profilesSub:['تنظیمات مستقل اپراتورها، با اعتبارسنجی و بازگشت نسخه.','Isolated operator settings, with validation and revision rollback.'],ordersSub:['رسیدها را بررسی کنید؛ تأیید، صدور حساب را در صف قرار می‌دهد.','Review receipts. Approval queues automatic account provisioning.'],subscriptionsSub:['اشتراک‌های ماندگار، وضعیت و کنترل حساب روی نود.','Durable entitlements and account controls on the assigned node.'],customersSub:['کاربران تلگرام، کیف پول و وضعیت دسترسی.','Telegram customers, wallet balances and account access.'],nodeUsersSub:['هویت‌ها و سهمیه‌های واقعیِ همین نود.','Actual account identities and quotas on this node.'],catalogSub:['پلن‌ها، پرداخت‌ها و محتوای ربات؛ ویرایش بدون انتشار دوباره.','Plans, payments and bot content. Edit without redeploying.'],settingsSub:['تنظیمات اعتبارسنجی‌شده و ماندگار در دیتابیس شما.','Validated configuration, persisted in your database.'],auditSub:['رویدادهای مدیریتی، بدون نمایش کلیدهای محرمانه.','Administrative events, without exposing secret keys.'],
+      refresh:['تازه‌سازی','Refresh'],add:['افزودن','Add new'],edit:['ویرایش','Edit'],save:['ذخیره و اعمال','Save and apply'],validate:['اعتبارسنجی','Validate'],cancel:['انصراف','Cancel'],close:['بستن','Close'],confirm:['تأیید','Confirm'],search:['جست‌وجو','Search'],searchHint:['نام، شناسه یا شماره کاربر…','Name, ID or user number…'],all:['همه','All'],next:['بعدی','Next'],previous:['قبلی','Previous'],loading:['در حال دریافت اطلاعات…','Loading your data…'],emptyTitle:['هنوز داده‌ای در این بخش نیست','Nothing here yet'],emptyText:['اولین مورد را اضافه کنید یا فیلتر جست‌وجو را تغییر دهید.','Add your first item, or adjust your search filters.'],error:['خطا','Error'],saved:['تغییرات ذخیره شد.','Changes saved.'],completed:['انجام شد.','Done.'],notTested:['تست نشده','Not tested'],noLimit:['بدون سقف تنظیم‌شده','No configured cap'],never:['ثبت نشده','Not recorded'],ago:['آخرین بررسی','Last checked'],details:['جزئیات','Details'],actions:['عملیات','Actions'],name:['نام','Name'],status:['وضعیت','Status'],id:['شناسه','ID'],date:['تاریخ','Date'],country:['کشور','Country'],amount:['مبلغ','Amount'],customer:['مشتری','Customer'],plan:['پلن','Plan'],node:['نود','Node'],expiry:['انقضا','Expiry'],traffic:['مصرف','Usage'],balance:['موجودی کیف پول','Wallet balance'],enabled:['فعال','Enabled'],disabled:['غیرفعال','Disabled'],active:['فعال','Active'],paused:['متوقف','Paused'],expired:['منقضی','Expired'],limited:['سهمیه تمام','Quota reached'],deleted:['حذف‌شده','Deleted'],pending:['در انتظار بررسی','Awaiting review'],pending_payment:['در انتظار پرداخت','Awaiting payment'],processing:['در حال صدور','Provisioning'],done:['تکمیل‌شده','Completed'],rejected:['ردشده','Rejected'],cancelled:['لغوشده','Cancelled'],queued:['در صف','Queued'],creating:['در حال ساخت','Creating'],ready:['آمادهٔ بازیابی','Ready to recover'],failed:['ناموفق','Failed'],reconcile:['نیاز به بررسی','Needs reconciliation'],banned:['مسدود','Banned'],sale:['فروش','Sale'],test:['تست','Test'],renew:['تمدید','Renewal'],topup:['شارژ کیف پول','Wallet top-up'],
+      heroTitle:['همهٔ نودها، یک مرکز کنترل','Every node. One control center.'],heroText:['از سفارش تا اتصال، مدیریت را یکپارچه نگه دارید. پروفایل‌ها و مسیرهای جایگزین را بدون تغییر لینک کاربران تنظیم کنید.','From purchase to connection, keep operations in one place. Update profiles and fallback routes without replacing customer links.'],addNode:['افزودن نود','Add a node'],explore:['کاوش مسیرهای اتصال','Explore connection routes'],totalCustomers:['کل مشتری‌ها','Total customers'],weeklyRevenue:['فروش ۷ روز اخیر','7-day sales revenue'],pendingOrders:['رسیدهای در انتظار','Pending receipts'],registeredNodes:['نودهای ثبت‌شده','Registered nodes'],newCustomers:['کاربر جدید در ۷ روز','new customers in 7 days'],awaitReview:['آمادهٔ بررسی مدیر','Ready for review'],infrastructure:['فروش و تست، جداگانه','Sales and tests, isolated'],nodeAccounts:['حساب‌های این نود','Accounts on this node'],proxyCount:['کاندیدهای ProxyIP','ProxyIP candidates'],availableCountries:['کشورهای اعلام‌شده','Claimed countries'],verifiedProxies:['آخرین تست TLS موفق','Latest TLS tests passed'],revenueChart:['روند فروش','Sales activity'],sevenDays:['۷ روز اخیر','Last 7 days'],recentActivity:['آخرین فعالیت‌ها','Recent activity'],viewAll:['مشاهدهٔ همه','View all'],noSales:['هنوز فروش تکمیل‌شده‌ای ثبت نشده.','No completed sales recorded yet.'],capacity:['ظرفیت ثبت‌شده','Registered capacity'],health:['دسترسی API','API reachability'],healthCheck:['بررسی اتصال','Check API'],apiReachable:['API پاسخگو','API reachable'],apiNotChecked:['بررسی نشده','Not checked'],role:['نقش','Role'],local:['محلی','Local'],remote:['راه دور','Remote'],purpose:['کاربری','Purpose'],sales:['فروش','Sales'],startSetup:['تنظیم دامنهٔ اصلی','Set main domain'],setupWarning:['دامنهٔ اصلی تنظیم نشده؛ پیش از فروش، بخش تنظیمات ربات را کامل کنید.','Main domain is not configured. Complete Bot settings before taking orders.'],
+      sourceOff:['منبع عمومی هنوز خاموش است','Public source is off'],sourceOffText:['دریافت فهرست فقط با انتخاب شما انجام می‌شود. داده‌ها را از منبع تنظیم‌شده بگیرید یا فایل خودتان را وارد کنید.','The list is fetched only at your request. Opt in to the configured source, or import your own file.'],sourceOn:['فهرست عمومی، نه تضمین کیفیت','A public list, not a guarantee'],sourceOnText:['کشور ستون اول، ادعای منبع است. فقط TLS/trace موفق، خروجیِ مشاهده‌شدهٔ همان تست را نشان می‌دهد.','The first country column is a source claim. Only a successful TLS/trace test provides observed exit evidence for that probe.'],fetchList:['دریافت فهرست','Fetch catalog'],importList:['ورود JSON / CSV','Import JSON / CSV'],sourceSettings:['تنظیمات منبع','Source settings'],allCountries:['همهٔ کشورها','All countries'],allStates:['همهٔ نتایج','All results'],proxySearch:['IP، دامنه یا ارائه‌دهنده…','IP, domain or provider…'],endpoint:['آدرس و پورت','Endpoint'],claimedCountry:['کشورِ منبع','Source country'],observedExit:['خروجیِ مشاهده‌شده','Observed exit'],testResult:['نتیجهٔ آخرین تست','Latest test result'],latency:['زمان پاسخ','Latency'],noExit:['هنوز تأیید نشده','Not verified'],testNow:['تست زنده','Test live'],tcp_ok:['TCP پاسخگو','TCP reachable'],relay_ok:['TLS / trace تأیید شد','TLS / trace verified'],relay_failed:['TCP باز؛ مسیر تأیید نشد','TCP open; route unverified'],tcp_failed:['اتصال ناموفق','TCP failed'],reported_ok:['سرویس بیرونی: موفق','Checker reports success'],reported_failed:['سرویس بیرونی: ناموفق','Checker reports failure'],untested:['تست نشده','Untested'],testing:['در حال تست…','Testing…'],stale:['قدیمی','Stale'],testPage:['تست این صفحه','Test this page'],stop:['توقف','Stop'],probeMode:['روش','Method'],probeOrigin:['از','From'],thisWorker:['همین Worker','This Worker'],relayMode:['TLS + trace واقعی','TLS + actual trace'],tcpMode:['فقط اتصال TCP','TCP connection only'],externalMode:['گزارش سرویس بیرونی','External checker report'],remainingTests:['تست باقی‌ماندهٔ امروز','tests left today'],candidateCount:['کاندید موجود','candidates'],countryCount:['کشور در فهرست','countries in catalog'],verifiedCount:['نتیجهٔ TLS موفق','successful TLS results'],selected:['انتخاب‌شده','selected'],selectHelp:['حداکثر ۴ مسیر جایگزین انتخاب کنید.','Select up to 4 fallback routes.'],applySelected:['اعمال انتخاب‌ها','Apply selection'],rollback:['بازگشت نسخه','Roll back'],clearSelection:['پاک‌کردن انتخاب','Clear selection'],selfTarget:['همین نود · fallback عمومی','This node · global fallback'],newAccounts:['حساب‌های جدید','new accounts'],proxyCaution:['فقط IPهای مجاز را تست کنید. TCP به‌تنهایی سلامت پروکسی نیست. نتیجه از Worker سنجیده می‌شود، نه از اینترنت ایران. توقف، شروع تست‌های بعدی را لغو می‌کند؛ درخواست جاری ممکن است کامل شود.','Test only addresses you are allowed to use. TCP alone does not prove a working relay. Measurements are from the Worker, not Iranian networks. Stop prevents new tests; an in-flight request may still finish.'],fallbackNotice:['ProxyIP جایگزین است؛ اتصال مستقیم همچنان اولویت دارد و همهٔ ترافیک را به کشور انتخاب‌شده نمی‌برد. تغییر عمومی، override اختصاصی کاربران را عوض نمی‌کند.','ProxyIP is a fallback. Direct connections still take priority; it does not force all traffic through the selected country. Global changes do not replace per-user overrides.'],futureNotice:['این انتخاب فقط به حساب‌هایی که هاب از این پس روی نود می‌سازد اعمال می‌شود. حساب‌های موجود و تنظیمات master نود تغییر نمی‌کنند.','This selection is added only to accounts the hub creates on this node from now on. Existing accounts and node master settings are unchanged.'],applyWarning:['اعمال امن به تست TLS/trace موفقِ همین مقصد در ۳۰ دقیقهٔ اخیر نیاز دارد.','Safe apply requires a successful TLS/trace probe from the target within the last 30 minutes.'],allowUnverified:['با مسئولیت خودم، IPهای مجاز را بدون تأیید تازهٔ این مقصد اعمال می‌کنم.','I accept the risk of applying authorized addresses without fresh verification from this target.'],clearFallback:['خالی کردن فهرست جایگزین','Clear fallback list'],rollbackText:['تنها فهرست قبلی این مقصد بازگردانده می‌شود؛ تغییر خودکار حساب‌های موجود انجام نمی‌شود.','Restore the preceding list for this target. Existing per-account overrides are not automatically changed.'],sourceConsent:['دریافت با رضایت شما','Fetch with your consent'],sourceConsentText:['این گزینه دریافت دستی از URL زیر را فعال می‌کند. ارائه‌دهنده درخواست شبکه و در حالت سنجش، IP انتخابی را دریافت می‌کند؛ برنامه هیچ UUID، کلید یا لینک اشتراکی نمی‌فرستد. فرادادهٔ شبکه تابع رفتار Cloudflare است. فهرست‌شدن IP، مجوز استفاده یا تضمین سلامت نیست.','This enables manual fetches from the URL below. The provider receives the network request and, for a checker, the candidate IP. The app sends no UUID, key or subscription URL. Platform metadata follows Cloudflare behavior. Listing does not prove permission or reliability.'],enableFetch:['فعال‌سازی و دریافت','Enable and fetch'],importHint:['JSON با آرایهٔ data یا آرایهٔ مستقیم؛ یا هر خط CSV ساده: country,endpoint,label. فیلد label اختیاری است. حداکثر ۱ MiB و ۲۰۰۰ رکورد؛ هر درخواست ۲۰ رکورد.','A JSON array (or data array), or simple CSV lines: country,endpoint,label. Label is optional. Maximum 1 MiB / 2,000 records; 20 rows per request.'],chooseFile:['انتخاب فایل','Choose file'],pasteList:['محتوای JSON یا CSV را وارد کنید','Paste JSON or CSV data'],startImport:['شروع ورود','Start import'],importProgress:['در حال ذخیرهٔ مرحله‌ای فهرست…','Saving the catalog in bounded pages…'],imported:['ذخیره‌شده','saved'],skipped:['ردشده','rejected'],importComplete:['ورود فهرست تمام شد. هیچ IP خودکار اعمال نشده است.','Import finished. No IP was automatically applied.'],importPartial:['فقط بخشی از منبع وارد شد؛ شمار رکوردهای ردشده یا محدودیت را بررسی کنید.','The import was partial. Check rejected rows and the catalog limit.'],resume:['ادامه','Resume'],unknownCountry:['نامشخص','Unknown'],measuredFrom:['محل اجرای تست','Probe location'],removeEntry:['حذف از فهرست','Remove from catalog'],removeEntryHelp:['فقط رکورد کشف حذف می‌شود؛ تنظیمات زندهٔ نود دست‌نخورده می‌ماند.','Only discovery metadata is removed. Active node settings are left unchanged.'],
+      bot:['ربات و کسب‌وکار','Bot and business'],panel:['تنظیمات همین نود','This node settings'],testSettings:['تست رایگان','Test accounts'],proxy:['منبع و بودجهٔ ProxyIP','ProxyIP source and budget'],keys:['کلیدهای API نود','Node API keys'],plans:['پلن‌ها','Plans'],payments:['روش‌های پرداخت','Payment methods'],guides:['راهنماها','Guides'],channels:['کانال‌های اجباری','Required channels'],coupons:['کدهای تخفیف','Coupons'],texts:['متن‌های ربات','Bot texts'],botHint:['دامنهٔ اصلی، پشتیبانی، پرداخت و شرایط استفاده.','Main domain, support, payment rules and Terms.'],panelHint:['پروتکل، مسیر API، IP تمیز، ProxyIP و توقف کلی نود.','Protocol, API route, clean IPs, ProxyIPs and node kill switch.'],testHint:['نود مستقل، سهمیه، مدت و فاصلهٔ صدور تست.','Designated node, quotas, validity and test cooldown.'],proxyHint:['منبع عمومی و سرویس سنجش به‌صورت پیش‌فرض خاموش‌اند.','Public catalog and external checker are disabled by default.'],keysHint:['فقط نام مرجع Secret ثبت می‌شود؛ خود کلید را در Cloudflare تعریف کنید.','Register the Secret name only. Set the actual value in Cloudflare.'],secretReference:['نام مرجع Secret','Secret reference'],registerKey:['ثبت مرجع کلید','Register key reference'],revoke:['لغو دسترسی','Revoke'],revokeText:['این کلید API بلافاصله از فهرست مجاز حذف می‌شود. مقدار Secret در Cloudflare حذف نمی‌شود.','Remove this key from the allowed registry. The Cloudflare Secret itself is not deleted.'],version:['نسخه','Revision'],fingerprint:['اثر انگشت TLS','TLS fingerprint'],echCount:['گونه‌های ECH','ECH variants'],mask:['Final Mask','Final Mask'],activeProfile:['فعال در اشتراک‌ها','Enabled in subscriptions'],isolatedProfile:['تغییر این پروفایل، پروفایل دیگر را عوض نمی‌کند. دو resolver از ECH، دو گونهٔ مستقل می‌سازند.','Profiles stay isolated. Two ECH resolvers produce two separate variants.'],profileRollbackText:['آخرین نسخهٔ قبلی با شمارهٔ جدید فعال می‌شود. لینک‌های فعلی تغییر نمی‌کنند.','Activate the preceding revision as a new version. Existing subscription links are preserved.'],form:['فرم','Form'],json:['JSON پیشرفته','Advanced JSON'],validSuccess:['اعتبارسنجی موفق بود. برای ثبت ماندگار، «ذخیره و اعمال» را بزنید.','Validation passed. Choose Save and apply to persist the change.'],validateFirst:['ابتدا دادهٔ فعلی را اعتبارسنجی کنید.','Validate the current values first.'],editorHelp:['همهٔ تغییرات در سمت سرور دوباره اعتبارسنجی می‌شوند. مقادیر واقعی زیرساخت خودتان را وارد کنید.','The server validates every change again. Supply your own real infrastructure values.'],immutableId:['شناسهٔ مورد موجود را تغییر ندهید؛ یک مورد جدید بسازید.','Do not change an existing ID. Create a new item instead.'],technicalSettings:['از ۰ برای حذف سقف استفاده نکنید مگر آگاهانه؛ محدودیت‌های Cloudflare همچنان برقرارند.','Use zero to remove a quota only deliberately. Cloudflare limits still apply.'],
+      approve:['تأیید رسید','Approve receipt'],reject:['رد رسید','Reject receipt'],approveText:['رسید را بررسی کرده‌اید؟ این کار اعتبار کیف پول یا صف صدور را به‌صورت ماندگار تغییر می‌دهد.','Have you reviewed the receipt? This changes wallet credit or queues provisioning durably.'],reason:['دلیل','Reason'],receipt:['مشاهدهٔ رسید','View receipt'],receiptNote:['متن همراه رسید','Receipt note'],toggle:['توقف / ادامه','Pause / resume'],resetUsage:['صفرکردن مصرف','Reset usage'],delete:['حذف','Delete'],dangerConfirm:['این عملیات روی حساب واقعی اجرا می‌شود. ادامه می‌دهید؟','This changes the real account. Continue?'],walletAdjust:['اصلاح کیف پول','Adjust wallet'],walletHint:['مبلغ مثبت برای افزایش و منفی برای کسر. درخواست تکراری همین فرم دوباره اعمال نمی‌شود.','Positive adds credit, negative deducts. Retrying this same form does not apply the adjustment twice.'],ban:['مسدود کردن','Ban user'],unban:['رفع مسدودی','Unban user'],resetCooldown:['بازنشانی فاصلهٔ تست','Reset test cooldown'],retry:['تلاش مجدد امن','Safe retry'],operationHint:['نتیجهٔ مبهم در نود را پیش از اقدام دستی بررسی کنید. بازنشانی کورکورانه ممکن است حساب تکراری بسازد.','Verify ambiguous node outcomes before manual recovery. Blind retries can create duplicate accounts.'],normalRetry:['تلاش معمول','Normal retry'],confirmedAbsent:['در نود بررسی کردم؛ حساب وجود ندارد','I checked the node; account is absent'],confirmedReset:['تأیید می‌کنم مصرف قبلاً صفر شده','I confirm usage was already reset'],accountIdentity:['شناسه و لینک، محرمانه‌اند. نام تصادفی حساب را کوتاه یا قابل حدس نکنید.','The identity and subscription link are secrets. Keep account names long and random.'],download:['دریافت فایل','Download file'],rowCount:['ردیف در این صفحه','rows on this page'],
+      version_conflict:['نسخه قدیمی شده؛ مورد را دوباره باز کنید.','Stale revision. Reopen the item before saving.'],unauthorized:['نشست معتبر نیست؛ دوباره وارد شوید.','Your session is not valid. Sign in again.'],auth_throttled:['تلاش ورود زیاد بوده؛ یک دقیقه صبر کنید.','Too many sign-in attempts. Wait one minute.'],csrf_failed:['درخواست امنیتی معتبر نیست؛ صفحه را دوباره باز کنید.','Security token failed. Reload and sign in again.'],web_admin_secret_required_min_32:['ابتدا WEB_ADMIN_KEY یا کلید جایگزین معتبر را در Worker Secrets تعریف کنید.','Set WEB_ADMIN_KEY or its valid fallback in Worker Secrets first.'],external_catalog_opt_in_required:['دریافت از منبع بیرونی را ابتدا فعال کنید.','Enable external catalog fetching first.'],external_checker_opt_in_required:['سرویس سنجش بیرونی هنوز فعال نیست.','The external checker has not been enabled.'],fresh_target_relay_test_or_explicit_override_required:['تست TLS تازه از مقصد انتخاب‌شده لازم است؛ یا ریسک اعمال تأییدنشده را صریح بپذیرید.','Run a fresh TLS probe from the selected target, or explicitly accept an unverified override.'],proxy_daily_test_budget:['بودجهٔ روزانهٔ تست تمام شده است (بازنشانی UTC).','Daily probe budget reached (resets at UTC midnight).'],rate_limited:['برای درخواست بعدی کمی صبر کنید.','Wait before the next request.'],insufficient_balance:['موجودی کافی نیست.','Insufficient balance.'],preview_network_disabled:['شبکهٔ واقعی در این پیش‌نمایش غیرفعال است؛ بعد از استقرار روی Worker تست کنید.','Real networking is disabled in this preview. Test after deploying to your Worker.'],no_proxy_rollback:['نسخهٔ قبلی برای این مقصد وجود ندارد.','There is no preceding list for this target.'],proxy_changed_since_apply:['ProxyIP پس از اعمال، دستی تغییر کرده؛ بازگشت خودکار متوقف شد.','ProxyIPs changed manually after apply. Automatic rollback was blocked.'],remote_probe_requires_nexiup_2_1:['تست از نود راه دور به NexiUP 2.1 یا جدیدتر نیاز دارد.','Remote probes require NexiUP 2.1 or later on that node.'],catalog_source_unavailable:['منبع پاسخ معتبر نداد؛ فهرست قبلی حفظ شد.','Source unavailable. Your preceding catalog is preserved.']
+    };
+    const F={id:'شناسه',name:'نام',label:'عنوان',label_en:'عنوان انگلیسی',description:'توضیحات',enabled:'فعال',base_url:'دامنهٔ واقعی نود (HTTPS)',api_route:'مسیر API',api_key_ref:'نام Secret کلید API نود',max_users:'حداکثر کاربران نود',code:'کد موقعیت',purpose:'کاربری نود',adapter:'نوع API',local:'نود محلی در همین Worker',days:'مدت (روز)',daily_gb:'سقف روزانه (GiB)',total_gb:'سقف کل (GiB)',conn_limit:'اتصال هم‌زمان',price:'قیمت',locations:'موقعیت‌های مجاز',reset_usage:'صفرکردن مصرف هنگام تمدید',max_configs:'حداکثر کانفیگ پایه',fingerprint:'اثر انگشت TLS',ech:'Resolverهای مستقل ECH',finalmask:'تنظیمات Final Mask',cipher_suites:'Cipher Suites',main_url:'دامنهٔ اصلی اشتراک (HTTPS)',support:'راه ارتباط با پشتیبانی',currency:'واحد پول',maintenance:'حالت نگهداری',announcement:'اطلاعیه',order_hours:'مهلت پرداخت (ساعت)',referral_percent:'درصد معرف',first_discount_percent:'تخفیف اولین خرید (%)',topup_bonus_percent:'پاداش شارژ (%)',min_topup:'حداقل شارژ',min_withdrawal:'حداقل برداشت',max_pending:'حداکثر سفارش باز هر کاربر',daily_report_hour:'ساعت گزارش (UTC)',terms_fa:'شرایط فارسی',terms_en:'شرایط انگلیسی',guides_fa:'راهنمای فارسی',guides_en:'راهنمای انگلیسی',bot_username:'نام کاربری ربات',traffic_gb:'سهمیهٔ تست (GiB)',cooldown_hours:'فاصلهٔ صدور (ساعت)',node_id:'شناسهٔ نود تست',allow_sales_node:'اجازهٔ صریح تست روی نود فروش',protocol:'پروتکل',clean_ips:'IPهای تمیز',proxy_ips:'ProxyIPهای جایگزین',user_nodes:'دامنه‌های نود',ports:'پورت‌های TLS',paused:'توقف عمومی نود',dns_url:'Resolver HTTPS برای DNS',usage_flush_seconds:'فاصلهٔ ثبت مصرف (ثانیه)',max_tunnel_seconds:'عمر تونل (ثانیه)',auto_update:'بروزرسانی خودکار (غیرفعال)',remote_deploy:'اجرای کد راه دور (غیرفعال)',repository:'مخزن مرجع',source_url:'URL فهرست عمومی',external_enabled:'اجازهٔ دریافت دستی از منبع بیرونی',checker_url:'URL سرویس سنجش بیرونی',checker_enabled:'اجازهٔ ارسال IP انتخابی به سرویس سنجش',timeout_ms:'مهلت کل تست (میلی‌ثانیه)',daily_test_limit:'بودجهٔ تست در هر روز UTC',details:'جزئیات پرداخت',instructions:'دستور پرداخت',title:'عنوان',title_en:'عنوان انگلیسی',text:'متن',text_en:'متن انگلیسی',chat_id:'شناسهٔ کانال',invite_url:'لینک دعوت',type:'نوع',value:'مقدار',max_uses:'کل دفعات مجاز',per_user:'دفعات هر کاربر',minimum:'حداقل مبلغ خرید',expires_at:'زمان انقضا (Unix ms)',fa:'متن فارسی',en:'متن انگلیسی',trafficLimit:'سقف کل (GiB)',dailyLimit:'سقف روزانه (GiB)',expiryDays:'مدت (روز)',expiryMs:'انقضا (Unix ms؛ صفر بدون انقضا)',notes:'یادداشت',connLimit:'اتصالات هم‌زمان',maxConfigs:'حداکثر کانفیگ پایه',proxyIp:'ProxyIP اختصاصی (جدا با کاما)',cleanIp:'IP تمیز اختصاصی',userNodes:'دامنه‌های اختصاصی',userPanelUrl:'دامنهٔ پنل کاربر',userMode:'نوع پروتکل کاربر',userPorts:'پورت‌ها (جدا با کاما)',isPaused:'توقف حساب'};
+    const t=k=>(L[k]||[k,k])[S.lang==='fa'?0:1];
+    const label=k=>S.lang==='fa'?(F[k]||t(k)):((L[k]||[])[1]||k.replace(/_/g,' ').replace(/([a-z])([A-Z])/g,'$1 $2'));
+    const num=n=>Number(n||0).toLocaleString(S.lang==='fa'?'fa-IR':'en-US',{maximumFractionDigits:2});
+    const date=n=>n?new Date(Number(n)).toLocaleString(S.lang==='fa'?'fa-IR':'en-GB',{dateStyle:'short',timeStyle:'short'}):t('never');
+    const flag=cc=>/^[A-Z]{2}$/.test(cc||'')&&cc!=='ZZ'?String.fromCodePoint(...[...cc].map(c=>127397+c.charCodeAt(0))):'◈';
+    const country=cc=>{if(!cc||cc==='ZZ')return t('unknownCountry');try{return new Intl.DisplayNames([S.lang],{type:'region'}).of(cc)||cc;}catch{return cc;}};
+    const byte=n=>Number(n)>=1073741824?num(Number(n)/1073741824)+' GiB':num(Number(n||0)/1048576)+' MiB';
+    const PATHS={grid:'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z',globe:'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0 M3 12h18 M12 3c5 5 5 13 0 18 M12 3c-5 5-5 13 0 18',server:'M4 3h16v7H4z M4 14h16v7H4z M7 6h1 M7 17h1 M12 6h5 M12 17h5',sliders:'M5 3v6 M5 13v8 M12 3v10 M12 17v4 M19 3v3 M19 10v11 M2 9h6v4H2z M9 13h6v4H9z M16 6h6v4h-6z',receipt:'M5 3h14v18l-3-2-4 2-4-2-3 2z M8 8h8 M8 12h6',link:'M9 15l6-6 M8 7l2-2a5 5 0 0 1 7 7l-2 2 M16 17l-2 2a5 5 0 0 1-7-7l2-2',users:'M16 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0 M4 21v-3a6 6 0 0 1 12 0v3 M18 4a4 4 0 0 1 0 7 M20 21v-3a6 6 0 0 0-2-4',key:'M11 8a5 5 0 1 1-10 0 5 5 0 0 1 10 0 M11 8h11 M17 8v4 M21 8v3',box:'M3 7l9-4 9 4v10l-9 4-9-4z M3 7l9 5 9-5 M12 12v9 M7 5l10 5',settings:'M12 3v3 M12 18v3 M3 12h3 M18 12h3 M5.6 5.6l2.1 2.1 M16.3 16.3l2.1 2.1 M5.6 18.4l2.1-2.1 M16.3 7.7l2.1-2.1 M17 12a5 5 0 1 1-10 0 5 5 0 0 1 10 0',clock:'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0 M12 7v5l4 2',refresh:'M20 7V3l-3 3a8 8 0 1 0 3 9 M20 7h-5',plus:'M12 5v14 M5 12h14',arrow:'M5 12h14 M13 6l6 6-6 6',play:'M7 4l14 8-14 8z',upload:'M12 16V3 M7 8l5-5 5 5 M4 15v6h16v-6',download:'M12 3v13 M7 11l5 5 5-5 M4 17v4h16v-4',pulse:'M2 12h5l3-8 4 16 3-8h5',eye:'M2 12c5-9 15-9 20 0-5 9-15 9-20 0 M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0',trash:'M3 6h18 M9 3h6 M6 6l1 15h10l1-15 M10 10v7 M14 10v7',check:'M4 12l5 5L20 6',stop:'M5 5h14v14H5z',wallet:'M3 5h17v15H3z M3 5l14-3v3 M15 10h6v6h-6z'};
+    const icon=k=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="'+(PATHS[k]||PATHS.grid)+'"/></svg>';
+    const btn=(action,text,i='',cls='',attrs='')=>'<button type="button" class="button '+cls+'" data-action="'+action+'" '+attrs+' aria-label="'+E(text)+'">'+(i?icon(i):'')+E(text)+'</button>';
+    const pill=(text,cls='')=>'<span class="badge '+cls+'"><span class="status-dot"></span>'+E(text)+'</span>';
+    const status=state=>pill(t(state),['active','done','relay_ok','tcp_ok','enabled'].includes(state)?'good':['pending','processing','creating','queued','reconcile','relay_failed'].includes(state)?'warn':['failed','rejected','banned','tcp_failed','reported_failed'].includes(state)?'bad':state==='reported_ok'?'info':'');
+    const navs=[['overview','overview','grid','network'],['proxies','proxies','globe'],['nodes','nodes','server'],['profiles','profiles','sliders'],['node-users','nodeUsers','key'],['orders','orders','receipt','business'],['subscriptions','subscriptions','link'],['customers','customers','users'],['catalog','catalog','box'],['settings','settings','settings','management'],['audit','audit','clock']];
+    function available(v){return !((S.session?.role==='node'&&['nodes','orders','subscriptions','customers','catalog'].includes(v))||(S.session?.role==='hub'&&v==='node-users'));}
+    function translate(){document.documentElement.lang=S.lang;document.documentElement.dir=S.lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-i18n]').forEach(el=>el.textContent=t(el.dataset.i18n));$('language-toggle').textContent=S.lang==='fa'?'EN':'فا';document.title='NexiUP · '+t('controlCenter');}
+    function navigation(){let out='';for(const [v,key,i,group]of navs){if(!available(v))continue;if(group)out+='<div class="nav-label">'+t(group)+'</div>';out+='<button class="nav-item '+(S.view===v?'active':'')+'" data-action="navigate" data-view="'+v+'" '+(S.view===v?'aria-current="page"':'')+'>'+icon(i)+'<span>'+t(key)+'</span>'+(v==='proxies'?'<span class="nav-pill">IP</span>':'')+'</button>';}$('navigation').innerHTML=out;$('workspace-role').textContent=(S.session?.role||'').toUpperCase()+' / WORKERS + D1';}
+    function toast(text,kind=''){const parent=$('toasts');while(parent.children.length>=3)parent.firstElementChild.remove();const node=document.createElement('div');node.className='toast '+kind;const message=document.createElement('span');message.textContent=text;const close=document.createElement('button');close.type='button';close.className='toast-dismiss';close.textContent='×';close.setAttribute('aria-label',t('close'));close.addEventListener('click',()=>node.remove());node.append(message,close);parent.appendChild(node);setTimeout(()=>node.remove(),7000);}
+    function showError(error){if(error?.name==='AbortError')return;toast(t(error.code||error.message||'error')+(error.retry?' · '+num(error.retry)+'s':''),'error');}
+    async function api(path,options={}){
+      const headers={Accept:'application/json'};if(options.body!==undefined)headers['Content-Type']='application/json';
+      if(S.session?.csrf)headers['X-NexiUP-CSRF']=S.session.csrf;if(options.nonce)headers['Idempotency-Key']=options.nonce;
+      const response=await fetch('/admin/web-api/'+path,{method:options.method||'GET',headers,credentials:'same-origin',cache:'no-store',signal:options.signal,...(options.body!==undefined?{body:JSON.stringify(options.body)}:{})});
+      const data=await response.json().catch(()=>({error:'invalid_response'}));
+      if(!response.ok){const error=new Error(data.error||'request_failed');error.code=data.error;error.retry=Number(response.headers.get('retry-after')||0);if(response.status===401&&S.session)showLogin();throw error;}return data;
+    }
+    function showLogin(){S.session=null;S.seq++;stopBatch();S.items=[];S.proxy=null;S.selected.clear();S.editor=null;S.modalAction=null;S.importStopped=true;closeModal();$('page-content').innerHTML='';$('modal-body').innerHTML='';$('app-shell').hidden=true;$('login-screen').hidden=false;$('admin-key').value='';document.body.classList.remove('nav-open');}
+    function openApp(data){S.session=data;S.preview=!!data.preview;$('app-version').textContent=data.version;$('preview-banner').hidden=!S.preview;$('app-shell').hidden=false;$('login-screen').hidden=true;translate();if(data.auto_login)$('preview-banner').textContent+=' '+t('autoPreview');go((location.hash||'#overview').slice(1));}
+    function resetFilter(){S.filter={q:'',country:'',state:'',cursor:'',history:[]};}
+    function go(view){if(!S.session)return;stopBatch();if(!navs.some(v=>v[0]===view)||!available(view))view='overview';if(S.view!==view)resetFilter();S.view=view;history.replaceState(null,'','#'+view);document.body.classList.remove('nav-open');document.querySelector('.mobile-menu').setAttribute('aria-expanded','false');load().catch(showError);}
+    function header(){navigation();const found=navs.find(n=>n[0]===S.view),key=found?.[1]||'overview';$('breadcrumb').textContent=t(key);$('page-title').textContent=t(key);$('page-subtitle').textContent=t(key+'Sub');$('section-label').textContent=S.view==='proxies'?'NETWORK / PROXYIP EXPLORER':S.view==='overview'?'WORKSPACE OVERVIEW':'WORKSPACE / '+S.view.replace('-',' ').toUpperCase();let actions=btn('refresh',t('refresh'),'refresh');if(['nodes','profiles','catalog','node-users'].includes(S.view))actions=btn('new',t('add'),'plus','primary')+actions;if(S.view==='proxies')actions=btn('sync',t('fetchList'),'download','primary')+btn('import',t('importList'),'upload')+actions;$('page-actions').innerHTML=actions;}
+    function query(extra={}){return new URLSearchParams({q:S.filter.q,cursor:S.filter.cursor,status:S.filter.state,...extra}).toString();}
+    async function load(){if(!S.session)return;const seq=++S.seq;header();$('page-content').innerHTML='<div class="loading"><span class="spinner"></span>'+t('loading')+'</div>';let content='';
+      try{
+        if(S.view==='overview'){const d=await api('overview');if(seq!==S.seq)return;content=overview(d);}
+        else if(S.view==='proxies'){const d=await api('proxy/list?'+query({country:S.filter.country,state:S.filter.state}));if(seq!==S.seq)return;S.proxy=d;S.items=d.items;S.next=d.next;content=proxyView(d);}
+        else if(S.view==='settings'){if(seq!==S.seq)return;content=settingsView();}
+        else if(S.view==='audit'){const d=await api('audit?'+new URLSearchParams(S.filter.cursor?{before:S.filter.cursor}:{}));if(seq!==S.seq)return;S.items=d.items;S.next=d.next;content=auditsView(d.items);}
+        else if(S.view==='profiles'){const d=await api('catalog?kind=profiles');if(seq!==S.seq)return;S.items=d.items;content=profilesView(d.items);}
+        else{const path=['catalog','nodes'].includes(S.view)?'catalog?'+query({kind:S.view==='nodes'?'nodes':S.kind}):S.view+'?'+query();const d=await api(path);if(seq!==S.seq)return;S.items=d.items;S.next=d.next;content=listView(d.items);}
+        if(seq!==S.seq||!S.session)return;$('page-content').innerHTML=content;
+      }catch(error){if(seq===S.seq&&S.session)$('page-content').innerHTML='<section class="card">'+empty(t(error.code||error.message),'refresh')+'</section>';throw error;}
+    }
+    function empty(text=t('emptyText'),action=''){return '<div class="empty"><div class="empty-icon">'+icon(S.view==='proxies'?'globe':'box')+'</div><h3>'+t('emptyTitle')+'</h3><p>'+E(text)+'</p>'+(action?btn(action,action==='refresh'?t('refresh'):t('add'),'plus','subtle'):'')+'</div>';}
+    function table(heads,rows,cls=''){return '<div class="table-wrap"><table class="'+cls+'"><thead><tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows+'</tbody></table></div>';}
+    function pager(){return '<div class="table-footer"><span class="table-info">'+num(S.items.length)+' '+t('rowCount')+'</span><div class="pager">'+btn('prev',t('previous'),'','small',S.filter.history.length?'':'disabled')+btn('next',t('next'),'','small',S.next?'':'disabled')+'</div></div>';}
+    function filters(states=[]){return '<div class="filters"><form id="search-form" class="search"><input name="q" id="search-q" value="'+E(S.filter.q)+'" placeholder="'+t('searchHint')+'" aria-label="'+t('search')+'"><button class="icon-button" type="submit" aria-label="'+t('search')+'">'+icon('arrow')+'</button></form>'+(states.length?'<select id="state-filter" aria-label="'+t('status')+'"><option value="">'+t('allStates')+'</option>'+states.map(s=>'<option value="'+s+'" '+(S.filter.state===s?'selected':'')+'>'+t(s)+'</option>').join('')+'</select>':'')+'</div>';}
+    function metric(title,value,footer,i,unit=''){return '<div class="card metric"><div class="metric-top"><span>'+E(title)+'</span><span class="metric-icon">'+icon(i)+'</span></div><strong class="metric-value">'+num(value)+(unit?'<small>'+E(unit)+'</small>':'')+'</strong><div class="metric-foot">'+E(footer)+'</div></div>';}
+    function overview(d){S.currency=d.currency||'';let metrics='';
+      if(d.summary){metrics=metric(t('totalCustomers'),d.summary.users.total,num(d.summary.users.new_in_period)+' '+t('newCustomers'),'users')+metric(t('weeklyRevenue'),d.summary.sales.revenue,t('sevenDays'),'wallet',d.currency)+metric(t('pendingOrders'),d.pending,t('awaitReview'),'receipt')+metric(t('registeredNodes'),d.summary.nodes.length,t('infrastructure'),'server');}
+      else metrics=metric(t('nodeAccounts'),d.local_users,'NexiUP node','users')+metric(t('proxyCount'),d.proxies.total,t('selectHelp'),'globe')+metric(t('availableCountries'),d.proxies.countries,t('claimedCountry'),'server')+metric(t('verifiedProxies'),d.proxies.verified,t('ago'),'pulse');
+      const art='<svg class="hero-art" viewBox="0 0 210 145" fill="none" aria-hidden="true"><ellipse cx="104" cy="70" rx="76" ry="41" transform="rotate(-24 104 70)" stroke="#5c567b"/><ellipse cx="104" cy="70" rx="76" ry="41" transform="rotate(35 104 70)" stroke="#4d526c"/><path d="M40 90l65-21 64-37 M105 69l55 57" stroke="#766995" stroke-dasharray="3 5"/><rect x="81" y="45" width="49" height="49" rx="13" fill="#45405f" stroke="#8470b6"/><path d="M94 80V57l24 23V57" stroke="#bcabe8" stroke-width="4"/><rect x="17" y="82" width="42" height="25" rx="7" fill="#2e354c" stroke="#54506c"/><rect x="148" y="17" width="42" height="25" rx="7" fill="#2e354c" stroke="#54506c"/><rect x="143" y="115" width="35" height="23" rx="7" fill="#2e354c" stroke="#54506c"/><circle cx="38" cy="94" r="4" fill="#94b3ad"/><circle cx="169" cy="29" r="4" fill="#afa2d8"/><circle cx="160" cy="127" r="4" fill="#afa2d8"/></svg>';
+      let out='<section class="hero"><div><span class="tiny-label">BUILT FOR YOUR NETWORK</span><h2>'+t('heroTitle')+'</h2><p>'+t('heroText')+'</p><div class="hero-actions">'+btn('navigate',t('explore'),'globe','primary','data-view="proxies"')+(d.role!=='node'?btn('new-node',t('addNode'),'plus'):'')+'</div></div>'+art+'</section><div class="metrics">'+metrics+'</div>';
+      if(d.role!=='hub'&&!d.node_ready)out+='<div class="notice warning">'+t('master_key_required_min_32')+'</div>';
+      if(d.summary&&!d.main_url)out+='<div class="notice warning"><div><strong>'+t('setupWarning')+'</strong></div>'+btn('edit-setting',t('startSetup'),'settings','','data-kind="bot"')+'</div>';
+      const activity='<section class="card"><div class="card-head"><div><h2>'+t('recentActivity')+'</h2><p>'+t('auditSub')+'</p></div>'+btn('navigate',t('viewAll'),'','small','data-view="audit"')+'</div><div class="timeline">'+(d.recent.length?d.recent.map(a=>'<div class="timeline-item"><span class="timeline-dot"></span><div><strong>'+E(a.action.replace(/_/g,' '))+'</strong><small>'+E(date(a.created_at))+' · <code>'+E(a.actor)+'</code></small></div></div>').join(''):empty())+'</div></section>';
+      out+='<div class="overview-grid">'+(d.summary?salesChart(d):'<section class="card"><div class="card-head"><h2>'+t('nodeUsers')+'</h2>'+status(d.node_paused?'paused':d.node_ready?'active':'not_configured')+'</div><div class="card-body"><p class="muted">'+t('nodeUsersSub')+'</p><div class="editor-actions">'+btn('navigate',t('nodeUsers'),'users','primary','data-view="node-users"')+btn('edit-setting',t('panel'),'settings','','data-kind="panel"')+'</div><p class="help-line">'+t('fallbackNotice')+'</p></div></section>')+activity+'</div>';
+      if(d.summary)out+='<section class="card"><div class="card-head"><div><h2>'+t('nodes')+'</h2><p>'+t('nodesSub')+'</p></div>'+btn('navigate',t('viewAll'),'','small','data-view="nodes"')+'</div>'+(d.summary.nodes.length?table([t('name'),t('capacity'),t('actions')],d.summary.nodes.map(n=>'<tr><td><div class="cell-name"><span class="metric-icon">'+icon('server')+'</span><strong>'+E(n.label)+'</strong></div></td><td><div class="capacity"><progress value="'+Number(n.active)+'" max="'+Number(n.max_users)+'"></progress><small>'+num(n.active)+' / '+num(n.max_users)+'</small></div></td><td>'+btn('health',t('healthCheck'),'pulse','small','data-id="'+E(n.id)+'"')+'</td></tr>').join('')):empty(t('emptyText'),'new-node'))+'</section>';
+      return out;
+    }
+    function salesChart(d){const days=[];for(let i=6;i>=0;i--){const dt=new Date(d.server_time-i*86400000),key=dt.toISOString().slice(0,10),found=d.days.find(v=>v.day===key);days.push({date:dt,value:found?.revenue||0});}const max=Math.max(1,...days.map(v=>v.value)),points=days.map((v,i)=>(24+i*76)+','+(143-v.value/max*110)).join(' '),revenue=days.reduce((n,v)=>n+v.value,0);
+      return '<section class="card"><div class="card-head"><div><h2>'+t('revenueChart')+'</h2><p>'+t('weeklyRevenue')+'</p></div>'+pill(t('sevenDays'),'info')+'</div><div class="chart-summary"><strong>'+num(revenue)+' <span>'+E(d.currency)+'</span></strong><span>'+num(d.summary.sales.done)+' '+t('orders')+'</span></div><div class="chart-wrap"><svg viewBox="0 0 510 170" preserveAspectRatio="none" role="img" aria-label="'+t('revenueChart')+'"><defs><linearGradient id="sales-fill" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#a293d7" stop-opacity=".23"/><stop offset="1" stop-color="#a293d7" stop-opacity=".01"/></linearGradient></defs><path d="M24 35H485 M24 72H485 M24 109H485 M24 146H485" stroke="#f0eef7" stroke-dasharray="4 5"/><polygon points="24,146 '+points+' 480,146" fill="url(#sales-fill)"/><polyline points="'+points+'" fill="none" stroke="#a595d6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>'+days.map((v,i)=>'<circle cx="'+(24+i*76)+'" cy="'+(143-v.value/max*110)+'" r="3" fill="#fff" stroke="#a595d6" stroke-width="2"/>').join('')+'</svg><div class="chart-days">'+days.map(v=>'<span>'+E(v.date.toLocaleDateString(S.lang==='fa'?'fa-IR':'en-GB',{day:'numeric',month:'short'}))+'</span>').join('')+'</div></div>'+(!revenue?'<p class="card-body muted small-text">'+t('noSales')+'</p>':'')+'</section>';
+    }
+    function profilesView(items){return '<div class="notice neutral">'+t('isolatedProfile')+'</div><div class="profiles-grid">'+items.map(p=>'<section class="card profile-card"><div class="profile-top"><div class="profile-logo">'+E(p.id.slice(0,2).toUpperCase())+'</div>'+status(p.enabled?'enabled':'disabled')+'</div><div><h2>'+E(S.lang==='fa'?p.label:p.label_en||p.label)+'</h2><span class="mono muted small-text">'+E(p.id)+'</span></div><dl class="profile-meta"><div><dt>'+t('fingerprint')+'</dt><dd class="mono">'+E(p.fingerprint)+'</dd></div><div><dt>'+t('version')+'</dt><dd>'+num(p.version)+'</dd></div><div><dt>'+t('echCount')+'</dt><dd>'+num(p.ech.length)+'</dd></div><div><dt>'+t('mask')+'</dt><dd>'+t(p.finalmask?'enabled':'disabled')+'</dd></div></dl><div class="actions">'+btn('edit',t('edit'),'sliders','primary small','data-id="'+E(p.id)+'"')+btn('profile-rollback',t('rollback'),'refresh','small','data-id="'+E(p.id)+'"'+(p.version>1?'':' disabled'))+'</div></section>').join('')+'</div>';}
+    function settingsView(){const kinds=S.session.role==='node'?['panel','proxy','keys']:S.session.role==='hub'?['bot','test','proxy']:['bot','test','panel','proxy','keys'];return '<div class="settings-cards">'+kinds.map(k=>'<section class="card setting-card"><span class="metric-icon">'+icon(k==='keys'?'key':k==='proxy'?'globe':'settings')+'</span><h2>'+t(k==='test'?'testSettings':k)+'</h2><p>'+t(k+'Hint')+'</p>'+btn(k==='keys'?'keys':'edit-setting',t(k==='keys'?'keys':'edit'),'arrow','subtle','data-kind="'+k+'"')+(k==='panel'?'<div class="editor-actions">'+btn('legacy-tools',t('legacyTools'),'download','small')+'</div>':'')+'</section>').join('')+'</div>';}
+    function auditsView(items){return '<section class="card">'+(items.length?table([t('date'),t('owner'),t('actions'),t('id')],items.map(a=>'<tr><td class="small-text">'+E(date(a.created_at))+'</td><td class="mono">'+E(a.actor)+'</td><td class="mono">'+E(a.action)+'</td><td class="mono">'+E(a.target)+'</td></tr>').join('')):empty())+pager()+'</section>';}
+    function listView(items){let tabs='',heads=[],rows='',states=[];if(S.view==='catalog')tabs='<div class="tabs">'+['plans','payments','coupons','guides','channels','texts'].map(k=>'<button class="tab '+(k===S.kind?'active':'')+'" data-action="catalog-tab" data-kind="'+k+'">'+t(k)+'</button>').join('')+'</div>';
+      if(S.view==='nodes'){heads=[t('name'),t('country'),t('purpose'),t('capacity'),t('health'),t('actions')];rows=items.map(n=>'<tr><td><div class="cell-name"><span class="metric-icon">'+icon('server')+'</span><div><strong>'+E(n.label)+'</strong><span class="subline mono">'+E(n.id)+' · '+E(n.adapter)+'</span></div></div></td><td><span class="flag">'+flag(n.code.toUpperCase())+'</span> '+E(country(n.code.toUpperCase()))+'</td><td>'+pill(t(n.purpose),n.purpose==='test'?'info':'')+'<span class="subline">'+t(n.local?'local':'remote')+' · '+t(n.enabled?'enabled':'disabled')+'</span></td><td><div class="capacity"><progress value="'+Number(n.active)+'" max="'+Number(n.max_users)+'"></progress><small>'+num(n.active)+' / '+num(n.max_users)+'</small></div></td><td>'+pill(t(n.last_health_ok?'apiReachable':'apiNotChecked'),n.last_health_ok?'good':'')+'<span class="subline">'+E(n.last_health_ok?date(n.last_health_ok):'')+'</span></td><td><div class="actions">'+btn('edit',t('edit'),'sliders','small','data-id="'+E(n.id)+'"')+btn('health',t('healthCheck'),'pulse','small','data-id="'+E(n.id)+'"')+'</div></td></tr>').join('');}
+      else if(S.view==='orders'){states=['pending','pending_payment','processing','done','rejected','cancelled'];heads=[t('id'),t('customer'),t('plan'),t('amount'),t('status'),t('actions')];rows=items.map(o=>'<tr><td><span class="mono">'+E(o.id)+'</span><span class="subline">'+E(date(o.created_at))+'</span></td><td>'+E(o.customer||o.user_id)+'<span class="subline mono">'+E(o.user_id)+'</span></td><td>'+E(o.plan_id||t(o.kind))+'</td><td>'+num(o.total)+'</td><td>'+status(o.status)+'</td><td>'+btn('detail',t('details'),'eye','small','data-id="'+E(o.id)+'"')+'</td></tr>').join('');}
+      else if(S.view==='subscriptions'){states=['active','paused','expired','deleted'];heads=[t('name'),t('customer'),t('node'),t('expiry'),t('status'),t('actions')];rows=items.map(o=>'<tr><td class="mono">'+E(o.name)+'</td><td>'+num(o.user_id)+'</td><td class="mono">'+E(o.node_id||'—')+'</td><td>'+E(date(o.expires_at))+'</td><td>'+status(o.status)+'</td><td>'+btn('detail',t('details'),'eye','small','data-id="'+E(o.id)+'"')+'</td></tr>').join('');}
+      else if(S.view==='customers'){heads=[t('customer'),t('id'),t('balance'),t('status'),t('actions')];rows=items.map(u=>'<tr><td><div class="cell-name"><span class="avatar small">'+E((u.name||'U').slice(0,1))+'</span><div>'+E(u.name||'—')+'<span class="subline mono">'+(u.username?'@'+E(u.username):'—')+'</span></div></div></td><td class="mono">'+E(u.id)+'</td><td>'+num(u.balance)+'</td><td>'+status(u.banned?'banned':'active')+'</td><td>'+btn('detail',t('details'),'eye','small','data-id="'+E(u.id)+'"')+'</td></tr>').join('');}
+      else if(S.view==='node-users'){heads=[t('name'),t('traffic'),t('expiry'),t('status'),t('actions')];rows=items.map(u=>'<tr><td class="mono">'+E(u.name)+'</td><td>'+byte(u.usage.total)+'<span class="subline">'+(u.usage.limit?byte(u.usage.limit):t('noLimit'))+'</span></td><td>'+E(date(u.expiryMs))+'</td><td>'+status(u.status)+'</td><td>'+btn('node-edit',t('edit'),'sliders','small','data-id="'+E(u.id)+'"')+'</td></tr>').join('');}
+      else if(S.view==='catalog'){heads=[t('name'),t('id'),t('details'),t('status'),t('actions')];rows=items.map(o=>'<tr><td>'+E(o.name||o.title||o.id)+'</td><td class="mono">'+E(o.id)+'</td><td>'+(S.kind==='plans'?num(o.total_gb)+' GiB · '+num(o.days)+' '+(S.lang==='fa'?'روز':'days')+'<span class="subline">'+num(o.price)+'</span>':E(String(o.type||o.chat_id||o.description||'').slice(0,60)))+'</td><td>'+status(o.enabled?'enabled':'disabled')+'</td><td>'+btn('edit',t('edit'),'sliders','small','data-id="'+E(o.id)+'"')+'</td></tr>').join('');}
+      return tabs+'<section class="card"><div class="toolbar">'+filters(states)+(S.view==='orders'?btn('operations',t('operationsTitle'),'clock','small'):'')+'</div>'+(items.length?table(heads,rows):empty(t('emptyText'),['nodes','catalog','node-users'].includes(S.view)?'new':''))+pager()+'</section>';
+    }
+    function proxyTargets(d){let options=S.session.role!=='hub'?[{id:'self',label:t('selfTarget')}]:[];options=options.concat(d.nodes.filter(n=>!n.local).map(n=>({id:'node:'+n.id,label:n.label+' · '+t('newAccounts')})));if(!options.some(o=>o.id===S.target))S.target=options[0]?.id||'';return options;}
+    function proxyView(d){const countryCount=d.countries.filter(c=>c.country!=='ZZ').length,verified=d.countries.reduce((n,c)=>n+Number(c.verified||0),0),targets=proxyTargets(d);if(!d.nodes.some(n=>n.id===S.probeNode&&n.enabled))S.probeNode='';
+      return '<div class="notice '+(d.settings.external_enabled?'neutral':'')+'"><div><strong>'+t(d.settings.external_enabled?'sourceOn':'sourceOff')+'</strong>'+t(d.settings.external_enabled?'sourceOnText':'sourceOffText')+'</div>'+btn('edit-setting',t('sourceSettings'),'settings','small','data-kind="proxy"')+'</div><div class="proxy-summary"><div class="proxy-stat"><strong>'+num(d.countries.reduce((n,c)=>n+c.count,0))+'</strong><span>'+t('candidateCount')+'</span></div><div class="proxy-stat"><strong>'+num(countryCount)+'</strong><span>'+t('countryCount')+'</span></div><div class="proxy-stat"><strong>'+num(verified)+'</strong><span>'+t('verifiedCount')+'</span></div><div class="proxy-stat"><strong id="probe-budget">'+num(d.remaining)+'</strong><span>'+t('remainingTests')+'</span></div></div><section class="card"><div class="toolbar"><div class="filters"><form id="search-form" class="search"><input name="q" id="search-q" value="'+E(S.filter.q)+'" placeholder="'+t('proxySearch')+'" aria-label="'+t('search')+'"><button class="icon-button" type="submit" aria-label="'+t('search')+'">'+icon('arrow')+'</button></form><select id="proxy-country" aria-label="'+t('claimedCountry')+'"><option value="">'+t('allCountries')+'</option>'+d.countries.map(c=>'<option value="'+E(c.country)+'" '+(c.country===S.filter.country?'selected':'')+'>'+flag(c.country)+' '+E(country(c.country))+' ('+num(c.count)+')</option>').join('')+'</select><select id="state-filter" aria-label="'+t('status')+'"><option value="">'+t('allStates')+'</option>'+['relay_ok','tcp_ok','untested','relay_failed','tcp_failed','reported_ok','reported_failed'].map(s=>'<option value="'+s+'" '+(s===S.filter.state?'selected':'')+'>'+t(s)+'</option>').join('')+'</select></div><span class="table-info">'+num(d.total)+' '+t('candidateCount')+'</span></div><div class="test-controls"><label for="probe-mode">'+t('probeMode')+'</label><select id="probe-mode">'+[['relay','relayMode'],['tcp','tcpMode'],['external','externalMode']].map(([v,key])=>'<option value="'+v+'" '+(S.mode===v?'selected':'')+(v==='external'&&!d.settings.checker_enabled?' disabled':'')+'>'+t(key)+'</option>').join('')+'</select><label for="probe-node">'+t('probeOrigin')+'</label><select id="probe-node" '+(S.mode==='external'?'disabled':'')+'><option value="">'+t('thisWorker')+'</option>'+d.nodes.filter(n=>n.enabled&&!n.local&&n.adapter==='nexiup').map(n=>'<option value="'+E(n.id)+'" '+(S.probeNode===n.id?'selected':'')+'>'+E(n.label)+'</option>').join('')+'</select><span class="grow"></span>'+btn('test-page',t('testPage'),'play','primary',!d.items.length||d.remaining<=0?'disabled':'')+btn('stop-tests',t('stop'),'stop','danger',S.batch?'':'hidden')+'</div><div id="test-progress" class="test-progress" '+(S.batch?'':'hidden')+'><span class="spinner"></span><span id="test-progress-text"></span><progress id="test-progress-bar" value="0" max="20"></progress></div><div id="proxy-table">'+proxyTable()+'</div>'+pager()+'</section><div class="selection-bar"><div><div id="selection-title" class="selection-title"></div><div id="selection-sub" class="selection-sub mono"></div></div><div class="actions"><select id="proxy-target" aria-label="'+t('node')+'">'+targets.map(o=>'<option value="'+E(o.id)+'" '+(o.id===S.target?'selected':'')+'>'+E(o.label)+'</option>').join('')+'</select>'+btn('apply-proxy',t('applySelected'),'check','primary',!targets.length?'disabled':'')+btn('rollback-proxy',t('rollback'),'refresh','',!targets.length?'disabled':'')+btn('clear-selection',t('clearSelection'),'','small')+'</div></div><p class="help-line">'+t('proxyCaution')+'</p><p class="help-line">'+t('fallbackNotice')+'</p>';
+    }
+    function proxyTable(){return S.items.length?table(['<span aria-label="'+t('selected')+'">◇</span>',t('endpoint'),t('claimedCountry'),t('testResult'),t('latency'),t('observedExit'),t('actions')],S.items.map(p=>{const probe=p.probe||{},old=p.checked_at&&p.checked_at<Date.now()-1800000,ms=probe.total_ms,exit=probe.relay_ok&&probe.exit_country;return '<tr data-proxy-row="'+E(p.id)+'"><td><input type="checkbox" data-select-proxy="'+E(p.id)+'" '+(S.selected.has(p.id)?'checked':'')+' aria-label="'+E(t('selected')+' '+p.id)+'"></td><td><span class="ip mono">'+E(p.id)+'</span><span class="subline">'+E(p.label||p.city||'—')+'</span></td><td><div class="cell-name"><span class="flag">'+flag(p.country)+'</span><div>'+E(country(p.country))+'<span class="subline mono">'+E(p.country)+'</span></div></div></td><td>'+status(p.busy?'testing':p.state)+(old?'<span class="subline">'+t('stale')+' · '+E(date(p.checked_at))+'</span>':'<span class="subline">'+E(p.checked_at?date(p.checked_at):t('notTested'))+'</span>')+(probe.error?'<span class="subline mono">'+E(probe.error)+'</span>':'')+'</td><td><span class="mono">'+(p.checked_at?num(ms)+' ms':'—')+'</span><span class="subline mono">'+(probe.tcp_ok?'TCP '+num(probe.tcp_ms)+' ms':probe.reported_ms!==null&&probe.reported_ms!==undefined?'report '+num(probe.reported_ms)+' ms':'—')+'</span><span class="subline">'+(probe.from_colo?t('measuredFrom')+' '+E(probe.from_colo):'')+'</span></td><td>'+(exit?'<span>'+flag(probe.exit_country)+' '+E(country(probe.exit_country))+'</span><span class="subline mono">'+E(probe.exit_ip)+'</span>':'<span class="muted small-text">'+t('noExit')+'</span>')+'</td><td><div class="actions">'+btn('probe',t('testNow'),'pulse','small','data-id="'+E(p.id)+'"'+(p.busy||S.batch?' disabled':''))+'<button class="icon-button" data-action="remove-proxy" data-id="'+E(p.id)+'" aria-label="'+t('removeEntry')+'">'+icon('trash')+'</button></div></td></tr>';}).join(''),'proxy-table'):empty(t('sourceOffText'),'sync');}
+    function updateSelection(){if(!$('selection-title'))return;$('selection-title').textContent=S.selected.size?num(S.selected.size)+' '+t('selected'):t('selectHelp');$('selection-sub').textContent=[...S.selected].join(' · ');}
+    function updateProxyTable(){if(S.view==='proxies'&&$('proxy-table')){$('proxy-table').innerHTML=proxyTable();updateSelection();}}
+    function showModal(title,body,footer=''){$('modal-title').textContent=title;$('modal-body').innerHTML=body;$('modal-footer').innerHTML=footer;if(!$('modal').open)$('modal').showModal();}
+    function closeModal(){if($('modal').open)$('modal').close();S.modalAction=null;}
+    function confirmAction(title,text,fn){S.modalAction=fn;showModal(title,'<p class="muted">'+E(text)+'</p>',btn('close-modal',t('cancel'))+btn('confirm-action',t('confirm'),'check','primary'));}
+    async function newEditor(kind,id=''){const data=await api('editor?'+new URLSearchParams({kind,id}));openEditor(kind,data.doc,data.version,id);}
+    function field(key,value,locked){const json=Array.isArray(value)||(value!==null&&typeof value==='object')||key==='finalmask',type=typeof value,fieldLabel=E(label(key))+' <span class="field-code" dir="ltr">'+E(key)+'</span>';
+      if(type==='boolean')return '<div class="field check"><label><input data-field="'+E(key)+'" data-type="boolean" type="checkbox" '+(value?'checked':'')+(['auto_update','remote_deploy'].includes(key)?' disabled':'')+'>'+fieldLabel+'</label></div>';
+      const choices={protocol:['vless','trojan','both'],purpose:['sales','test'],adapter:['nexiup','nahan'],fingerprint:['chrome','unsafe','firefox','safari','ios','android','edge','random','randomized'],type:['percent','fixed'],userMode:['','alpha','beta','both']};
+      if(choices[key])return '<div class="field"><label>'+fieldLabel+'</label><select data-field="'+E(key)+'" data-type="string" dir="ltr">'+choices[key].map(v=>'<option value="'+v+'" '+(v===value?'selected':'')+'>'+E(v||'default')+'</option>').join('')+'</select></div>';
+      const long=json||/^(terms_|guides_|cipher_suites|details|instructions|description|announcement|notes|text|fa$|en$)/.test(key),val=json?JSON.stringify(value,null,2):String(value??'');
+      return '<div class="field '+(long?'full ':'')+(json?'json':'')+'"><label for="field-'+E(key)+'">'+fieldLabel+'</label>'+(long?'<textarea id="field-'+E(key)+'" data-field="'+E(key)+'" data-type="'+(json?'json':type)+'" spellcheck="false" '+(json||/cipher/.test(key)?'dir="ltr"':'')+'>'+E(val)+'</textarea>':'<input id="field-'+E(key)+'" data-field="'+E(key)+'" data-type="'+type+'" type="'+(type==='number'?'number':'text')+'" '+(type==='number'?'step="any"':'')+' value="'+E(val)+'" '+(locked||key==='repository'?'readonly':'')+' '+(/url|route|key|proxy|Ip|Port|id|name/.test(key)?'dir="ltr"':'')+' autocomplete="off">')+'</div>';
+    }
+    function openEditor(kind,doc,version,id=''){S.editor={kind,doc,version,id,nonce:crypto.randomUUID(),mode:'form',valid:null};S.modalAction=null;renderEditor();}
+    function renderEditor(){const e=S.editor;const body='<p class="help-line">'+t(e.kind==='node-user'?'accountIdentity':'editorHelp')+'</p>'+(e.kind==='proxy'?'<div class="notice warning">'+t('sourceConsentText')+'</div>':'')+'<div class="tabs"><button class="tab '+(e.mode==='form'?'active':'')+'" data-action="editor-mode" data-mode="form">'+t('form')+'</button><button class="tab '+(e.mode==='json'?'active':'')+'" data-action="editor-mode" data-mode="json">'+t('json')+'</button></div>'+(e.mode==='form'?'<form id="editor-form"><div class="editor-grid">'+Object.entries(e.doc).map(([k,v])=>field(k,v,k==='id'&&!!e.id)).join('')+'</div></form>':'<textarea id="raw-editor" class="json-view" spellcheck="false" rows="18">'+E(JSON.stringify(e.doc,null,2))+'</textarea>')+'<div id="validation-box" class="validation-box" hidden>'+t('validSuccess')+'</div>';
+      const title=(e.id||e.version>0?t('edit'):t('add'))+' · '+t(e.kind==='node-user'?'nodeUsers':e.kind==='test'?'testSettings':e.kind);let foot=btn('close-modal',t('cancel'))+btn('validate-editor',t('validate'),'check')+btn('save-editor',t('save'),'arrow','primary','id="save-editor" disabled');
+      if(e.kind==='node-user'&&e.id)foot=btn('node-action',t('delete'),'trash','danger small','data-id="'+E(e.id)+'" data-op="delete"')+btn('node-action',t('resetUsage'),'refresh','small','data-id="'+E(e.id)+'" data-op="reset"')+foot;
+      showModal(title,body,foot);
+    }
+    function editorDoc(){const e=S.editor;if(e.mode==='json'){const v=JSON.parse($('raw-editor').value);if(e.id&&e.doc.id&&v.id!==e.id)throw new Error('immutableId');return v;}const d={};document.querySelectorAll('#editor-form [data-field]').forEach(el=>{const key=el.dataset.field,type=el.dataset.type;d[key]=type==='boolean'?el.checked:type==='number'?Number(el.value):type==='json'?JSON.parse(el.value):el.value;});return d;}
+    async function validateEditor(){const e=S.editor,doc=editorDoc();if(e.kind==='node-user')await api('node-users/validate',{method:'POST',body:doc});else await api('validate',{method:'POST',body:{kind:e.kind,doc}});e.valid=JSON.stringify(doc);$('validation-box').hidden=false;$('save-editor').disabled=false;}
+    async function saveEditor(){const e=S.editor,doc=editorDoc();if(e.valid!==JSON.stringify(doc))throw new Error('validateFirst');if(e.kind==='node-user')await api('node-users'+(e.id?'?id='+encodeURIComponent(e.id):''),{method:e.id?'PUT':'POST',body:doc,nonce:e.nonce});else await api('save',{method:'POST',body:{kind:e.kind,doc,version:e.version}});closeModal();toast(t('saved'),'good');await load();updateSelection();}
+    async function nodeEditor(id=''){if(id){const d=await api('node-users?id='+encodeURIComponent(id));openEditor('node-user',d.doc,0,id);}else openEditor('node-user',{name:'web_'+crypto.randomUUID().replace(/-/g,''),trafficLimit:1,dailyLimit:1,expiryDays:30,connLimit:2,maxConfigs:4,notes:'',proxyIp:'',cleanIp:'',userNodes:'',userPanelUrl:'',userMode:'',userPorts:'',isPaused:false},0);}
+    function summaryFields(obj,fields){return '<dl class="detail-grid">'+fields.map(([k,key])=>'<div><dt>'+t(key||k)+'</dt><dd>'+E(obj[k]??'—')+'</dd></div>').join('')+'</dl>';}
+    async function detail(id){const view=S.view,d=await api(view+'?id='+encodeURIComponent(id)),o=d.item;S.detail={view,item:o,nonce:crypto.randomUUID()};let body='',foot=btn('close-modal',t('close'));
+      if(view==='orders'){body=summaryFields({...o,created_at:date(o.created_at),total:num(o.total),status:t(o.status)},[['id','id'],['user_id','customer'],['plan_id','plan'],['total','amount'],['status','status'],['created_at','date']]);if(o.receipt?.available)body+='<div class="actions">'+btn('receipt',t('receipt'),'eye','','data-id="'+E(o.id)+'" data-type="'+E(o.receipt.type)+'"')+'</div><p class="receipt-caption">'+E(o.receipt.note||'')+'</p><div id="receipt-body"></div>';if(o.status==='pending')foot+=btn('reject-order',t('reject'),'','danger','data-id="'+E(o.id)+'"')+btn('approve-order',t('approve'),'check','primary','data-id="'+E(o.id)+'"');}
+      else if(view==='subscriptions'){body=summaryFields({...o,expires_at:date(o.expires_at),status:t(o.status)},[['name','name'],['user_id','customer'],['node_id','node'],['expires_at','expiry'],['status','status']]);foot+=['toggle','reset','delete'].map(a=>btn('sub-action',t(a==='reset'?'resetUsage':a),a==='delete'?'trash':'refresh',a==='delete'?'danger small':'small','data-id="'+E(o.id)+'" data-op="'+a+'"')).join('');}
+      else if(view==='customers'){body=summaryFields({...o,balance:num(o.balance)},[['name','name'],['id','id'],['username','name'],['balance','balance']]);foot+=btn('wallet',t('walletAdjust'),'wallet','subtle','data-id="'+o.id+'"')+btn('ban-user',t(o.banned?'unban':'ban'),'','small','data-id="'+o.id+'" data-banned="'+(o.banned?'false':'true')+'"')+btn('test-reset',t('resetCooldown'),'refresh','small','data-id="'+o.id+'"');}
+      showModal(t('details'),body,foot);
+    }
+    function simpleForm(title,body,fn,submit=t('confirm')){S.modalAction=fn;showModal(title,body,btn('close-modal',t('cancel'))+btn('form-action',submit,'check','primary'));}
+    async function keysView(){const d=await api('keys');showModal(t('keys'),'<p class="muted small-text">'+t('keysHint')+'</p>'+(d.items.length?table([t('name'),t('secretReference'),t('actions')],d.items.map(k=>'<tr><td>'+E(k.name)+'</td><td class="mono">'+E(k.secret_ref)+'</td><td>'+btn('revoke-key',t('revoke'),'trash','danger small','data-id="'+E(k.id)+'"')+'</td></tr>').join('')):empty(t('keysHint'))),btn('new-key',t('registerKey'),'plus','primary')+btn('close-modal',t('close')));}
+    async function operations(filter=S.opsFilter||'reconcile',cursor=''){const d=await api('operations?'+new URLSearchParams({status:filter,cursor}));S.opsFilter=filter;S.opsNext=d.next;S.operations=d.items;showModal(t('operationsTitle'),'<div class="notice warning">'+t('operationHint')+'</div><select id="ops-filter" aria-label="'+t('status')+'">'+['reconcile','failed','queued','creating','ready','done'].map(v=>'<option value="'+v+'" '+(filter===v?'selected':'')+'>'+t(v)+'</option>').join('')+'</select>'+table([t('id'),t('status'),t('actions')],d.items.map(o=>'<tr><td><span class="mono">'+E(o.id)+'</span><span class="subline mono">'+E(o.error||o.phase)+'</span></td><td>'+status(o.state)+'</td><td>'+btn('retry-op',t('retry'),'refresh','small','data-id="'+E(o.id)+'"'+(o.state==='done'?' disabled':''))+'</td></tr>').join(''))+(d.items.length?'':empty()),btn('operations-first',t('refresh'),'refresh')+btn('operations-next',t('next'),'arrow','',d.next?'':'disabled')+btn('close-modal',t('close')));}
+    function stopBatch(){if(S.batch){S.batch.controller.abort();S.batch=null;}}
+    async function probeOne(id,options={}){const item=S.items.find(v=>v.id===id);if(item)item.busy=true;updateProxyTable();try{const data=await api('proxy/probe',{method:'POST',body:{id,mode:options.mode||S.mode,node_id:(options.mode||S.mode)==='external'?'':(options.node??S.probeNode)},signal:options.signal});const current=S.items.find(v=>v.id===id);if(current)Object.assign(current,data);if($('probe-budget'))$('probe-budget').textContent=num(data.remaining);return data;}finally{if(item)item.busy=false;updateProxyTable();}}
+    async function testPage(){if(S.batch||!S.items.length)return;const job={controller:new AbortController(),ids:S.items.map(i=>i.id),done:0,mode:S.mode,node:S.probeNode};S.batch=job;const stop=document.querySelector('[data-action="stop-tests"]'),start=document.querySelector('[data-action="test-page"]');if(stop)stop.hidden=false;if(start)start.disabled=true;$('test-progress').hidden=false;let index=0;
+      const progress=()=>{if(!$('test-progress-text'))return;$('test-progress-text').textContent=num(job.done)+' / '+num(job.ids.length);$('test-progress-bar').max=job.ids.length;$('test-progress-bar').value=job.done;};progress();
+      const run=async()=>{while(index<job.ids.length&&!job.controller.signal.aborted){const id=job.ids[index++];try{await probeOne(id,{mode:job.mode,node:job.node,signal:job.controller.signal});}catch(e){if(e.name==='AbortError')break;showError(e);if(['proxy_daily_test_budget','unauthorized','preview_network_disabled'].includes(e.code)){job.controller.abort();break;}}job.done++;progress();if(!job.controller.signal.aborted)await new Promise(resolve=>setTimeout(resolve,300));}};
+      await Promise.all([run(),run()]);if(S.batch===job)S.batch=null;if(stop)stop.hidden=true;if(start)start.disabled=false;if($('test-progress'))$('test-progress').hidden=true;updateProxyTable();
+    }
+    function applyDialog(clear=false){if(!S.target)throw new Error('node_not_found');const p=S.proxy.policies.find(p=>p.target===S.target),ids=clear?[]:[...S.selected];if(!ids.length&&!clear){confirmAction(t('clearFallback'),t('fallbackNotice'),()=>applyDialog(true));return;}const target=S.target,version=p?.version||0;
+      simpleForm(t('applySelected'),'<div class="notice warning">'+t(target==='self'?'fallbackNotice':'futureNotice')+'</div><div class="pill-list">'+ids.map(id=>'<code>'+E(id)+'</code>').join('')+'</div><p class="muted small-text">'+t('applyWarning')+'</p><label class="field check"><input id="allow-unverified" type="checkbox">'+t('allowUnverified')+'</label>',async()=>{const override=$('allow-unverified').checked;await api('proxy/apply',{method:'POST',body:{target,ids,version,allow_unverified:override}});closeModal();toast(t('saved'),'good');S.selected.clear();await load();updateSelection();},t('applySelected'));
+    }
+    async function syncList(){const settings=(await api('editor?kind=proxy')).doc;const start=async()=>{S.importStopped=false;showModal(t('fetchList'),'<p class="loading"><span class="spinner"></span>'+t('loading')+'</p>',btn('close-modal',t('close')));const job=await api('proxy/sync',{method:'POST',body:{}});S.importJob=job;await continueImport();};if(!settings.external_enabled){confirmAction(t('sourceConsent'),t('sourceConsentText')+'\n\n'+settings.source_url,async()=>{const e=await api('editor?kind=proxy');e.doc.external_enabled=true;await api('save',{method:'POST',body:{kind:'proxy',doc:e.doc,version:e.version}});await start();});}else await start();}
+    function importDialog(){S.importJob=null;S.importStopped=false;showModal(t('importList'),'<div class="notice neutral">'+t('importHint')+'</div><label for="import-file">'+t('chooseFile')+'</label><input id="import-file" type="file" accept=".json,.csv,.txt,application/json,text/csv,text/plain"><label for="import-data">'+t('pasteList')+'</label><textarea id="import-data" rows="10" dir="ltr" spellcheck="false" placeholder="country,endpoint,label"></textarea>',btn('close-modal',t('cancel'))+btn('start-import',t('startImport'),'upload','primary'));}
+    async function continueImport(){S.importStopped=false;while(S.importJob&&S.importJob.state==='pending'&&!S.importStopped){const j=S.importJob;showModal(t('importList'),'<p class="muted">'+t('importProgress')+'</p><div class="test-progress"><span class="spinner"></span><strong>'+num(j.cursor)+' / '+num(j.total)+'</strong><progress value="'+j.cursor+'" max="'+j.total+'"></progress></div><p class="small-text muted">'+num(j.imported)+' '+t('imported')+' · '+num(j.rejected)+' '+t('skipped')+'</p>',btn('stop-import',t('stop'),'stop'));try{S.importJob=await api('proxy/continue',{method:'POST',body:{id:j.id,cursor:j.cursor}});}catch(error){showModal(t('importList'),'<p class="muted">'+E(t(error.code||error.message))+'</p>',btn('resume-import',t('resume'),'play','primary')+btn('close-modal',t('close')));throw error;}}
+      const j=S.importJob;if(j?.state==='done'){showModal(t('importList'),'<div class="validation-box">'+t('importComplete')+'</div><p class="help-line">'+num(j.imported)+' '+t('imported')+' · '+num(j.rejected)+' '+t('skipped')+'</p>'+(j.rejected||j.original_total>j.total?'<div class="notice warning">'+t('importPartial')+' · '+num(j.total)+' / '+num(j.original_total)+'</div>':''),btn('close-modal',t('close'),'check','primary'));if(S.view==='proxies'){resetFilter();await load();updateSelection();}}
+    }
+    const handlers={
+      navigate:el=>go(el.dataset.view),refresh:async()=>{stopBatch();await load();updateSelection();},menu:()=>{const opened=document.body.classList.toggle('nav-open');document.querySelector('.mobile-menu').setAttribute('aria-expanded',String(opened));},language:async()=>{S.lang=S.lang==='fa'?'en':'fa';translate();if(S.session){await load();updateSelection();}},logout:async()=>{try{await api('logout',{method:'POST',body:{}});}finally{showLogin();}},'close-modal':()=>{if(S.importJob?.state==='pending')S.importStopped=true;closeModal();},
+      new:()=>S.view==='node-users'?nodeEditor():newEditor(S.view==='catalog'?S.kind:S.view),edit:el=>newEditor(S.view==='catalog'?S.kind:S.view,el.dataset.id),'new-node':()=>newEditor('nodes'),'edit-setting':el=>newEditor(el.dataset.kind),'catalog-tab':async el=>{S.kind=el.dataset.kind;resetFilter();await load();},'node-edit':el=>nodeEditor(el.dataset.id),
+      next:async()=>{if(!S.next)return;S.filter.history.push(S.filter.cursor);S.filter.cursor=S.next;await load();updateSelection();},prev:async()=>{if(!S.filter.history.length)return;S.filter.cursor=S.filter.history.pop();await load();updateSelection();},detail:el=>detail(el.dataset.id),'validate-editor':()=>validateEditor(),'save-editor':()=>saveEditor(),'editor-mode':el=>{S.editor.doc=editorDoc();S.editor.mode=el.dataset.mode;S.editor.valid=null;renderEditor();},
+      'profile-rollback':el=>confirmAction(t('rollback'),t('profileRollbackText'),async()=>{await api('profiles/rollback',{method:'POST',body:{id:el.dataset.id}});toast(t('saved'),'good');await load();}),health:async el=>{const d=await api('nodes/health',{method:'POST',body:{id:el.dataset.id}});toast(t('apiReachable')+' · '+num(d.total)+' / '+num(d.max_users),'good');await load();},
+      'confirm-action':async()=>{const fn=S.modalAction;closeModal();if(fn)await fn();},'form-action':async()=>{if(S.modalAction)await S.modalAction();},
+      'approve-order':el=>confirmAction(t('approve'),t('approveText'),async()=>{await api('orders/decide',{method:'POST',body:{id:el.dataset.id,action:'approve'}});toast(t('completed'),'good');await load();}),
+      'reject-order':el=>simpleForm(t('reject'),'<label for="reason">'+t('reason')+'</label><textarea id="reason" maxlength="500" required></textarea>',async()=>{const reason=$('reason').value.trim();if(!reason)throw new Error('reason_required');await api('orders/decide',{method:'POST',body:{id:el.dataset.id,action:'reject',reason}});closeModal();toast(t('completed'),'good');await load();},t('reject')),
+      receipt:el=>{const url='/admin/web-api/receipt?id='+encodeURIComponent(el.dataset.id);if(el.dataset.type==='photo')$('receipt-body').innerHTML='<img class="receipt-image" src="'+E(url)+'" alt="'+t('receipt')+'">';else $('receipt-body').innerHTML='<a class="button" href="'+E(url)+'" download="receipt.bin">'+t('download')+'</a>';},
+      'sub-action':el=>{const nonce=S.detail?.nonce||crypto.randomUUID();confirmAction(t(el.dataset.op==='reset'?'resetUsage':el.dataset.op),t('dangerConfirm'),async()=>{await api('subscriptions/action',{method:'POST',body:{id:el.dataset.id,action:el.dataset.op},nonce});toast(t('completed'),'good');await load();});},
+      'node-action':el=>{const nonce=S.editor.nonce;confirmAction(t(el.dataset.op==='delete'?'delete':'resetUsage'),t('dangerConfirm'),async()=>{await api('node-users?'+new URLSearchParams({id:el.dataset.id,action:el.dataset.op==='reset'?'reset':''}),{method:el.dataset.op==='delete'?'DELETE':'POST',nonce});toast(t('completed'),'good');await load();});},
+      wallet:el=>{const nonce=crypto.randomUUID();simpleForm(t('walletAdjust'),'<div class="notice neutral">'+t('walletHint')+'</div><label for="amount">'+t('amount')+'</label><input id="amount" type="number" step="1" value="0" dir="ltr"><label for="reason">'+t('reason')+'</label><input id="reason" maxlength="200">',async()=>{await api('customers/action',{method:'POST',nonce,body:{id:Number(el.dataset.id),action:'wallet',amount:Number($('amount').value),reason:$('reason').value}});closeModal();toast(t('saved'),'good');await load();});},
+      'ban-user':el=>confirmAction(t(el.dataset.banned==='true'?'ban':'unban'),t('dangerConfirm'),async()=>{await api('customers/action',{method:'POST',body:{id:Number(el.dataset.id),action:'ban',banned:el.dataset.banned==='true'}});toast(t('saved'),'good');await load();}),
+      'test-reset':el=>confirmAction(t('resetCooldown'),t('dangerConfirm'),async()=>{await api('customers/action',{method:'POST',body:{id:Number(el.dataset.id),action:'test_reset'}});toast(t('completed'),'good');}),operations:()=>operations(),'operations-next':()=>operations(S.opsFilter,S.opsNext),'operations-first':()=>operations(),
+      'retry-op':el=>simpleForm(t('retry'),'<div class="notice warning">'+t('operationHint')+'</div><select id="manual-retry"><option value="">'+t('normalRetry')+'</option><option value="absent">'+t('confirmedAbsent')+'</option><option value="reset">'+t('confirmedReset')+'</option></select>',async()=>{await api('operations/retry',{method:'POST',body:{id:el.dataset.id,manual:$('manual-retry').value}});closeModal();toast(t('completed'),'good');}),
+      'legacy-tools':async()=>{const d=await api('editor?kind=panel');showModal(t('legacyTools'),'<p class="muted">'+t('legacyHint')+'</p><div class="editor-actions"><a class="button primary" href="/'+encodeURIComponent(d.doc.api_route)+'/dash" target="_blank" rel="noopener noreferrer">'+t('legacyTools')+' ↗</a></div>',btn('close-modal',t('close')));},keys:()=>keysView(),'new-key':()=>simpleForm(t('registerKey'),'<div class="notice neutral">'+t('keysHint')+'</div><label for="key-name">'+t('name')+'</label><input id="key-name" maxlength="80"><label for="key-ref">'+t('secretReference')+'</label><input id="key-ref" dir="ltr" placeholder="NODE_KEY_…">',async()=>{await api('keys',{method:'POST',body:{name:$('key-name').value,secret_ref:$('key-ref').value}});toast(t('saved'),'good');await keysView();}),
+      'revoke-key':el=>confirmAction(t('revoke'),t('revokeText'),async()=>{await api('keys?id='+encodeURIComponent(el.dataset.id),{method:'DELETE'});await keysView();}),
+      probe:el=>probeOne(el.dataset.id),'test-page':()=>testPage(),'stop-tests':()=>stopBatch(),'clear-selection':()=>{S.selected.clear();updateProxyTable();},'apply-proxy':()=>applyDialog(),
+      'rollback-proxy':()=>{const p=S.proxy.policies.find(p=>p.target===S.target);if(!p?.can_rollback)throw new Error('no_proxy_rollback');const target=S.target;confirmAction(t('rollback'),t('rollbackText'),async()=>{await api('proxy/rollback',{method:'POST',body:{target,version:p.version}});toast(t('saved'),'good');await load();updateSelection();});},
+      'remove-proxy':el=>confirmAction(t('removeEntry'),t('removeEntryHelp'),async()=>{await api('proxy/remove',{method:'POST',body:{id:el.dataset.id}});S.selected.delete(el.dataset.id);await load();updateSelection();}),sync:()=>syncList(),import:()=>importDialog(),
+      'start-import':async()=>{S.importJob=await api('proxy/import',{method:'POST',body:{data:$('import-data').value}});await continueImport();},'resume-import':async()=>{S.importJob=await api('proxy/import-status?id='+encodeURIComponent(S.importJob.id));await continueImport();},'stop-import':async()=>{S.importStopped=true;if(S.importJob){await api('proxy/cancel-import',{method:'POST',body:{id:S.importJob.id}});S.importJob.state='cancelled';}closeModal();await load();updateSelection();}
+    };
+    document.addEventListener('click',async event=>{const el=event.target.closest('[data-action]');if(!el||el.disabled)return;const action=handlers[el.dataset.action];if(!action)return;const was=el.disabled;el.disabled=true;try{await action(el);updateSelection();}catch(error){showError(error);}finally{if(el.isConnected)el.disabled=was;}});
+    document.addEventListener('change',async event=>{const el=event.target;try{
+      if(el.dataset.selectProxy){if(el.checked){if(S.selected.size>=4){el.checked=false;toast(t('selectHelp'));return;}S.selected.add(el.dataset.selectProxy);}else S.selected.delete(el.dataset.selectProxy);updateSelection();}
+      else if(el.id==='proxy-country'||el.id==='state-filter'){stopBatch();if(el.id==='proxy-country')S.filter.country=el.value;else S.filter.state=el.value;S.filter.cursor='';S.filter.history=[];await load();updateSelection();}
+      else if(el.id==='ops-filter')await operations(el.value);
+      else if(el.id==='probe-mode'){S.mode=el.value;if(S.mode==='external')S.probeNode='';$('probe-node').disabled=S.mode==='external';}
+      else if(el.id==='probe-node')S.probeNode=el.value;else if(el.id==='proxy-target')S.target=el.value;
+      else if(el.id==='import-file'&&el.files[0]){if(el.files[0].size>1048576)throw new Error('body_too_large');$('import-data').value=await el.files[0].text();}
+    }catch(error){showError(error);}});
+    document.addEventListener('input',event=>{if(event.target.matches('#editor-form [data-field],#raw-editor')){if(S.editor)S.editor.valid=null;if($('save-editor'))$('save-editor').disabled=true;if($('validation-box'))$('validation-box').hidden=true;}});
+    document.addEventListener('submit',async event=>{event.preventDefault();try{
+      if(event.target.id==='login-form'){const button=$('login-button');button.disabled=true;let key=$('admin-key').value;try{for(let i=0;i<10;i++){$('login-status').textContent=t('loading');const response=await fetch('/admin/web-api/login',{method:'POST',headers:{Authorization:'Bearer '+key},credentials:'same-origin',cache:'no-store'});const data=await response.json();if(!response.ok)throw Object.assign(new Error(data.error),{code:data.error});if(data.migration_required){$('login-status').textContent='D1 · '+data.version;continue;}key='';$('admin-key').value='';$('login-status').textContent='';openApp(data);return;}throw new Error('migration_not_finished');}finally{key='';$('admin-key').value='';button.disabled=false;}}
+      if(event.target.id==='search-form'){stopBatch();S.filter.q=$('search-q').value;S.filter.cursor='';S.filter.history=[];await load();updateSelection();}
+    }catch(error){if(event.target.id==='login-form')$('login-status').textContent=t(error.code||error.message);else showError(error);}});
+    $('modal').addEventListener('cancel',()=>{S.importStopped=true;S.modalAction=null;});
+    document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!$('modal').open){document.body.classList.remove('nav-open');document.querySelector('.mobile-menu').setAttribute('aria-expanded','false');}});
+    window.addEventListener('hashchange',()=>{if(S.session)go(location.hash.slice(1));});
+    translate();api('session').then(openApp).catch(error=>{showLogin();if(error.code!=='unauthorized')$('login-status').textContent=t(error.code||error.message);});
+  })();
+`;
+
 // ---- Embedded QR encoder follows. Transpiled once from Project Nayuki TypeScript.
 // No deployment compilation, remote dependency, dynamic evaluation or Node API.
 /*!
@@ -2235,9 +3145,9 @@ export default {
  *   out of or in connection with the Software or the use or other dealings in the
  *   Software.
  */
-"use strict";
-var qrcodegen;
-(function (qrcodegen) {
+// Original namespace wrappers adapted to a plain-JavaScript factory for checkJs.
+const qrcodegen = createQrEncoder();
+function createQrEncoder() {
     /*---- QR Code symbol class ----*/
     /*
      * A QR Code symbol, which is a type of two-dimension barcode.
@@ -2256,6 +3166,8 @@ var qrcodegen;
      * (Note that all ways require supplying the desired error correction level.)
      */
     class QrCode {
+        /** @type {typeof Ecc} */
+        static Ecc;
         /*-- Static factory functions (high level) --*/
         // Returns a QR Code representing the given Unicode text string at the given error correction level.
         // As a conservative upper bound, this function is guaranteed to succeed for strings that have 738 or fewer
@@ -2263,7 +3175,7 @@ var qrcodegen;
         // QR Code version is automatically chosen for the output. The ECC level of the result may be higher than the
         // ecl argument if it can be done without increasing the version.
         static encodeText(text, ecl) {
-            const segs = qrcodegen.QrSegment.makeSegments(text);
+            const segs = QrSegment.makeSegments(text);
             return QrCode.encodeSegments(segs, ecl);
         }
         // Returns a QR Code representing the given binary data at the given error correction level.
@@ -2271,7 +3183,7 @@ var qrcodegen;
         // bytes allowed is 2953. The smallest possible QR Code version is automatically chosen for the output.
         // The ECC level of the result may be higher than the ecl argument if it can be done without increasing the version.
         static encodeBinary(data, ecl) {
-            const seg = qrcodegen.QrSegment.makeBytes(data);
+            const seg = QrSegment.makeBytes(data);
             return QrCode.encodeSegments([seg], ecl);
         }
         /*-- Static factory functions (mid level) --*/
@@ -2814,7 +3726,6 @@ var qrcodegen;
         [-1, 1, 1, 2, 2, 4, 4, 6, 6, 8, 8, 8, 10, 12, 16, 12, 17, 16, 18, 21, 20, 23, 23, 25, 27, 29, 34, 34, 35, 38, 40, 43, 45, 48, 51, 53, 56, 59, 62, 65, 68], // Quartile
         [-1, 1, 1, 2, 4, 4, 4, 5, 6, 8, 8, 11, 11, 16, 16, 18, 16, 19, 21, 25, 25, 25, 34, 30, 32, 35, 37, 40, 42, 45, 48, 51, 54, 57, 60, 63, 66, 70, 74, 77, 81], // High
     ];
-    qrcodegen.QrCode = QrCode;
     // Appends the given number of low-order bits of the given value
     // to the given buffer. Requires 0 <= len <= 31 and 0 <= val < 2^len.
     function appendBits(val, len, bb) {
@@ -2845,6 +3756,8 @@ var qrcodegen;
      * Any segment longer than this is meaningless for the purpose of generating QR Codes.
      */
     class QrSegment {
+        /** @type {typeof Mode} */
+        static Mode;
         /*-- Static factory functions (mid level) --*/
         // Returns a segment representing the given binary data encoded in
         // byte mode. All input byte arrays are acceptable. Any text string
@@ -2988,15 +3901,6 @@ var qrcodegen;
     // The set of all legal characters in alphanumeric mode,
     // where each character value maps to the index in the string.
     QrSegment.ALPHANUMERIC_CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
-    qrcodegen.QrSegment = QrSegment;
-})(qrcodegen || (qrcodegen = {}));
-/*---- Public helper enumeration ----*/
-(function (qrcodegen) {
-    var QrCode;
-    (function (QrCode) {
-        /*
-         * The error correction level in a QR Code symbol. Immutable.
-         */
         class Ecc {
             /*-- Constructor and fields --*/
             constructor(
@@ -3014,15 +3918,6 @@ var qrcodegen;
         Ecc.QUARTILE = new Ecc(2, 3); // The QR Code can tolerate about 25% erroneous codewords
         Ecc.HIGH = new Ecc(3, 2); // The QR Code can tolerate about 30% erroneous codewords
         QrCode.Ecc = Ecc;
-    })(QrCode = qrcodegen.QrCode || (qrcodegen.QrCode = {}));
-})(qrcodegen || (qrcodegen = {}));
-/*---- Public helper enumeration ----*/
-(function (qrcodegen) {
-    var QrSegment;
-    (function (QrSegment) {
-        /*
-         * Describes how a segment's data bits are interpreted. Immutable.
-         */
         class Mode {
             /*-- Constructor and fields --*/
             constructor(
@@ -3047,5 +3942,5 @@ var qrcodegen;
         Mode.KANJI = new Mode(0x8, [8, 10, 12]);
         Mode.ECI = new Mode(0x7, [0, 0, 0]);
         QrSegment.Mode = Mode;
-    })(QrSegment = qrcodegen.QrSegment || (qrcodegen.QrSegment = {}));
-})(qrcodegen || (qrcodegen = {}));
+    return { QrCode, QrSegment };
+}

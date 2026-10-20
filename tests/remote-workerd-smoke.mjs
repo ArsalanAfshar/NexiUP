@@ -34,9 +34,11 @@ async function post(target, origin, path, key, body) {
 }
 try {
   const hub = await mf.getWorker('hub'), node = await mf.getWorker('node');
-  for (let i = 0; i < 5; i++) {
-    await post(hub, 'https://main.example.test', '/setup', setup, { action: 'migrate' });
-    await post(node, 'https://node.example.test', '/setup', master, { action: 'migrate' });
+  for (let i = 0; i < 12; i++) {
+    const h = await post(hub, 'https://main.example.test', '/setup', setup, { action: 'migrate' });
+    const n = await post(node, 'https://node.example.test', '/setup', master, { action: 'migrate' });
+    if (h.ready && n.ready) break;
+    assert.ok(i < 11, 'migrations must complete');
   }
   await post(hub, 'https://main.example.test', '/setup', setup, { action: 'configure', main_url: 'https://main.example.test' });
   await post(node, 'https://node.example.test', '/sync/api/keys', master, { name: 'local integration hub', secret_ref: 'NODE_KEY_REMOTE' });
