@@ -1,0 +1,17 @@
+# Local tooling, downloaded reference sources, credentials and build output
+.work/
+node_modules/
+.wrangler/
+build/
+dist/
+coverage/
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+backups/
+!wrangler.toml
