@@ -81,3 +81,56 @@ test('private-chat boundary prevents sending credentials to a forwarded/group ch
   const res=await worker.fetch(new Request('https://main.example.test/webhook',{method:'POST',headers:{'X-Telegram-Bot-Api-Secret-Token':x.env.WEBHOOK_SECRET},body:JSON.stringify(update)}),x.env,{});
   assert.equal(res.status,200);assert.equal(net.calls.length,0);
 });
+
+test('stock Nahan generated short panel-key format is accepted without master fallback',async t=>{
+  const x=await f(t,'hub'),n=node(x,{adapter:'nahan',local:false}),net=mockNetwork(t);
+  x.env.NODE_KEY_DE='nahan_'+Date.now().toString(36)+'_'+crypto.randomUUID().replaceAll('-','').slice(0,8);
+  assert.ok(x.env.NODE_KEY_DE.length<32);await nodeRequest(x.r(),n);
+  assert.equal(net.calls[0].headers.Authorization,'Bearer '+x.env.NODE_KEY_DE);
+  x.env.NODE_KEY_DE=x.env.MASTER_KEY;await assert.rejects(nodeRequest(x.r(),n),/node_api_key_missing_or_master/);
+});
+
+test('NexiUP toggle action honors a stable Idempotency-Key',async t=>{
+  const x=await f(t),n=node(x);const u=await panelCreate(x.r(),{name:'toggle_once',expiryDays:1},'toggle-user');
+  await nodeRequest(x.r(),n,'POST',u.id,null,'toggle','once');await nodeRequest(x.r(),n,'POST',u.id,null,'toggle','once');
+  assert.equal((await panelGet(x.r(),u.id)).isPaused,true);
+  await nodeRequest(x.r(),n,'POST',u.id,null,'toggle','twice');assert.equal((await panelGet(x.r(),u.id)).isPaused,false);
+});
+
+test('configured Cloudflare usage queues 70/90 percent warnings once per UTC day',async t=>{
+  const x=await f(t);x.env.CF_ACCOUNT_ID=crypto.randomUUID().replaceAll('-','');x.env.CF_API_TOKEN=crypto.randomUUID();
+  x.DB.exec("UPDATE nx_settings SET value=? WHERE key='bot'",JSON.stringify({...x.bot,daily_report_hour:(new Date().getUTCHours()+1)%24}));
+  let apiCalls=0;t.mock.method(globalThis,'fetch',async(input,init)=>{
+    assert.equal(new URL(String(input)).hostname,'api.cloudflare.com');const payload=JSON.parse(init.body);assert.match(payload.query,/workersInvocationsAdaptive/);assert.match(payload.variables.start,/T00:00:00Z$/);apiCalls++;
+    return Response.json({data:{viewer:{accounts:[{workersInvocationsAdaptive:[{sum:{requests:91000}}]}]}}});
+  });
+  await scheduled(x.r(),{scheduledTime:5*60000});await scheduled(x.r(),{scheduledTime:5*60000});assert.equal(apiCalls,2);
+  const jobs=x.DB.rows("SELECT * FROM nx_jobs WHERE id LIKE 'cf:%'");assert.equal(jobs.length,2);assert.ok(jobs.some(j=>j.id.endsWith(':70:901')));assert.ok(jobs.some(j=>j.id.endsWith(':90:901')));
+});
+
+test('authenticated node API allows a provisioning burst and reads capped-account bases safely',async t=>{
+  const x=await f(t),u=await panelCreate(x.r(),{name:'burst_account',trafficLimit:1,expiryDays:1},'burst');
+  x.DB.exec('INSERT INTO nx_panel_usage(id,epoch,up,down,day) VALUES(?,0,?,0,?)',u.id,2*1073741824,'2026-10-20');
+  for(const path of ['/sync/api/users?id=missing','/sync/api/users','/sync/api/users?id='+u.id+'&action=configs']){
+    const response=await worker.fetch(new Request('https://node.example.test'+path,{headers:{Authorization:'Bearer '+x.env.MASTER_KEY}}),x.env,{});
+    assert.equal(response.status,path.includes('missing')?404:200);
+    if(path.includes('configs')){const data=await response.json();assert.equal(data.user.status,'limited');assert.equal(data.bases[0].id,u.id);}
+  }
+});
+
+test('Workers-compatible manual redirect handling never forwards node credentials',async t=>{
+  const x=await f(t);let count=0;t.mock.method(globalThis,'fetch',async(input,init)=>{count++;assert.equal(init.redirect,'manual');return new Response(null,{status:302,headers:{Location:'https://elsewhere.example.test/'}});});
+  await assert.rejects(x.r().fetch('https://node.example.test/sync/api/users',{headers:{Authorization:'Bearer '+x.env.NODE_KEY_DE}}),/redirect_forbidden/);assert.equal(count,1);
+});
+
+test('a retrying old operation or delivery cannot monopolize the due queue',async t=>{
+  const x=await f(t);node(x);const p=plan(x);pendingOrder(x,'fresh');await approveOrder(x.r(),901,'fresh');
+  x.DB.exec('UPDATE nx_ops SET created_at=? WHERE id=?',Date.now()-10000,'ofresh');
+  x.DB.exec('INSERT INTO nx_ops(id,kind,user_id,node_id,name,payload,state,phase,retry_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)','older','test',102,'de','older',JSON.stringify({plan:p}),'ready','remote_ready',Date.now()-1,Date.now()-DAY);
+  await scheduled(x.r(),{scheduledTime:6*60000});assert.equal(x.DB.row('SELECT state FROM nx_ops WHERE id=?','ofresh').state,'done');assert.equal(x.DB.row('SELECT state FROM nx_ops WHERE id=?','older').state,'ready');
+  // Remove the successful issuance's delivery job so this checks the ordering directly.
+  x.DB.exec('DELETE FROM nx_jobs');
+  x.DB.exec('INSERT INTO nx_jobs(id,user_id,kind,data,due,created_at) VALUES(?,?,?,?,?,?)','old-job',101,'text',JSON.stringify({text:'older retry'}),Date.now()-1,Date.now()-DAY);
+  x.DB.exec('INSERT INTO nx_jobs(id,user_id,kind,data,due,created_at) VALUES(?,?,?,?,?,?)','new-job',101,'text',JSON.stringify({text:'new eligible job'}),Date.now()-10000,Date.now()-10000);
+  const net=mockNetwork(t);await scheduled(x.r(),{scheduledTime:7*60000});assert.equal(net.calls[0].payload.text,'new eligible job');assert.equal(x.DB.row('SELECT status FROM nx_jobs WHERE id=?','new-job').status,'done');
+});

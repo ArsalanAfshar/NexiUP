@@ -1,0 +1,49 @@
+# Attribution and license review / انتساب و بررسی مجوز
+
+## NexiUP
+
+Original bot: [ArsalanAfshar/NexiUP](https://github.com/ArsalanAfshar/NexiUP), commit `77e421f59f1c354c3a2cf507568790e0d7902a29`. The original source header says `LICENSE: MIT`; its README says `Copyright (c) 2026 NexiUP Contributors`, but no license file was present. This owner-requested rewrite preserves that attribution and adds the standard MIT text for NexiUP-owned code. Original source and documentation remain in Git history. No changes were made to main.
+
+ربات اولیه در سربرگ کد و README مجوز MIT را اعلام می‌کند، ولی فایل مجوز نداشت. این بازنویسی به درخواست مالک، انتساب قبلی را حفظ و متن MIT را برای کد متعلق به NexiUP اضافه می‌کند. نسخه اولیه در تاریخچه Git باقی است و شاخه main تغییر نکرده است.
+
+## Nahan and edgetunnel: inspected, not copied
+
+- [itsyebekhe/nahan](https://github.com/itsyebekhe/nahan), commit `67c9a038da4b0812bc4c8b630a6144967d102880`, declares MIT in README, but its linked LICENSE file is missing and GitHub's license endpoint returns 404.
+- The stated lineage includes [ImLTHQ/edgetunnel](https://github.com/ImLTHQ/edgetunnel) (license endpoint returned 404) and [cmliu/edgetunnel](https://github.com/cmliu/edgetunnel) (GitHub reports GPL-2.0).
+- Therefore **no Nahan/edgetunnel source, dashboard, subscription HTML, obfuscated bundle, or tunnel code is vendored here**. The node is an original Nahan-users-API-compatible implementation. API names and protocol facts are used for interoperability; MIT is not claimed for upstream code. A literal fork requires a documented upstream license decision/grant first.
+- The requested upstream lineage is acknowledged, not silently erased or rebranded as NexiUP-authored code.
+
+Nahan در README ادعای MIT دارد، اما فایل مجوز آن در نسخه بررسی‌شده موجود نیست. یکی از نیاکان معرفی‌شده GPL-2.0 است. بنابراین هیچ کد یا HTML آن‌ها در خروجی MIT کپی نشده؛ نود، پیاده‌سازی مستقل با API سازگار است، نه تغییر مجوز یک fork واقعی. برای fork عینی باید وضعیت مجوز بالادستی روشن شود.
+
+## Project Nayuki QR-Code-generator — embedded MIT component
+
+Source: [nayuki/QR-Code-generator](https://github.com/nayuki/QR-Code-generator), commit `3c6d0b3cefb4e049dc337e82237c9644399716a8`, `typescript-javascript/qrcodegen.ts`. Transpiled once with TypeScript 5.9.3 to readable JavaScript, appended to `worker.js` with its notice retained. Deployment never fetches or compiles it. The PNG serializer and test-only PNG/QR fixture reader are original NexiUP code.
+
+مولد QR با مجوز روشن MIT و حفظ کامل انتساب، یک‌بار به جاوااسکریپت خوانا تبدیل و داخل worker.js تعبیه شده است. هنگام نصب یا اجرا وابستگی شبکه‌ای یا مرحله ساخت ندارد. هیچ URL اشتراک به سرویس QR بیرونی فرستاده نمی‌شود.
+
+> Copyright (c) Project Nayuki. (MIT License)
+> https://www.nayuki.io/page/qr-code-generator-library
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy of
+> this software and associated documentation files (the "Software"), to deal in
+> the Software without restriction, including without limitation the rights to
+> use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+> the Software, and to permit persons to whom the Software is furnished to do so,
+> subject to the following conditions:
+> - The above copyright notice and this permission notice shall be included in
+>   all copies or substantial portions of the Software.
+> - The Software is provided "as is", without warranty of any kind, express or
+>   implied, including but not limited to the warranties of merchantability,
+>   fitness for a particular purpose and noninfringement. In no event shall the
+>   authors or copyright holders be liable for any claim, damages or other
+>   liability, whether in an action of contract, tort or otherwise, arising from,
+>   out of or in connection with the Software or the use or other dealings in the
+>   Software.
+
+## Schema/protocol references and development-only tools
+
+Xray-core and v2rayNG source were inspected for field/schema compatibility; no implementation code was copied. Cloudflare documentation supplied platform/API facts. Links, commit pins and findings are in [docs/RESEARCH.md](docs/RESEARCH.md).
+
+Node's built-in runner/SQLite power the default tests. Wrangler, Miniflare/workerd, TypeScript and jsQR were used as optional development/verification tools, not runtime dependencies. Their packages, cloned references and generated bundles are not committed. No dependency on an external repository exists at Worker runtime.
+
+کد Xray و v2rayNG فقط برای بررسی شِما خوانده شد؛ پیاده‌سازی آن‌ها کپی نشده است. ابزارهای Wrangler، Miniflare، TypeScript و jsQR صرفاً برای بررسی محلی به کار رفته‌اند و داخل محصول یا وابستگی زمان اجرا نیستند.

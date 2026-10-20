@@ -78,7 +78,7 @@ export function mockNetwork(t, handlers = {}) {
     const id = url.searchParams.get('id');
     if (url.pathname.endsWith('/api/users')) {
       const user = [...remote.values()].find(u => u.id === id || u.name === id);
-      if (method === 'GET') return id ? (user ? Response.json({ success: true, user }) : Response.json({ success: false }, { status: 404 })) : Response.json({ success: true, total: remote.size, users: [...remote.values()] });
+      if (method === 'GET') return id ? (user ? Response.json({ success: true, user, ...(url.searchParams.get('action') === 'configs' ? { bases: [{ protocol: 'vless', id: user.id, server: url.hostname, host: url.hostname, sni: url.hostname, port: 443, path: '/sync/ws', alpn: [] }] } : {}) }) : Response.json({ success: false }, { status: 404 })) : Response.json({ success: true, total: remote.size, users: [...remote.values()] });
       if (method === 'POST' && !id) {
         const u = { ...payload, id: crypto.randomUUID(), expiryMs: Date.now() + Number(payload.expiryDays) * DAY, usage: { total: 0 } }; remote.set(u.name, u); return Response.json({ success: true, user: u }, { status: 201 });
       }

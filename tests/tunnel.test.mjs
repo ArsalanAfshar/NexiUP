@@ -58,3 +58,10 @@ test('paused node rejects upgrade without opening sockets',async t=>{
   const p=JSON.parse(x.DB.row("SELECT value FROM nx_settings WHERE key='panel'").value);p.paused=true;x.DB.exec("UPDATE nx_settings SET value=? WHERE key='panel'",JSON.stringify(p));
   const res=await worker.fetch(new Request('https://node.example.test/sync/ws',{headers:{Upgrade:'websocket'}}),x.env,{});assert.equal(res.status,503);assert.equal(connections.length,0);
 });
+
+test('malformed early data returns before creating lifetime/flush timers',async t=>{
+  const x=await fixture();t.after(()=>x.DB.close());const connections=cloudflareFakes(t);
+  const original=globalThis.setInterval,intervals=[];t.mock.method(globalThis,'setInterval',(...args)=>{const id=original(...args);intervals.push(id);return id;});t.after(()=>intervals.forEach(clearInterval));
+  const response=await worker.fetch(new Request('https://node.example.test/sync/ws',{headers:{Upgrade:'websocket','Sec-WebSocket-Protocol':'%'}}),x.env,{waitUntil(){}});
+  assert.equal(response.status,400);assert.equal(intervals.length,0);assert.equal(connections.length,0);
+});

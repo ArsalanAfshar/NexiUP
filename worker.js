@@ -1,4 +1,4 @@
-/**
+/*!
  * NexiUP 2 — Telegram sales hub and original Nahan-compatible node.
  * Copyright (c) 2026 NexiUP Contributors. MIT; see LICENSE and THIRD_PARTY.md.
  * One ES module; paste directly into Cloudflare Workers. No runtime npm dependencies.
@@ -38,7 +38,8 @@ const t = (u, fa, en) => u?.lang === 'en' ? en : fa;
 const noStore = { 'Cache-Control':'no-store', 'Referrer-Policy':'no-referrer', 'X-Content-Type-Options':'nosniff' };
 const json = (obj, status = 200, extra = {}) => new Response(JSON.stringify(obj), { status, headers:{ ...noStore, 'Content-Type':'application/json; charset=utf-8', ...extra } });
 function constantTimeEqual(a, b) {
-  a = enc.encode(String(a || '')); b = enc.encode(String(b || ''));
+  a=String(a||'');b=String(b||'');if(a.length>1024||b.length>1024)return false;
+  a=enc.encode(a);b=enc.encode(b);
   let d = a.length ^ b.length;
   for (let i = 0; i < Math.max(a.length, b.length); i++) d |= (a[i] || 0) ^ (b[i] || 0);
   return d === 0;
@@ -88,6 +89,11 @@ function listHosts(v, max = 4) {
   if (!Array.isArray(v) || v.length > max) fail('too_many_hosts');
   return [...new Set(v.map(publicHost))];
 }
+function validNodeKey(node,key) {
+  // Stock Nahan 3.0.4 generates ~23-character nahan_* keys. Preserve interoperability
+  // without weakening NexiUP's own 32+ character keys; never fall back to a master key.
+  return strongSecret(key)||(node.adapter==='nahan'&&typeof key==='string'&&/^nahan_[a-z0-9]{6,16}_[a-z0-9]{6,16}$/.test(key));
+}
 function strongSecret(v) { return typeof v === 'string' && v.length >= 32 && v.length <= 256; }
 function getRole(env) { const r = env.ROLE || 'all'; if (!['hub','node','all'].includes(r)) fail('invalid_role', 503); return r; }
 function ownerIds(env) { return String(env.ADMIN_IDS || '').split(',').filter(x => /^\d{1,16}$/.test(x.trim())).map(x => Number(x.trim())).filter(x => x > 0 && Number.isSafeInteger(x)).slice(0, 5); }
@@ -112,7 +118,9 @@ function runtime(env, execution = {}) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeout);
       try {
-        const res = await fetch(url, { ...init, redirect:'error', signal:controller.signal });
+        const res = await fetch(url, { ...init, redirect:'manual', signal:controller.signal });
+        if(res.status>=300&&res.status<400){await res.body?.cancel();throw new Fault('redirect_forbidden',502);}
+        // Workers supports manual/follow, not redirect:error. Never forward credentials.
         // Body reads must be bounded by the same deadline, not just response headers.
         const bytes = await boundedBody(res, 1024 * 1024);
         return new Response([204,205,304].includes(res.status)?null:bytes, { status:res.status, headers:res.headers });
@@ -349,6 +357,11 @@ async function saveProfile(r, actor, profile, expectedVersion = 0) {
   let p;
   try { p = validateProfile(profile); }
   catch (e) { await audit(r, actor, 'profile_invalid', String(profile?.id || '').slice(0,24), { validation:codeOf(e) }); throw e; }
+  const release=await lock(r,'profile-set');
+  try {
+  const set=await r.all('SELECT id,data FROM nx_profiles LIMIT 7');
+  const weight=profile=>profile.enabled?Math.max(1,profile.ech.length):0;
+  if(set.filter(x=>x.id!==p.id).reduce((sum,x)=>sum+weight(parse(x.data)),0)+weight(p)>6)fail('profile_set_exceeds_variant_budget',422);
   const old = await r.first('SELECT * FROM nx_profiles WHERE id=?', p.id);
   if (old && old.version !== expectedVersion) fail('version_conflict', 409);
   if (!old && (await r.first('SELECT COUNT(*) AS n FROM nx_profiles')).n >= 6) fail('too_many_profiles');
@@ -359,6 +372,7 @@ async function saveProfile(r, actor, profile, expectedVersion = 0) {
   const out = await r.batch(items);
   if (!changes(out[old ? 1 : 0])) fail('version_conflict', 409);
   invalidate(r, 'profiles'); return { ...p, version:old ? old.version + 1 : 1 };
+  } finally { await release(); }
 }
 async function rollbackProfile(r, actor, id) {
   const old = await r.first('SELECT * FROM nx_profile_versions WHERE id=? ORDER BY version DESC LIMIT 1', id);
@@ -564,8 +578,12 @@ async function panelMutate(r,id,method,input={},action='',key='') {
     // Epoch fencing prevents buffered pre-reset bytes from resurrecting after a reset.
     await r.run('INSERT OR IGNORE INTO nx_panel_requests(key,user_id,action,created_at) VALUES(?,?,?,?)',key||randomId(),id,'reset',now());
   } else if(action==='toggle') {
-    const d=parse(row.data); d.isPaused=!d.isPaused;
-    await r.run('UPDATE nx_panel_users SET data=? WHERE id=?',JSON.stringify(d),id);
+    const mutation='toggle:'+(key||randomId());
+    await r.batch([
+      ['INSERT OR IGNORE INTO nx_panel_requests(key,user_id,action,created_at) VALUES(?,?,?,?)',mutation,id,'toggle_pending',now()],
+      ["UPDATE nx_panel_users SET data=json_set(data,'$.isPaused',json(CASE WHEN json_extract(data,'$.isPaused')=1 THEN 'false' ELSE 'true' END)) WHERE id=? AND EXISTS(SELECT 1 FROM nx_panel_requests WHERE key=? AND user_id=? AND action='toggle_pending')",id,mutation,id],
+      ["UPDATE nx_panel_requests SET action='toggle_done' WHERE key=? AND user_id=? AND action='toggle_pending'",mutation,id]
+    ]);
   } else if(method==='PUT') {
     const d=validatePanelUser(input,parse(row.data));
     try { await r.run('UPDATE nx_panel_users SET name=?,data=? WHERE id=?',d.name,JSON.stringify(d),id); } catch { fail('duplicate_name',409); }
@@ -604,7 +622,8 @@ async function panelAuth(r,request,masterOnly=false) {
     fail('unauthorized',401);
   }
   // Durable API control-plane throttle (not used for tunnel packets).
-  await rate(r,'panel-api:'+actor+':'+ip,100);
+  const allowance=await r.first(`INSERT INTO nx_limits(key,next_at) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET next_at=MAX(nx_limits.next_at,?)+100 WHERE nx_limits.next_at<=? RETURNING key`,'panel-api:'+actor+':'+ip,now()+100,now(),now()+2000);
+  if(!allowance)throw new Fault('panel_api_rate_limit',429,1);
   return actor;
 }
 async function panelApi(r,request,url,panel) {
@@ -613,7 +632,7 @@ async function panelApi(r,request,url,panel) {
   const id=url.searchParams.get('id'),action=url.searchParams.get('action')||'', method=request.method;
   if(endpoint==='users') {
     if(method==='GET') {
-      if(id) return json({success:true,user:await panelGet(r,id,url.origin)});
+      if(id) {const user=await panelGet(r,id,url.origin);return json({success:true,user,...(action==='configs'?{bases:panelBases(user,panel,url.origin)}:{})});}
       const q=(url.searchParams.get('q')||'').slice(0,40),limit=20,cursor=url.searchParams.get('cursor')||'';
       const rows=await r.all('SELECT u.*,x.up,x.down,x.day,x.day_up,x.day_down FROM nx_panel_users u LEFT JOIN nx_panel_usage x ON x.id=u.id AND x.epoch=u.epoch WHERE u.id>? AND (u.name LIKE ? OR u.id=?) ORDER BY u.id LIMIT ?',cursor,'%'+q+'%',q,limit+1);
       const total=(await r.first('SELECT COUNT(*) AS n FROM nx_panel_users')).n;
@@ -646,7 +665,7 @@ async function panelApi(r,request,url,panel) {
       await audit(r,actor,'key_registered',kid,{secret_ref:data.secret_ref});return json({success:true,id:kid},201);
     }
   }
-  if(endpoint==='stats'&&method==='GET') return json({success:true,colo:request.cf?.colo||null,edge_country:request.cf?.country||null,proxy_exit:{verified:false,ip:null,country:null},users:(await r.first('SELECT COUNT(*) AS n FROM nx_panel_users')).n,version:VERSION});
+  if(endpoint==='stats'&&method==='GET') return json({success:true,colo:request.cf?.colo||null,request_country:request.cf?.country||null,proxy_exit:{verified:false,ip:null,country:null},users:(await r.first('SELECT COUNT(*) AS n FROM nx_panel_users')).n,version:VERSION});
   if(endpoint==='logs'&&method==='GET') return json({success:true,logs:await r.all('SELECT * FROM nx_audit WHERE id>? ORDER BY id LIMIT 20',Number(url.searchParams.get('after')||0))});
   if(endpoint==='backup'&&method==='GET') {
     const page=url.searchParams.get('cursor')||'';
@@ -794,7 +813,7 @@ async function tunnel(r,request,panel) {
   }
   ws.addEventListener('message',incoming);ws.addEventListener('close',close);ws.addEventListener('error',close);
   const early=request.headers.get('sec-websocket-protocol');
-  if(early){try{if(early.length>5464)fail('early_data_limit');const s=atob(early.replaceAll('-','+').replaceAll('_','/'));incoming({data:Uint8Array.from(s,c=>c.charCodeAt(0)).buffer});}catch{close();}}
+  if(early){try{if(early.length>5464)fail('early_data_limit');const s=atob(early.replaceAll('-','+').replaceAll('_','/'));incoming({data:Uint8Array.from(s,c=>c.charCodeAt(0)).buffer});}catch{close();return json({error:'invalid_early_data'},400);}}
   periodic=setInterval(()=>{
     if(closed)return;
     // At most 20 refresh cycles; no per-packet D1 access. Budget closes unusually expensive tunnels.
@@ -826,7 +845,7 @@ async function saveNode(r,n,actor) {
   n=validateNode(n);
   if(n.local&&getRole(r.env)==='hub')fail('local_requires_all_role');
   if(n.local&&!strongSecret(r.env.MASTER_KEY))fail('master_key_required_min_32',503);
-  if(!n.local&&(!strongSecret(r.env[n.api_key_ref])||constantTimeEqual(r.env[n.api_key_ref],r.env.MASTER_KEY)))fail('distinct_node_secret_required');
+  if(!n.local&&(!validNodeKey(n,r.env[n.api_key_ref])||constantTimeEqual(r.env[n.api_key_ref],r.env.MASTER_KEY)))fail('distinct_node_secret_required');
   if(n.local){const other=await r.first('SELECT id FROM nx_nodes WHERE local=1 AND id<>?',n.id);if(other)fail('one_local_node_registry_entry_only');}
   const previous=await r.first('SELECT * FROM nx_nodes WHERE id=?',n.id);
   if(previous){
@@ -848,7 +867,7 @@ async function nodeRequest(r,node,method='GET',id='',payload=null,action='',idem
     return panelMutate(r,id,method,payload||{},action,idempotency);
   }
   const key=r.env[node.api_key_ref];
-  if(!strongSecret(key)||constantTimeEqual(key,r.env.MASTER_KEY))fail('node_api_key_missing_or_master',503);
+  if(!validNodeKey(node,key)||constantTimeEqual(key,r.env.MASTER_KEY))fail('node_api_key_missing_or_master',503);
   const url=new URL(`${httpsOrigin(node.base_url)}/${ident(node.api_route,48)}/api/users`);
   if(id)url.searchParams.set('id',id);if(action)url.searchParams.set('action',action);
   let res;
@@ -873,10 +892,11 @@ function normalizeRemoteUser(u) {
 async function baseConfigs(r,node,user) {
   if(node.local)return panelBases(user,await setting(r,'panel'),node.base_url);
   if(node.adapter==='nexiup') {
-    // Node's ordinary subscription base mode is account-scoped and has no arbitrary URL trust.
-    const url=`${node.base_url}/${node.api_route}?sub=${encodeURIComponent(user.name)}&format=base`;
-    const res=await r.fetch(url);if(!res.ok)fail('node_configs_unavailable',502);
-    const bases=parse(await res.text());if(!Array.isArray(bases)||!bases.length||bases.length>4)fail('invalid_node_configs');
+    // Authenticated retrieval also works when a retained-usage renewal is still capped.
+    // Public subscriptions correctly reject inactive accounts, but the hub must be able
+    // to snapshot an already-created identity without recreating or resetting it.
+    const response=await nodeRequest(r,node,'GET',user.id,null,'configs');
+    const bases=response.bases;if(!Array.isArray(bases)||!bases.length||bases.length>4)fail('invalid_node_configs');
     return bases.map(b=>{const parsed=parseBaseUri(baseUri(b));if(parsed.id!==user.id)fail('node_identity_mismatch');return parsed;});
   }
   const url=`${node.base_url}/${node.api_route}?sub=${encodeURIComponent(user.name)}&flag=base64`;
@@ -1357,7 +1377,7 @@ async function adminMenu(r,u) {
     ['nodes','🌐 نودها / Nodes'],['profiles','📡 پروفایل اپراتور / Profiles'],['test','🧪 تنظیمات تست / Test settings'],
     ['plans','🛒 پلن‌ها / Plans'],['payments','💳 پرداخت / Payments'],['guides','📖 راهنما / Guides'],['channels','📢 عضویت / Channels'],['coupons','🎟 تخفیف / Coupons'],['texts','📝 متن‌ها / Texts'],['bot','⚙️ تنظیمات ربات / Bot settings'],['panel','🛡 تنظیمات نود محلی / Local node']
   ].map(([id,label])=>({label,action:'manage',id}));
-  buttons.push({label:'📦 سفارش‌ها / Orders',action:'orders'},{label:'🔁 صدور و بازیابی / Operations',action:'ops'},{label:'🧪 سابقه تست / Test grants',action:'grants'},{label:'👥 کاربران / Users',action:'users'},{label:'💸 برداشت‌ها / Withdrawals',action:'withdrawals'},{label:'📣 همگانی / Broadcast',action:'broadcast'},{label:'📊 آمار / Statistics',action:'stats'},{label:'☁️ مصرف Cloudflare / Usage',action:'usage'},{label:'💾 پشتیبان تنظیمات / Backup',action:'backup'},{label:'📋 رویدادها / Audit',action:'audit'},back(u));
+  buttons.push({label:'🩺 سلامت / Diagnostics',action:'diagnostics'},{label:'📦 سفارش‌ها / Orders',action:'orders'},{label:'🔁 صدور و بازیابی / Operations',action:'ops'},{label:'🧪 سابقه تست / Test grants',action:'grants'},{label:'👥 کاربران / Users',action:'users'},{label:'💸 برداشت‌ها / Withdrawals',action:'withdrawals'},{label:'📣 همگانی / Broadcast',action:'broadcast'},{label:'📊 آمار / Statistics',action:'stats'},{label:'☁️ مصرف Cloudflare / Usage',action:'usage'},{label:'💾 پشتیبان تنظیمات / Backup',action:'backup'},{label:'📋 رویدادها / Audit',action:'audit'},back(u));
   return send(r,u,t(u,'مدیریت NexiUP — تغییرات عملیاتی در D1 ذخیره می‌شوند.','NexiUP administration — operational changes are stored in D1.'),buttons);
 }
 async function manage(r,u,kind,cursor='') {
@@ -1455,7 +1475,7 @@ async function adminSubs(r,u,userId) {
 }
 async function adminSubView(r,u,id) {
   const s=await r.first('SELECT * FROM nx_subs WHERE id=?',id);if(!s)fail('subscription_not_found');
-  return send(r,u,`${id}\nUser: ${s.user_id}; node: ${s.node_id}\n${s.status}; expiry: ${stamp(s.expires_at)}`,[{label:'توقف/ادامه / Pause/resume',action:'subtoggle',id},{label:'افزودن روز / Extend days',action:'subextend',id},{label:'صفرکردن مصرف / Reset usage',action:'subreset',id},{label:'حذف حساب / Delete account',action:'subdelete',id},{label:'مدیریت / Admin',action:'admin'}]);
+  return send(r,u,`${id}\nUser: ${s.user_id}; node: ${s.node_id}\n${s.status}; expiry: ${stamp(s.expires_at)}`,[{label:'توقف/ادامه / Pause/resume',action:'subtoggle',id},{label:'افزودن روز / Extend days',action:'subextend',id},{label:'صفرکردن مصرف / Reset usage',action:'subreset',id},{label:'حذف حساب / Delete account',action:'subdelete',id},{label:'به‌روزرسانی کانفیگ پایه / Refresh transports',action:'subrefresh',id},{label:'مدیریت / Admin',action:'admin'}]);
 }
 async function adminSubAction(r,actor,id,action,nonce) {
   const s=await r.first('SELECT * FROM nx_subs WHERE id=?',id);if(!s?.node_id)fail('unmapped_subscription');const n=await r.first('SELECT * FROM nx_nodes WHERE id=?',s.node_id);
@@ -1591,7 +1611,7 @@ async function jobSteps(r,job,u) {
     for(const c of d.configs){
       const hint=t(u,'ورود: JSON کامل را کپی و در کلاینت Xray سازگار وارد کنید.','Import: copy this complete JSON into a compatible Xray client.');
       const full=c.label+'\n'+hint+'\n'+c.text;
-      if(full.length<=4096)steps.push({method:'sendMessage',payload:{chat_id:u.id,text:full,link_preview_options:{is_disabled:true}}});
+      if(full.length<=4096)steps.push({method:'sendMessage',payload:{chat_id:u.id,text:full,entities:[{type:'pre',offset:full.length-c.text.length,length:c.text.length,language:'json'}],link_preview_options:{is_disabled:true}}});
       else {
         const parts=safeConfigParts(c.text);
         steps.push({method:'sendMessage',payload:{chat_id:u.id,text:`${c.label}\n${hint}\n${t(u,`${parts.length} پیام خام بعدی را بدون فاصله یا خط جدید به هم بچسبانید. فایل کامل نیز ضمیمه می‌شود.`,`Join the next ${parts.length} raw messages without separators or newlines. An intact file is also attached.`)}`}});
@@ -1633,7 +1653,7 @@ async function processJob(r,id,maxSteps=2) {
   }finally{await release();}
 }
 
-const ADMIN_ACTIONS=new Set(['admin','manage','managepage','edit','apply','rollback','nodetest','channeltest','resetcool','cooluser','orders','review','approve','reject','ops','opview','retryop','absentop','resetdone','confirmop','users','userview','usersearch','ban','balance','directmsg','usersubs','setadmin','admsub','subtoggle','subextend','subreset','subdelete','subconfirm','grants','withdrawals','wdview','wdapprove','wdreject','broadcast','bcstart','bcstop','stats','usage','audit','backup','exportkind','ticketreply']);
+const ADMIN_ACTIONS=new Set(['admin','manage','managepage','edit','apply','rollback','nodetest','channeltest','resetcool','cooluser','orders','review','approve','reject','ops','opview','retryop','absentop','resetdone','confirmop','users','userview','usersearch','ban','balance','directmsg','usersubs','setadmin','admsub','subtoggle','subextend','subreset','subdelete','subconfirm','subrefresh','grants','withdrawals','wdview','wdapprove','wdreject','broadcast','bcstart','bcstop','stats','usage','diagnostics','audit','backup','exportkind','ticketreply']);
 async function handleAction(r,u,action,id,key) {
   if(ADMIN_ACTIONS.has(action)&&!await isAdmin(r,u.id))fail('admin_required',403);
   if(action==='lang'){if(!['fa','en'].includes(id))fail('invalid_language');await r.run('UPDATE nx_users SET lang=? WHERE id=?',id,u.id);u.lang=id;return u.terms_at?home(r,u):showTerms(r,u);}
@@ -1737,6 +1757,7 @@ async function handleAction(r,u,action,id,key) {
     await r.batch([['UPDATE nx_users SET admin=? WHERE id=?',Number(desired),Number(uid)],auditStmt(u.id,'admin_access_changed',uid,{admin:Number(desired)})]);return userView(r,u,uid);
   }
   if(action==='admsub')return adminSubView(r,u,id);
+  if(action==='subrefresh'){const sub=await r.first('SELECT * FROM nx_subs WHERE id=?',id);if(!sub?.node_id)fail('unmapped_subscription');const n=await r.first('SELECT * FROM nx_nodes WHERE id=?',sub.node_id);const user=normalizeRemoteUser((await nodeRequest(r,n,'GET',sub.remote_id)).user);if(user.id!==sub.remote_id)fail('node_identity_mismatch');const bases=await baseConfigs(r,n,user);await r.batch([['UPDATE nx_subs SET bases=? WHERE id=?',JSON.stringify(bases),id],auditStmt(u.id,'base_configs_refreshed',id)]);return adminSubView(r,u,id);}
   if(action==='subextend'){await state(r,u.id,'admin:extend',{id,key});return send(r,u,'تعداد روز افزوده را بفرستید؛ مصرف حفظ می‌شود. / Send extra days; usage is retained.');}
   if(['subtoggle','subreset','subdelete'].includes(action)){
     await state(r,u.id,'admin:subconfirm',{id,action:action==='subtoggle'?'toggle':action==='subreset'?'reset':'delete',nonce:key});return send(r,u,'تأیید اقدام روی حساب نود؟ / Confirm node-account operation?',[{label:'تأیید / Confirm',action:'subconfirm',id:key},{label:'لغو / Cancel',action:'admin'}]);
@@ -1759,6 +1780,12 @@ async function handleAction(r,u,action,id,key) {
   if(action==='bcstart'){if(!['all','buyers','non_buyers','active_30d'].includes(id))fail('invalid_broadcast_segment');await state(r,u.id,'admin:broadcast',{segment:id,key});return send(r,u,'متن همگانی ساده را بفرستید (بدون HTML) / Send plain-text broadcast (no HTML)');}
   if(action==='bcstop'){await r.batch([['UPDATE nx_broadcasts SET status=? WHERE id=?','cancelled',id],auditStmt(u.id,'broadcast_cancelled',id)]);return adminMenu(r,u);}
   if(action==='stats')return send(r,u,JSON.stringify(await getStats(r,id==='0'?'today':id),null,2),[...['today','7d','30d','all'].map(p=>({label:p,action:'stats',id:p})),{label:'مدیریت / Admin',action:'admin'}]);
+  if(action==='diagnostics'){
+    const started=now();await r.first('SELECT 1 AS ok');const d1_read_wall_ms=now()-started;
+    const hook=await telegram(r,'getWebhookInfo',{}),bot=await setting(r,'bot');
+    const operations=await r.all('SELECT state,COUNT(*) AS count FROM nx_ops GROUP BY state LIMIT 10'),deliveries=await r.all('SELECT status,COUNT(*) AS count FROM nx_jobs GROUP BY status LIMIT 10');
+    return send(r,u,JSON.stringify({version:VERSION,role:getRole(r.env),d1_read_wall_ms,webhook:{configured:!!hook.url,matches_main_url:hook.url===bot.main_url+'/webhook',pending:hook.pending_update_count||0,last_error_at:hook.last_error_date?stamp(hook.last_error_date*1000):null},operations,deliveries},null,2),[{label:'مدیریت / Admin',action:'admin'}]);
+  }
   if(action==='usage')return send(r,u,JSON.stringify(await cloudflareUsage(r),null,2)+'\n'+t(u,'حد روزانه مشترک کل حساب است؛ نه برای هر نود جداگانه.','The daily limit is account-wide, not a separate allowance for every node.'),[{label:'مدیریت / Admin',action:'admin'}]);
   if(action==='audit'){
     const rows=await r.all('SELECT id,actor,action,target,created_at FROM nx_audit WHERE id>? ORDER BY id LIMIT 16',Number(id)||0);
@@ -1848,10 +1875,10 @@ async function exportConfig(r,u,selector,key) {
   let records,next='';
   if(['bot','test','panel'].includes(kind))records=[await setting(r,kind,true)];
   else if(kind==='nodes'){
-    const rows=await r.all('SELECT * FROM nx_nodes WHERE id>? ORDER BY id LIMIT 7',cursor);records=[];
-    for(const row of rows.slice(0,6))records.push((await editableDoc(r,'nodes',row.id)).doc);if(rows.length>6)next=rows[5].id;
-  }else if(kind==='profiles')records=(await profiles(r,true)).map(({version,...doc})=>doc);
-  else {const rows=await catalog(r,kind,false,cursor,7);records=rows.slice(0,6).map(({version,...doc})=>doc);if(rows.length>6)next=rows[5].id;}
+    const rows=await r.all('SELECT * FROM nx_nodes WHERE id>? ORDER BY id LIMIT 4',cursor);records=[];
+    for(const row of rows.slice(0,3))records.push((await editableDoc(r,'nodes',row.id)).doc);if(rows.length>3)next=rows[2].id;
+  }else if(kind==='profiles'){const rows=(await profiles(r,true)).filter(p=>p.id>cursor);records=rows.slice(0,3).map(({version,...doc})=>doc);if(rows.length>3)next=rows[2].id;}
+  else {const rows=await catalog(r,kind,false,cursor,4);records=rows.slice(0,3).map(({version,...doc})=>doc);if(rows.length>3)next=rows[2].id;}
   const content=JSON.stringify({project:'NexiUP',version:2,kind,records,next},null,2);
   await enqueue(r,'backup:'+key,u.id,'document',{content,filename:`nexiup-${kind}.json`,caption:'Configuration only. Restore caption: #import_nexiup. Keep private.'});
   await audit(r,u.id,'config_backup',kind,{records:records.length});
@@ -1867,7 +1894,7 @@ async function downloadJsonText(r,document) {
 async function importConfig(r,u,document) {
   if(!await isAdmin(r,u.id))fail('admin_required',403);
   const d=parse(await downloadJsonText(r,document));
-  if(!d||d.project!=='NexiUP'||d.version!==2||!Array.isArray(d.records)||d.records.length>6)fail('invalid_v2_backup');
+  if(!d||d.project!=='NexiUP'||d.version!==2||!Array.isArray(d.records)||d.records.length>3)fail('invalid_v2_backup');
   // Restore is settings-only, strictly validated, upsert-only and audited. No SQL comes from the file.
   const docs=[];for(const doc of d.records)docs.push(await validateEdit(r,d.kind,doc));
   for(const doc of docs){const {version}=await editableDoc(r,d.kind,doc.id||'');await applyEdit(r,u.id,d.kind,doc,version);}
@@ -1928,7 +1955,7 @@ async function webhook(r,request) {
     if(e instanceof Fault && e.status<500 && !['telegram_rate_limit','query_budget'].includes(e.code)){
       const uid=update.callback_query?.from?.id||update.message?.from?.id;
       if(uid&&r.queries<42){
-        try{await send(r,{id:uid},`⚠️ ${e.code}${e.retry?' ('+e.retry+'s)':''}\n${t(null,'لطفاً وضعیت را بررسی کنید یا دوباره از منو اقدام کنید.','Check status or retry from the menu.')}`,[{label:'منو / Menu',action:'home'}]);}catch{}
+        try{const target=await r.first('SELECT id,lang FROM nx_users WHERE id=?',uid)||{id:uid,lang:'fa'};await send(r,target,`⚠️ ${e.code}${e.retry?' ('+e.retry+'s)':''}\n${t(target,'لطفاً وضعیت را بررسی کنید یا دوباره از منو اقدام کنید.','Check status or retry from the menu.')}`,[{label:t(target,'منو','Menu'),action:'home'}]);}catch{}
       }
       if(r.queries<45)await r.run('UPDATE nx_updates SET status=?,until_ms=0 WHERE id=? AND owner=?','done',update.update_id,owner);
       return json({ok:true});
@@ -1989,8 +2016,8 @@ async function reports(r) {
 async function scheduled(r,event) {
   await ready(r);const role=getRole(r.env);if(role==='node')return; // no cron necessary on node-only deployments
   const minute=Math.floor((event?.scheduledTime||now())/60000),slot=minute%6;
-  if(slot===0||slot===2){const op=await r.first("SELECT id FROM nx_ops WHERE state IN ('queued','creating','ready','reconcile') AND retry_at<=? ORDER BY created_at LIMIT 1",now());if(op)await processOp(r,op.id);}
-  else if(slot===1||slot===3){const job=await r.first("SELECT id FROM nx_jobs WHERE status='queued' AND due<=? ORDER BY created_at LIMIT 1",now());if(job)await processJob(r,job.id,3);}
+  if(slot===0||slot===2){const op=await r.first("SELECT id FROM nx_ops WHERE state IN ('queued','creating','ready','reconcile') AND retry_at<=? ORDER BY CASE WHEN retry_at=0 THEN created_at ELSE retry_at END,created_at LIMIT 1",now());if(op)await processOp(r,op.id);}
+  else if(slot===1||slot===3){const job=await r.first("SELECT id FROM nx_jobs WHERE status='queued' AND due<=? ORDER BY due,created_at LIMIT 1",now());if(job)await processJob(r,job.id,3);}
   else if(slot===4)await housekeeping(r);
   else {if(minute%60===5)await reports(r);else await processBroadcast(r);}
 }
@@ -2015,11 +2042,11 @@ function dashboard() {
     const $=id=>document.getElementById(id);let secret='',base=location.pathname.replace(/\/dash\/?$/,'')+'/api/',tab='users',selected='',cursor='',last=null;
     const show=x=>{$('result').textContent=JSON.stringify(x,null,2);last=x;};
     async function api(path,method='GET',body){const res=await fetch(base+path,{method,headers:{Authorization:'Bearer '+secret,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});const data=await res.json();if(!res.ok)throw Error(data.error||String(res.status));return data;}
-    async function safe(fn){try{$('status').textContent='…';await fn();$('status').textContent='✓';}catch(e){$('status').textContent=e.message;}}
+    let uiBusy=false;async function safe(fn){if(uiBusy)return;uiBusy=true;try{$('status').textContent='…';await fn();$('status').textContent='✓';}catch(e){$('status').textContent=e.message;}finally{uiBusy=false;}}
     function editor(doc){$('editor').value=JSON.stringify(doc,null,2);}
     function userDoc(u){const keys=['name','trafficLimit','dailyLimit','expiryMs','notes','connLimit','maxConfigs','proxyIp','cleanIp','userNodes','userPanelUrl','userMode','userPorts','isPaused'];return Object.fromEntries(keys.filter(k=>u[k]!==undefined).map(k=>[k,u[k]]));}
     async function load(){
-      $('title').textContent=tab; $('list').replaceChildren();$('next').classList.add('hidden');
+      $('title').textContent=tab; $('list').replaceChildren();$('next').classList.add('hidden');$('save').disabled=!['users','config','keys'].includes(tab);
       for(const id of ['pause','reset','delete'])$(id).classList.add('hidden');
       if(tab==='users'){
         const d=await api('users'+(cursor?'?cursor='+encodeURIComponent(cursor):''));show(d);
@@ -2034,7 +2061,7 @@ function dashboard() {
     $('logout').onclick=()=>{secret='';$('key').value='';$('editor').value='';$('result').textContent='';$('app').classList.add('hidden');};
     for(const b of document.querySelectorAll('[data-tab]'))b.onclick=()=>safe(async()=>{tab=b.dataset.tab;cursor='';selected='';await load();});
     $('next').onclick=()=>safe(load);
-    $('new').onclick=()=>{tab='users';selected='';editor({name:'',trafficLimit:1,dailyLimit:1,expiryDays:1,connLimit:1,maxConfigs:4,notes:''});};
+    $('new').onclick=()=>{tab='users';selected='';$('save').disabled=false;editor({name:'',trafficLimit:1,dailyLimit:1,expiryDays:1,connLimit:1,maxConfigs:4,notes:''});};
     $('save').onclick=()=>safe(async()=>{const doc=JSON.parse($('editor').value);if(!confirm('Apply validated changes?'))return;if(tab==='config'){show(await api('config','PUT',doc));base='/'+doc.api_route+'/api/';history.replaceState(null,'','/'+doc.api_route+'/dash');}else if(tab==='keys')show(await api('keys','POST',doc));else show(await api('users'+(selected?'?id='+encodeURIComponent(selected):''),selected?'PUT':'POST',doc));});
     for(const [id,action]of [['pause','toggle'],['reset','reset'],['delete','delete']])$(id).onclick=()=>safe(async()=>{if(!selected||!confirm('Confirm '+action+'?'))return;show(await api('users?id='+encodeURIComponent(selected)+(action==='delete'?'':'&action='+action),action==='delete'?'DELETE':'POST'));});
     $('download').onclick=()=>{if(!last)return;const a=document.createElement('a'),url=URL.createObjectURL(new Blob([JSON.stringify(last,null,2)],{type:'application/json'}));a.href=url;a.download='nexiup-panel-page.json';a.click();URL.revokeObjectURL(url);};
@@ -2140,8 +2167,8 @@ async function setup(r,request) {
   }
   if(b.action==='tick'){
     if(role==='node')fail('hub_only');
-    if(b.kind==='op'){const op=await r.first("SELECT id FROM nx_ops WHERE state IN ('queued','creating','ready','reconcile') AND retry_at<=? ORDER BY created_at LIMIT 1",now());if(op)await processOp(r,op.id);return json({processed:op?.id||null});}
-    if(b.kind==='job'){const job=await r.first("SELECT id FROM nx_jobs WHERE status='queued' AND due<=? ORDER BY created_at LIMIT 1",now());if(job)await processJob(r,job.id,2);return json({processed:job?.id||null});}
+    if(b.kind==='op'){const op=await r.first("SELECT id FROM nx_ops WHERE state IN ('queued','creating','ready','reconcile') AND retry_at<=? ORDER BY CASE WHEN retry_at=0 THEN created_at ELSE retry_at END,created_at LIMIT 1",now());if(op)await processOp(r,op.id);return json({processed:op?.id||null});}
+    if(b.kind==='job'){const job=await r.first("SELECT id FROM nx_jobs WHERE status='queued' AND due<=? ORDER BY due,created_at LIMIT 1",now());if(job)await processJob(r,job.id,2);return json({processed:job?.id||null});}
     fail('invalid_tick_kind');
   }
   if(b.action==='legacy'){
@@ -2186,7 +2213,7 @@ export default {
 
 // ---- Embedded QR encoder follows. Transpiled once from Project Nayuki TypeScript.
 // No deployment compilation, remote dependency, dynamic evaluation or Node API.
-/*
+/*!
  * QR Code generator library (TypeScript)
  *
  * Copyright (c) Project Nayuki. (MIT License)

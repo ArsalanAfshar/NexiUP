@@ -252,3 +252,10 @@ test('embedded setup and dashboard scripts parse and reference no remote assets'
     assert.equal(/<(script|link)[^>]+(?:src|href)=["']https?:/i.test(text),false);
   }
 });
+
+test('profile-set activation cannot exceed the all-customer variant budget',async t=>{
+  const x=await f(t);const p=structuredClone(DEFAULT_PROFILES[1]);p.id='extraech';await saveProfile(x.r(),901,p,0);
+  const q=structuredClone(DEFAULT_PROFILES[1]);q.id='overflow';await assert.rejects(saveProfile(x.r(),901,q,0),/profile_set_exceeds_variant_budget/);
+  assert.equal(x.DB.row('SELECT id FROM nx_profiles WHERE id=?','overflow'),undefined);
+  assert.equal((await profiles(x.r(),true)).find(p=>p.id==='hamrah').version,1);
+});
