@@ -1,0 +1,22 @@
+name = "nexiup"
+main = "worker.js"
+compatibility_date = "2026-10-20"
+compatibility_flags = ["global_fetch_strictly_public"]
+workers_dev = true
+
+[vars]
+ROLE = "all"
+# Set ADMIN_IDS in the dashboard. Never put secrets here.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nexiup"
+# Replace with YOUR database's ID from Cloudflare before a real deployment.
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+[triggers]
+crons = ["* * * * *"]
+
+# Do not log request URLs: they can contain subscription bearer tokens.
+[observability]
+enabled = false
