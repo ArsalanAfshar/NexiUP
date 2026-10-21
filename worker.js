@@ -1,5 +1,5 @@
 /*!
- * NexiUP 2.1 — Telegram sales hub, web control panel and compatible node.
+ * NexiUP 2.1.1 — Telegram sales hub, web control panel and compatible node.
  * Copyright (c) 2026 NexiUP Contributors. MIT; see LICENSE and THIRD_PARTY.md.
  * One ES module; paste directly into Cloudflare Workers. No runtime npm dependencies.
  * Nahan source is NOT vendored: its inspected license grant was incomplete.
@@ -8,7 +8,8 @@
  */
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '2.1.0';
+const VERSION = '2.1.1';
+const knownFaults = new WeakSet();
 
 /** @typedef {{ label: string, action?: string, id?: string | number, url?: string }} MenuButton */
 /** @typedef {(MenuButton | MenuButton[])[]} MenuButtons */
@@ -25,7 +26,7 @@ let liveWebSockets = 0;
 const authFailures = new Map();
 
 class Fault extends Error {
-  constructor(code, status = 400, retry = 0) { super(code); this.code = code; this.status = status; this.retry = retry; }
+  constructor(code, status = 400, retry = 0) { super(code); this.code = code; this.status = status; this.retry = retry; knownFaults.add(this); }
 }
 const fail = (code, status = 400) => { throw new Fault(code, status); };
 const now = () => Date.now();
@@ -35,10 +36,10 @@ const parse = (s, fallback = null) => { try { return JSON.parse(s); } catch { re
 const isObject = x => x !== null && typeof x === 'object' && !Array.isArray(x);
 const changes = r => Number(r?.meta?.changes || 0);
 const html = x => String(x ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
-const codeOf = e => e instanceof Fault ? e.code : 'internal_error'; // Never store remote error bodies, URLs or stacks.
+const codeOf = e => knownFaults.has(e) ? e.code : 'internal_error'; // Never store remote error bodies, URLs or stacks.
 const stamp = ms => ms ? new Date(ms).toISOString().replace('T', ' ').slice(0, 16) + ' UTC' : '—';
 const t = (u, fa, en) => u?.lang === 'en' ? en : fa;
-const noStore = { 'Cache-Control':'no-store', 'Referrer-Policy':'no-referrer', 'X-Content-Type-Options':'nosniff' };
+const noStore = { 'X-NexiUP-Version':VERSION, 'Cache-Control':'no-store', 'Referrer-Policy':'no-referrer', 'X-Content-Type-Options':'nosniff' };
 const json = (obj, status = 200, extra = {}) => new Response(JSON.stringify(obj), { status, headers:{ ...noStore, 'Content-Type':'application/json; charset=utf-8', ...extra } });
 function constantTimeEqual(a, b) {
   a=String(a||'');b=String(b||'');if(a.length>1024||b.length>1024)return false;
@@ -102,20 +103,95 @@ function controlSecret(env,key) { return ['MASTER_KEY','SETUP_KEY','WEB_ADMIN_KE
 function getRole(env) { const r = env.ROLE || 'all'; if (!['hub','node','all'].includes(r)) fail('invalid_role', 503); return r; }
 function ownerIds(env) { return String(env.ADMIN_IDS || '').split(',').filter(x => /^\d{1,16}$/.test(x.trim())).map(x => Number(x.trim())).filter(x => x > 0 && Number.isSafeInteger(x)).slice(0, 5); }
 
-/** Counts statements, not just batch round trips. Leaves room below D1's Free 50. */
-function runtime(env, execution = {}) {
-  const raw = env.DB;
-  let queries = 0, external = 0;
-  const dbError = e => { if(String(e?.message||'').includes('insufficient_balance'))throw new Fault('insufficient_balance',409);throw e; };
-  const reserve = n => { if (queries + n > 46) throw new Fault('query_budget', 503, 60); queries += n; };
-  const st = (sql, args) => raw.prepare(sql).bind(...args);
+// Unknown rejections can be null, primitives or objects with throwing getters. Never
+// assume Error/instanceof or serialize their messages, SQL, request URLs or stacks.
+function errorField(error, name) { try { return error?.[name]; } catch { return undefined; } }
+function errorMessage(error) {
+  const parts=[];
+  for(let i=0;i<3&&error!=null;i++){
+    const message=errorField(error,'message');if(typeof message==='string')parts.push(message.slice(0,2000));
+    error=errorField(error,'cause');
+  }
+  return parts.join(' '); // Internal classification only; never return/log this string.
+}
+function schemaMissing(error) { return /no such table:\s*(?:main\.)?(?:schema_version|nx_[a-z0-9_]+)\b/i.test(errorMessage(error)); }
+function requestSurface(request) {
+  try{
+    const path=new URL(request.url).pathname;
+    if(request.headers.get('upgrade')?.toLowerCase()==='websocket')return 'tunnel';
+    if(path==='/setup')return 'setup';if(path==='/health')return 'health';
+    if(path.startsWith('/admin/web-api/'))return 'admin_api';if(path.startsWith('/sub/'))return 'subscription';
+    if(path==='/webhook')return 'webhook';if(path.includes('/api/'))return 'node_api';
+  }catch{}
+  return 'request';
+}
+function logRuntimeError(error,env,metadata) {
+  // Explicit opt-in. Only fixed categories, version, random correlation ID and
+  // numeric source positions; not even an exception's name/message is trusted.
+  try{
+    if(env?.NEXIUP_DIAGNOSTICS!=='true')return;
+    let position={};const stack=errorField(error,'stack');
+    if(typeof stack==='string'){
+      const match=stack.slice(0,12000).match(/^\s+at [^\n]*\bworker\.js:(\d{1,7}):(\d{1,7})(?:\)|\s|$)/m);
+      if(match)position={line:Number(match[1]),column:Number(match[2])};
+    }
+    console.error(JSON.stringify({event:'nexiup_runtime_error',version:VERSION,...metadata,...position}));
+  }catch{} // A failed logger/property access must not crash the recovery path.
+}
+function requestFailure(error,request,env,r) {
+  try{
+    const fault=knownFaults.has(error)?error:null;
+    const databaseFailure=r?.databaseFailed(error)===true;
+    const status=fault?fault.status:databaseFailure?503:500;
+    const code=fault?fault.code:databaseFailure?'d1_unavailable':'internal_error';
+    const headers=fault?.retry?{'Retry-After':String(fault.retry)}:{};
+    if(status<500)return json({error:code},status,headers);
+    let requestId='unavailable';try{requestId=randomId();}catch{}
+    logRuntimeError(error,env,{request_id:requestId,surface:request?requestSurface(request):'scheduled',code});
+    return json({error:code,version:VERSION,request_id:requestId},status,{...headers,'X-NexiUP-Request-ID':requestId});
+  }catch{
+    // Last-resort response contains literals only. Platform/module-startup faults
+    // and resource exhaustion remain outside a JavaScript request error boundary.
+    return new Response('{"error":"internal_error"}',{status:500,headers:{...noStore,'Content-Type':'application/json'}});
+  }
+}
+async function readDeadline(operation,ms=8000) {
+  let timer;
+  try{return await Promise.race([operation,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Fault('d1_read_timeout',503)),ms);})]);}
+  finally{clearTimeout(timer);}
+}
+
+/** Counts statements, not just batch round trips. Leaves room below D1's Free 50.
+ * Binding acquisition is lazy: liveness and the public login/setup shell need no D1.
+ * Only SELECT reads have a deadline. Never time out/retry an in-flight mutation.
+ */
+function runtime(env = {}, execution = {}) {
+  let raw, queries=0, external=0, sawDatabaseFailure=false, lastDatabaseError;
+  const database=()=>{
+    if(raw)return raw;
+    let candidate;
+    try{candidate=env.DB;}catch{throw new Fault('d1_binding_unavailable',503);}
+    if(candidate==null)throw new Fault('d1_binding_missing',503);
+    try{if(typeof candidate!=='object'||typeof candidate.prepare!=='function'||typeof candidate.batch!=='function')throw new Fault('d1_binding_invalid',503);}
+    catch(error){if(knownFaults.has(error))throw error;throw new Fault('d1_binding_invalid',503);}
+    raw=candidate;return raw;
+  };
+  const dbError=error=>{
+    sawDatabaseFailure=true;lastDatabaseError=error;
+    if(errorMessage(error).includes('insufficient_balance'))throw new Fault('insufficient_balance',409);
+    throw error;
+  };
+  const reserve=n=>{if(queries+n>46)throw new Fault('query_budget',503,60);queries+=n;};
+  const st=(sql,args)=>database().prepare(sql).bind(...args);
+  const read=(sql,operation)=>/^\s*SELECT\b/i.test(sql)?readDeadline(operation):operation;
   return {
-    env, raw, execution,
-    get queries() { return queries; }, get external() { return external; },
-    first(sql, ...args) { reserve(1); return st(sql, args).first(); },
-    async all(sql, ...args) { reserve(1); return (await st(sql, args).all()).results || []; },
-    run(sql, ...args) { reserve(1); return st(sql, args).run().catch(dbError); },
-    batch(items) { reserve(items.length); return raw.batch(items.map(([sql, ...args]) => st(sql, args))).catch(dbError); },
+    env, execution, get raw(){return database();},
+    get queries(){return queries;},get external(){return external;},
+    databaseFailed(error){return sawDatabaseFailure&&lastDatabaseError===error;},
+    async first(sql,...args){reserve(1);try{return await read(sql,st(sql,args).first());}catch(error){return dbError(error);}},
+    async all(sql,...args){reserve(1);try{return (await read(sql,st(sql,args).all())).results||[];}catch(error){return dbError(error);}},
+    async run(sql,...args){reserve(1);try{return await st(sql,args).run();}catch(error){return dbError(error);}},
+    async batch(items){reserve(items.length);try{return await database().batch(items.map(([sql,...args])=>st(sql,args)));}catch(error){return dbError(error);}},
     async fetch(url, init = {}, timeout = 8000, maxBytes = 1024 * 1024) {
       if (++external > 40) throw new Fault('fetch_budget', 503, 60);
       // Disallow redirects so Authorization never follows a node to a different origin.
@@ -230,6 +306,7 @@ const MIGRATIONS = [
 async function migrate(r) {
   await r.run(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`);
   const v = (await r.first('SELECT MAX(version) AS version FROM schema_version'))?.version || 0;
+  if(v>MIGRATIONS.length)fail('schema_newer_than_worker',503);
   if (v < MIGRATIONS.length) {
     await r.batch([...MIGRATIONS[v].map(sql => [sql]), ['INSERT OR IGNORE INTO schema_version(version,applied_at) VALUES(?,?)', v + 1, now()]]);
     return { ready:false, version:v + 1, remaining:MIGRATIONS.length - v - 1 };
@@ -242,8 +319,9 @@ async function ready(r) {
   if (initialized.has(r.raw)) return;
   try {
     const row = await r.first("SELECT MAX(version) AS version,(SELECT COUNT(*) FROM nx_settings WHERE key IN ('bot','test','panel','proxy')) AS seeded,(SELECT COUNT(*) FROM nx_profiles) AS profiles FROM schema_version");
+    if(row?.version>MIGRATIONS.length)fail('schema_newer_than_worker',503);
     if (row?.version === MIGRATIONS.length && row.seeded === 4 && row.profiles > 0) { initialized.set(r.raw, true); return; }
-  } catch {}
+  } catch(error) { if(!schemaMissing(error))throw error; }
   fail('run_setup_migrations', 503);
 }
 function cache(r) { if (!caches.has(r.raw)) caches.set(r.raw, new Map()); return caches.get(r.raw); }
@@ -2664,12 +2742,16 @@ function dashboard() {
   `);
 }
 function setupPage() {
-  return page('Setup',`<header><div><span class="badge">NexiUP / Setup</span><h1>راه‌اندازی امن / Secure setup</h1></div></header>
-  <div class="card"><p>در نقش hub/all از SETUP_KEY و در نقش node از MASTER_KEY استفاده کنید. راز در URL ذخیره نمی‌شود. / Use SETUP_KEY for hub/all, MASTER_KEY for node. No secrets in URLs.</p><label for="key">Setup secret</label><input type="password" id="key" autocomplete="off"><label for="origin">Main HTTPS Worker origin (hub/all)</label><input id="origin" placeholder="https://…"><button id="migrate">۱. آماده‌سازی D1 / Initialize D1</button><button id="configure">۲. دامنه اصلی / Save main origin</button><button id="hook">۳. فعال‌سازی ربات / Register webhook</button><p>Then configure nodes, plans and test settings in Telegram /admin. Enable one cron: <code>* * * * *</code>.</p><button class="secondary" id="op">صدور بعدی / Process next operation</button><button class="secondary" id="job">تحویل بعدی / Process next delivery</button><pre id="result" role="status"></pre></div>`,String.raw`
+  return page('Setup',`<header><div><span class="badge">NexiUP ${VERSION} / Setup</span><h1>راه‌اندازی و بررسی دیپلوی / Setup &amp; deployment checks</h1></div><a href="/admin">پنل مدیریت / Admin</a></header>
+  <div class="card"><p>برای راه‌اندازی در hub/all از SETUP_KEY و در node از MASTER_KEY استفاده کنید. WEB_ADMIN_KEY نیز فقط برای بررسی خواندنی پذیرفته می‌شود. کد برنامه راز را در URL، localStorage یا sessionStorage نمی‌گذارد. / Use SETUP_KEY for hub/all or MASTER_KEY for node. WEB_ADMIN_KEY is also accepted for read-only checks, not setup writes.</p>
+  <label for="key">کلید مدیر / Owner secret</label><input type="password" id="key" autocomplete="off" maxlength="256">
+  <button id="diagnostics">بررسی دیپلوی، بدون تغییر داده / Check deployment — read only</button><p>این بررسی پیش از مهاجرت هم کار می‌کند: binding، اتصال D1، نسخهٔ ساختار و حداقل تنظیمات؛ بدون تماس با ربات، نود یا ProxyIP. پاسخ health فقط زنده‌بودن handler را نشان می‌دهد، نه آمادگی سرویس. / Works before migrations. No Telegram/node/proxy requests. Health is liveness, not readiness.</p>
+  <label for="origin">Main HTTPS Worker origin (hub/all)</label><input id="origin" placeholder="https://…"><button id="migrate">۱. آماده‌سازی D1 / Initialize D1</button><button id="configure">۲. دامنه اصلی / Save main origin</button><button id="hook">۳. فعال‌سازی ربات / Register webhook</button><p>مدیریت کامل در <a href="/admin">/admin</a>؛ مدیریت تلگرام نیز حفظ شده است. / Full web panel: <a href="/admin">/admin</a>. Enable one hub/all cron: <code>* * * * *</code>.</p><button class="secondary" id="op">صدور بعدی / Process next operation</button><button class="secondary" id="job">تحویل بعدی / Process next delivery</button><pre id="result" role="status" dir="ltr"></pre></div>`,String.raw`
   const $=id=>document.getElementById(id);let busy=false;
-  async function call(action,extra={}){const res=await fetch('/setup',{method:'POST',headers:{Authorization:'Bearer '+$('key').value,'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});const d=await res.json();$('result').textContent=JSON.stringify(d,null,2);if(!res.ok)throw Error(d.error||res.status);return d;}
+  async function call(action,extra={}){const res=await fetch('/setup',{method:'POST',headers:{Authorization:'Bearer '+$('key').value,'Content-Type':'application/json'},body:JSON.stringify({action,...extra})});const d=await res.json();$('result').textContent=JSON.stringify(d,null,2);if(!res.ok&&action!=='diagnostics')throw Error(JSON.stringify(d,null,2));return d;}
   async function safe(fn){if(busy)return;busy=true;try{await fn();}catch(e){$('result').textContent=e.message;}finally{busy=false;}}
-  $('migrate').onclick=()=>safe(async()=>{for(let i=0;i<6;i++){const d=await call('migrate');if(d.ready)break;}});
+  $('diagnostics').onclick=()=>safe(()=>call('diagnostics'));
+  $('migrate').onclick=()=>safe(async()=>{for(let i=0;i<12;i++){const d=await call('migrate');if(d.ready)return;}throw Error('Migration is not ready; run read-only deployment checks. / آماده‌سازی کامل نشده؛ بررسی خواندنی دیپلوی را اجرا کنید.');});
   $('configure').onclick=()=>safe(()=>call('configure',{main_url:$('origin').value}));
   $('hook').onclick=()=>safe(()=>call('webhook'));
   $('op').onclick=()=>safe(()=>call('tick',{kind:'op'}));$('job').onclick=()=>safe(()=>call('tick',{kind:'job'}));
@@ -2738,12 +2820,62 @@ async function importLegacy(r,kind,after=0) {
   }
   fail('legacy_import_kind_users_or_services');
 }
+// Owner-only, read-only deployment preflight. It works before migrations and
+// deliberately makes no Telegram, node, proxy, DNS or external network request.
+async function deploymentDiagnostics(r) {
+  const role=getRole(r.env),requestId=randomId(),started=now();let expired=false;
+  const checks={owner_key:strongSecret(r.env.WEB_ADMIN_KEY!==undefined?r.env.WEB_ADMIN_KEY:role==='node'?r.env.MASTER_KEY:r.env.SETUP_KEY)};
+  if(role!=='hub')checks['master_key']=strongSecret(r.env.MASTER_KEY);
+  if(role!=='node'){
+    checks['bot_token_present']=typeof r.env.BOT_TOKEN==='string'&&r.env.BOT_TOKEN.length>0;
+    checks['owner_ids']=ownerIds(r.env).length>0;
+    checks['callback_secret']=strongSecret(r.env.CALLBACK_SECRET);
+    checks['webhook_secret']=typeof r.env.WEBHOOK_SECRET==='string'&&/^[A-Za-z0-9_-]{32,256}$/.test(r.env.WEBHOOK_SECRET);
+  }
+  const report={project:'NexiUP',version:VERSION,request_id:requestId,role,read_only:true,ready:false,external_connectivity_tested:false,
+    configuration:{complete:Object.values(checks).every(Boolean),checks},database:{binding:'DB',status:'not_checked'},
+    schema:{status:'not_checked',version:0,expected:MIGRATIONS.length,missing_tables:[]},statements:0,elapsed_ms:0};
+  try{
+    // Whole preflight plus individual SELECTs are bounded. A late read cannot
+    // commit data; there is intentionally no blanket deadline on mutations.
+    await readDeadline((async()=>{
+      await r.first('SELECT 1 AS connected');if(expired)return;report.database.status='ok';
+      const tables=['schema_version',...MIGRATIONS.flat().map(sql=>sql.match(/^CREATE TABLE IF NOT EXISTS (\w+)/)?.[1]).filter(Boolean)];
+      const existing=new Set((await r.all(`SELECT name FROM sqlite_master WHERE type='table' AND name IN (${tables.map(()=>'?').join(',')})`,...tables)).map(row=>row.name));if(expired)return;
+      report.schema.missing_tables=tables.filter(name=>!existing.has(name));
+      if(existing.has('schema_version')){
+        const row=await r.first('SELECT MAX(version) AS version FROM schema_version');if(expired)return;
+        if(row?.version!=null&&(!Number.isSafeInteger(row.version)||row.version<0)){report.schema.status='invalid_version';return;}
+        report.schema.version=row?.version||0;
+      }
+      if(report.schema.version>MIGRATIONS.length){report.schema.status='newer_than_worker';return;}
+      if(report.schema.version<MIGRATIONS.length){report.schema.status='migration_required';return;}
+      if(report.schema.missing_tables.length){report.schema.status='incomplete';return;}
+      const seed=await r.first("SELECT (SELECT COUNT(*) FROM nx_settings WHERE key IN ('bot','test','panel','proxy')) AS seeded,(SELECT COUNT(*) FROM nx_profiles) AS profiles");if(expired)return;
+      report.schema.status=seed?.seeded===4&&seed.profiles>0?'ready':'seed_required';
+      report.ready=report.schema.status==='ready'&&report.configuration.complete;
+    })());
+  }catch(error){
+    const code=knownFaults.has(error)?codeOf(error):'d1_unavailable';
+    report.database.status=code;report.ready=false;
+    logRuntimeError(error,r.env,{request_id:requestId,surface:'diagnostics',code});
+  }finally{expired=true;}
+  report.statements=r.queries;report.elapsed_ms=now()-started;
+  return json(report,report.ready?200:503,{'X-NexiUP-Request-ID':requestId});
+}
+
 async function setup(r,request) {
   if(request.method==='GET')return setupPage();if(request.method!=='POST')fail('method_not_allowed',405);
+  webOrigin(request);
   const role=getRole(r.env),secret=role==='node'?r.env.MASTER_KEY:r.env.SETUP_KEY;
-  if(!strongSecret(secret))fail('setup_secret_required_min_32',503);
-  if(!constantTimeEqual(request.headers.get('authorization'),'Bearer '+secret))fail('unauthorized',401);
-  const b=await bodyJson(request);
+  const diagnosticSecret=r.env.WEB_ADMIN_KEY!==undefined?r.env.WEB_ADMIN_KEY:secret,header=request.headers.get('authorization');
+  const setupOwner=strongSecret(secret)&&constantTimeEqual(header,'Bearer '+secret);
+  const webOwner=strongSecret(diagnosticSecret)&&constantTimeEqual(header,'Bearer '+diagnosticSecret);
+  if(!setupOwner&&!webOwner){if(!strongSecret(secret)&&!strongSecret(diagnosticSecret))fail('setup_secret_required_min_32',503);fail('unauthorized',401);}
+  const b=await bodyJson(request);if(!isObject(b))fail('invalid_json');
+  if(b.action==='diagnostics')return await deploymentDiagnostics(r);
+  // A dedicated web key grants read-only diagnostics here, not setup mutations.
+  if(!setupOwner)fail('unauthorized',401);
   if(b.action==='migrate')return json(await migrate(r));
   await ready(r);
   if(b.action==='configure'){
@@ -2773,15 +2905,20 @@ async function setup(r,request) {
 }
 export default {
   async fetch(request,env,execution) {
-    const r=runtime(env,execution);
+    let r;
     try{
-      const role=getRole(env),url=new URL(request.url);
+      env=env??{};r=runtime(env,execution);const url=new URL(request.url);
       // Never serve a credential-entry form over plaintext HTTP. API writes still fail closed.
       if(url.protocol==='http:'&&['GET','HEAD'].includes(request.method)&&(url.pathname==='/admin'||url.pathname==='/admin/'||url.pathname==='/setup'||url.pathname.endsWith('/dash'))){url.protocol='https:';url.port='';return new Response(null,{status:308,headers:{...noStore,Location:url.toString()}});}
-      if(url.pathname==='/health')return json({project:'NexiUP',version:VERSION,role});
+      if(url.pathname==='/health'){
+        let role='invalid';try{role=getRole(env);}catch{}
+        return json({project:'NexiUP',version:VERSION,role,status:'alive',database_checked:false});
+      }
+      if(url.pathname==='/'&&request.method==='GET'&&!request.headers.get('upgrade'))return camouflage();
       if((url.pathname==='/admin'||url.pathname==='/admin/')&&request.method==='GET'&&!url.searchParams.has('sub'))return adminPage();
       if(url.pathname.startsWith('/admin/web-api/'))return await webApi(r,request,url);
       if(url.pathname==='/setup')return await setup(r,request);
+      const role=getRole(env);
       if(url.pathname==='/webhook'){
         if(role==='node'||request.method!=='POST')fail('not_found',404);
         return await webhook(r,request);
@@ -2801,11 +2938,13 @@ export default {
         if(url.pathname===`/${panel.api_route}`&&request.method==='GET')return await serveNodeSubscription(r,url,request,panel);
       }
       return camouflage();
-    }catch(e){return json({error:codeOf(e)},e instanceof Fault?e.status:500,e.retry?{'Retry-After':String(e.retry)}:{});}
+    }catch(error){return requestFailure(error,request,env,r);}
   },
   async scheduled(event,env,execution) {
-    const work=scheduled(runtime(env,execution),event).catch(()=>{}); // Never log tokens, URLs, receipts or configs.
-    execution.waitUntil(work);
+    let r;
+    const work=(async()=>{try{r=runtime(env??{},execution);await scheduled(r,event);}catch(error){requestFailure(error,null,env,r);}})();
+    try{if(execution&&typeof execution.waitUntil==='function')execution.waitUntil(work);else await work;}
+    catch(error){requestFailure(error,null,env,r);await work;}
   }
 };
 
@@ -2819,7 +2958,7 @@ function adminPage() {
     </section>
     <div id="app-shell" class="app-shell" hidden>
       <button id="nav-backdrop" class="nav-backdrop" aria-label="Close menu" data-action="menu"></button>
-      <aside class="sidebar" id="sidebar"><a class="wordmark" href="#overview"><span class="brand-mark">N</span><span dir="ltr">Nexi<span class="accent">UP</span></span><span class="version-tag">2.1</span></a><div class="workspace"><span class="workspace-icon">W</span><div><strong data-i18n="workspace">فضای مدیریت شما</strong><span id="workspace-role">Workers + D1</span></div><span class="workspace-dot"></span></div><nav id="navigation" aria-label="Navigation"></nav><div class="sidebar-bottom"><div class="private-note"><span>◈</span><div><strong data-i18n="independent">مستقل، در اختیار شما</strong><small data-i18n="noExternalAssets">بدون فایل یا رابط کاربری بیرونی</small></div></div><button class="account" data-action="logout"><span class="avatar">N</span><span><strong data-i18n="owner">مدیر سیستم</strong><small data-i18n="signOut">خروج از نشست امن</small></span><span class="logout-arrow">↗</span></button></div></aside>
+      <aside class="sidebar" id="sidebar"><a class="wordmark" href="#overview"><span class="brand-mark">N</span><span dir="ltr">Nexi<span class="accent">UP</span></span><span class="version-tag">${VERSION}</span></a><div class="workspace"><span class="workspace-icon">W</span><div><strong data-i18n="workspace">فضای مدیریت شما</strong><span id="workspace-role">Workers + D1</span></div><span class="workspace-dot"></span></div><nav id="navigation" aria-label="Navigation"></nav><div class="sidebar-bottom"><div class="private-note"><span>◈</span><div><strong data-i18n="independent">مستقل، در اختیار شما</strong><small data-i18n="noExternalAssets">بدون فایل یا رابط کاربری بیرونی</small></div></div><button class="account" data-action="logout"><span class="avatar">N</span><span><strong data-i18n="owner">مدیر سیستم</strong><small data-i18n="signOut">خروج از نشست امن</small></span><span class="logout-arrow">↗</span></button></div></aside>
       <div class="main-shell"><header class="topbar"><div class="breadcrumbs"><button class="icon-button mobile-menu" data-action="menu" aria-label="Menu" aria-expanded="false" aria-controls="sidebar">☰</button><span data-i18n="controlCenter">مرکز کنترل</span><span class="slash">/</span><strong id="breadcrumb"></strong></div><div class="top-actions"><span class="secure-status"><span></span><span data-i18n="secureSession">نشست امن</span></span><button class="language-button" data-action="language" id="language-toggle">EN</button><span class="avatar small">N</span></div></header>
       <div id="preview-banner" class="preview-banner" hidden data-i18n="previewNotice">پیش‌نمایش محلی با داده‌های ساختگی؛ تست شبکه و تماس با سرویس‌های واقعی در این پیش‌نمایش غیرفعال است.</div>
       <main class="content"><div class="page-heading"><div><div class="tiny-label" id="section-label">WORKSPACE OVERVIEW</div><h1 id="page-title"></h1><p id="page-subtitle" class="muted"></p></div><div id="page-actions" class="actions"></div></div><div id="page-content" aria-live="polite"></div><footer class="page-footer"><span>NexiUP <span id="app-version">${VERSION}</span> · MIT / Font OFL</span><span data-i18n="footerNote">داده‌ها در D1 شما · نتیجهٔ تست، تضمین اتصال نیست</span></footer></main></div>
@@ -2941,6 +3080,7 @@ const ADMIN_SCRIPT = String.raw`
     const $=id=>document.getElementById(id);
     const E=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const L={
+      d1_binding_missing:['binding دیتابیس با نام DB در این دیپلوی در دسترس نیست. /setup را بررسی کنید.','D1 binding DB is absent in this deployment. Open /setup for checks.'],d1_binding_invalid:['binding با نام DB از نوع D1 معتبر نیست.','The DB binding is not a valid D1 binding.'],d1_binding_unavailable:['خواندن binding دیتابیس ناموفق بود. بررسی دیپلوی را اجرا کنید.','The D1 binding could not be acquired. Run deployment checks.'],d1_unavailable:['دسترسی به D1 ناموفق بود؛ این خطا لزوماً با مهاجرت حل نمی‌شود.','D1 access failed; this is not necessarily a migration issue.'],d1_read_timeout:['مهلت خواندن D1 تمام شد. بررسی خواندنی /setup را اجرا کنید.','D1 read deadline exceeded. Run the read-only /setup checks.'],schema_newer_than_worker:['نسخهٔ دیتابیس جدیدتر از Worker است؛ دیتابیس را پاک نکنید.','Database schema is newer than this Worker. Do not delete the database.'],
       loginTitle:['یک نمای روشن از تمام شبکه‌تان.','A clear view of your entire network.'],loginIntro:['مدیریت نودها، اشتراک‌ها و مسیرهای اتصال، در یک پنل مستقل و امن.','Nodes, subscriptions and connection routes. One private, self-hosted control center.'],welcome:['به مرکز کنترل خوش آمدید','Welcome to your control center'],loginHint:['با کلید مدیریت Worker وارد شوید. این کلید در مرورگر ذخیره نمی‌شود.','Sign in with your Worker admin key. The key is never saved in your browser.'],adminKey:['کلید مدیریت','Admin key'],signIn:['ورود امن به پنل','Sign in securely'],keyHelp:['WEB_ADMIN_KEY؛ اگر تعریف نشده: SETUP_KEY برای hub/all و MASTER_KEY برای node. حداقل ۳۲ کاراکتر تصادفی.','Use WEB_ADMIN_KEY. If unset: SETUP_KEY for hub/all, MASTER_KEY for node. At least 32 random characters.'],setupLink:['آماده‌سازی و مهاجرت دیتابیس ↗','Database setup and migrations ↗'],privacyNote:['کوکی HttpOnly · نشست ۳۰ دقیقه‌ای · بدون سرویس تحلیلی بیرونی','HttpOnly cookie · 30-minute session · No third-party analytics'],workspace:['فضای مدیریت شما','Your workspace'],independent:['مستقل، در اختیار شما','Independent. Yours.'],noExternalAssets:['بدون فایل یا رابط بیرونی','No external UI or assets'],owner:['مدیر سیستم','Workspace owner'],signOut:['خروج از نشست امن','Sign out securely'],controlCenter:['مرکز کنترل','Control center'],secureSession:['نشست امن','Secure session'],footerNote:['داده‌ها در D1 شما · نتیجهٔ تست، تضمین اتصال نیست','Your data in your D1 · A test is not a connectivity guarantee'],previewNotice:['پیش‌نمایش محلی با داده‌های ساختگی؛ تست شبکه و تماس با سرویس‌های واقعی در این پیش‌نمایش غیرفعال است.','Local preview with synthetic data. Live network tests and real external services are disabled in this preview.'],
       not_configured:['آماده نشده','Not configured'],master_key_required_min_32:['برای سرویس‌دهی نود، MASTER_KEY معتبر را در Worker Secrets تعریف کنید.','Set a valid MASTER_KEY in Worker Secrets before serving the node.'],autoPreview:['ورود این نسخه نمایشی خودکار است.','Sign-in is automatic in this disposable preview.'],operationsTitle:['صف و بازیابی صدور','Provisioning queue and recovery'],legacyTools:['پشتیبان و ابزار قدیمی نود','Node backup and legacy tools'],legacyHint:['ابزار قبلی حفظ شده است؛ برای پشتیبان و بازیابی نود، ورود جداگانه با MASTER_KEY لازم است.','The existing tools are preserved. Node backup/restore requires a separate MASTER_KEY sign-in.'],overview:['نمای کلی','Overview'],proxies:['کاوش ProxyIP','ProxyIP explorer'],nodes:['نودها','Nodes'],profiles:['پروفایل اپراتورها','Operator profiles'],orders:['سفارش‌ها','Orders'],subscriptions:['اشتراک‌ها','Subscriptions'],customers:['مشتری‌ها','Customers'],nodeUsers:['حساب‌های نود','Node accounts'],catalog:['کاتالوگ فروش','Sales catalog'],settings:['تنظیمات','Settings'],audit:['گزارش فعالیت','Activity log'],network:['شبکه و اتصال','NETWORK & CONNECTIVITY'],business:['فروش و مشترکین','SALES & SUBSCRIBERS'],management:['مدیریت','MANAGEMENT'],live:['زنده','LIVE'],overviewSub:['وضعیت کسب‌وکار و زیرساخت خود را در یک نگاه ببینید.','Your business and infrastructure, in one place.'],proxiesSub:['کاندیدهای کشورهای مختلف را پیدا کنید، زنده بسنجید و آگاهانه اعمال کنید.','Explore countries, run live diagnostics and apply a fallback deliberately.'],nodesSub:['نودهای فروش و تست؛ بدون تغییر دامنهٔ اشتراک مشتری.','Sales and test nodes, without changing your customer subscription domain.'],profilesSub:['تنظیمات مستقل اپراتورها، با اعتبارسنجی و بازگشت نسخه.','Isolated operator settings, with validation and revision rollback.'],ordersSub:['رسیدها را بررسی کنید؛ تأیید، صدور حساب را در صف قرار می‌دهد.','Review receipts. Approval queues automatic account provisioning.'],subscriptionsSub:['اشتراک‌های ماندگار، وضعیت و کنترل حساب روی نود.','Durable entitlements and account controls on the assigned node.'],customersSub:['کاربران تلگرام، کیف پول و وضعیت دسترسی.','Telegram customers, wallet balances and account access.'],nodeUsersSub:['هویت‌ها و سهمیه‌های واقعیِ همین نود.','Actual account identities and quotas on this node.'],catalogSub:['پلن‌ها، پرداخت‌ها و محتوای ربات؛ ویرایش بدون انتشار دوباره.','Plans, payments and bot content. Edit without redeploying.'],settingsSub:['تنظیمات اعتبارسنجی‌شده و ماندگار در دیتابیس شما.','Validated configuration, persisted in your database.'],auditSub:['رویدادهای مدیریتی، بدون نمایش کلیدهای محرمانه.','Administrative events, without exposing secret keys.'],
       refresh:['تازه‌سازی','Refresh'],add:['افزودن','Add new'],edit:['ویرایش','Edit'],save:['ذخیره و اعمال','Save and apply'],validate:['اعتبارسنجی','Validate'],cancel:['انصراف','Cancel'],close:['بستن','Close'],confirm:['تأیید','Confirm'],search:['جست‌وجو','Search'],searchHint:['نام، شناسه یا شماره کاربر…','Name, ID or user number…'],all:['همه','All'],next:['بعدی','Next'],previous:['قبلی','Previous'],loading:['در حال دریافت اطلاعات…','Loading your data…'],emptyTitle:['هنوز داده‌ای در این بخش نیست','Nothing here yet'],emptyText:['اولین مورد را اضافه کنید یا فیلتر جست‌وجو را تغییر دهید.','Add your first item, or adjust your search filters.'],error:['خطا','Error'],saved:['تغییرات ذخیره شد.','Changes saved.'],completed:['انجام شد.','Done.'],notTested:['تست نشده','Not tested'],noLimit:['بدون سقف تنظیم‌شده','No configured cap'],never:['ثبت نشده','Not recorded'],ago:['آخرین بررسی','Last checked'],details:['جزئیات','Details'],actions:['عملیات','Actions'],name:['نام','Name'],status:['وضعیت','Status'],id:['شناسه','ID'],date:['تاریخ','Date'],country:['کشور','Country'],amount:['مبلغ','Amount'],customer:['مشتری','Customer'],plan:['پلن','Plan'],node:['نود','Node'],expiry:['انقضا','Expiry'],traffic:['مصرف','Usage'],balance:['موجودی کیف پول','Wallet balance'],enabled:['فعال','Enabled'],disabled:['غیرفعال','Disabled'],active:['فعال','Active'],paused:['متوقف','Paused'],expired:['منقضی','Expired'],limited:['سهمیه تمام','Quota reached'],deleted:['حذف‌شده','Deleted'],pending:['در انتظار بررسی','Awaiting review'],pending_payment:['در انتظار پرداخت','Awaiting payment'],processing:['در حال صدور','Provisioning'],done:['تکمیل‌شده','Completed'],rejected:['ردشده','Rejected'],cancelled:['لغوشده','Cancelled'],queued:['در صف','Queued'],creating:['در حال ساخت','Creating'],ready:['آمادهٔ بازیابی','Ready to recover'],failed:['ناموفق','Failed'],reconcile:['نیاز به بررسی','Needs reconciliation'],banned:['مسدود','Banned'],sale:['فروش','Sale'],test:['تست','Test'],renew:['تمدید','Renewal'],topup:['شارژ کیف پول','Wallet top-up'],
@@ -2968,13 +3108,15 @@ const ADMIN_SCRIPT = String.raw`
     function translate(){document.documentElement.lang=S.lang;document.documentElement.dir=S.lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-i18n]').forEach(el=>el.textContent=t(el.dataset.i18n));$('language-toggle').textContent=S.lang==='fa'?'EN':'فا';document.title='NexiUP · '+t('controlCenter');}
     function navigation(){let out='';for(const [v,key,i,group]of navs){if(!available(v))continue;if(group)out+='<div class="nav-label">'+t(group)+'</div>';out+='<button class="nav-item '+(S.view===v?'active':'')+'" data-action="navigate" data-view="'+v+'" '+(S.view===v?'aria-current="page"':'')+'>'+icon(i)+'<span>'+t(key)+'</span>'+(v==='proxies'?'<span class="nav-pill">IP</span>':'')+'</button>';}$('navigation').innerHTML=out;$('workspace-role').textContent=(S.session?.role||'').toUpperCase()+' / WORKERS + D1';}
     function toast(text,kind=''){const parent=$('toasts');while(parent.children.length>=3)parent.firstElementChild.remove();const node=document.createElement('div');node.className='toast '+kind;const message=document.createElement('span');message.textContent=text;const close=document.createElement('button');close.type='button';close.className='toast-dismiss';close.textContent='×';close.setAttribute('aria-label',t('close'));close.addEventListener('click',()=>node.remove());node.append(message,close);parent.appendChild(node);setTimeout(()=>node.remove(),7000);}
-    function showError(error){if(error?.name==='AbortError')return;toast(t(error.code||error.message||'error')+(error.retry?' · '+num(error.retry)+'s':''),'error');}
+    function uiError(error){return t(error.code||error.message||'error')+(error.reference?' · ID: '+error.reference:'')+(error.version?' · v'+error.version:'');}
+    function apiError(data,response){const error=new Error(data.error||'request_failed');error.code=data.error;error.retry=Number(response.headers.get('retry-after')||0);error.reference=/^[a-f0-9]{24}$/.test(data.request_id)?data.request_id:'';error.version=/^\d+\.\d+\.\d+$/.test(data.version)?data.version:'';return error;}
+    function showError(error){if(error?.name==='AbortError')return;toast(uiError(error)+(error.retry?' · '+num(error.retry)+'s':''),'error');}
     async function api(path,options={}){
       const headers={Accept:'application/json'};if(options.body!==undefined)headers['Content-Type']='application/json';
       if(S.session?.csrf)headers['X-NexiUP-CSRF']=S.session.csrf;if(options.nonce)headers['Idempotency-Key']=options.nonce;
       const response=await fetch('/admin/web-api/'+path,{method:options.method||'GET',headers,credentials:'same-origin',cache:'no-store',signal:options.signal,...(options.body!==undefined?{body:JSON.stringify(options.body)}:{})});
       const data=await response.json().catch(()=>({error:'invalid_response'}));
-      if(!response.ok){const error=new Error(data.error||'request_failed');error.code=data.error;error.retry=Number(response.headers.get('retry-after')||0);if(response.status===401&&S.session)showLogin();throw error;}return data;
+      if(!response.ok){if(response.status===401&&S.session)showLogin();throw apiError(data,response);}return data;
     }
     function showLogin(){S.session=null;S.seq++;stopBatch();S.items=[];S.proxy=null;S.selected.clear();S.editor=null;S.modalAction=null;S.importStopped=true;closeModal();$('page-content').innerHTML='';$('modal-body').innerHTML='';$('app-shell').hidden=true;$('login-screen').hidden=false;$('admin-key').value='';document.body.classList.remove('nav-open');}
     function openApp(data){S.session=data;S.preview=!!data.preview;$('app-version').textContent=data.version;$('preview-banner').hidden=!S.preview;$('app-shell').hidden=false;$('login-screen').hidden=true;translate();if(data.auto_login)$('preview-banner').textContent+=' '+t('autoPreview');go((location.hash||'#overview').slice(1));}
@@ -2991,7 +3133,7 @@ const ADMIN_SCRIPT = String.raw`
         else if(S.view==='profiles'){const d=await api('catalog?kind=profiles');if(seq!==S.seq)return;S.items=d.items;content=profilesView(d.items);}
         else{const path=['catalog','nodes'].includes(S.view)?'catalog?'+query({kind:S.view==='nodes'?'nodes':S.kind}):S.view+'?'+query();const d=await api(path);if(seq!==S.seq)return;S.items=d.items;S.next=d.next;content=listView(d.items);}
         if(seq!==S.seq||!S.session)return;$('page-content').innerHTML=content;
-      }catch(error){if(seq===S.seq&&S.session)$('page-content').innerHTML='<section class="card">'+empty(t(error.code||error.message),'refresh')+'</section>';throw error;}
+      }catch(error){if(seq===S.seq&&S.session)$('page-content').innerHTML='<section class="card">'+empty(uiError(error),'refresh')+'</section>';throw error;}
     }
     function empty(text=t('emptyText'),action=''){return '<div class="empty"><div class="empty-icon">'+icon(S.view==='proxies'?'globe':'box')+'</div><h3>'+t('emptyTitle')+'</h3><p>'+E(text)+'</p>'+(action?btn(action,action==='refresh'?t('refresh'):t('add'),'plus','subtle'):'')+'</div>';}
     function table(heads,rows,cls=''){return '<div class="table-wrap"><table class="'+cls+'"><thead><tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows+'</tbody></table></div>';}
@@ -3111,13 +3253,13 @@ const ADMIN_SCRIPT = String.raw`
     }catch(error){showError(error);}});
     document.addEventListener('input',event=>{if(event.target.matches('#editor-form [data-field],#raw-editor')){if(S.editor)S.editor.valid=null;if($('save-editor'))$('save-editor').disabled=true;if($('validation-box'))$('validation-box').hidden=true;}});
     document.addEventListener('submit',async event=>{event.preventDefault();try{
-      if(event.target.id==='login-form'){const button=$('login-button');button.disabled=true;let key=$('admin-key').value;try{for(let i=0;i<10;i++){$('login-status').textContent=t('loading');const response=await fetch('/admin/web-api/login',{method:'POST',headers:{Authorization:'Bearer '+key},credentials:'same-origin',cache:'no-store'});const data=await response.json();if(!response.ok)throw Object.assign(new Error(data.error),{code:data.error});if(data.migration_required){$('login-status').textContent='D1 · '+data.version;continue;}key='';$('admin-key').value='';$('login-status').textContent='';openApp(data);return;}throw new Error('migration_not_finished');}finally{key='';$('admin-key').value='';button.disabled=false;}}
+      if(event.target.id==='login-form'){const button=$('login-button');button.disabled=true;let key=$('admin-key').value;try{for(let i=0;i<10;i++){$('login-status').textContent=t('loading');const response=await fetch('/admin/web-api/login',{method:'POST',headers:{Authorization:'Bearer '+key},credentials:'same-origin',cache:'no-store'});const data=await response.json();if(!response.ok)throw apiError(data,response);if(data.migration_required){$('login-status').textContent='D1 · '+data.version;continue;}key='';$('admin-key').value='';$('login-status').textContent='';openApp(data);return;}throw new Error('migration_not_finished');}finally{key='';$('admin-key').value='';button.disabled=false;}}
       if(event.target.id==='search-form'){stopBatch();S.filter.q=$('search-q').value;S.filter.cursor='';S.filter.history=[];await load();updateSelection();}
-    }catch(error){if(event.target.id==='login-form')$('login-status').textContent=t(error.code||error.message);else showError(error);}});
+    }catch(error){if(event.target.id==='login-form')$('login-status').textContent=uiError(error);else showError(error);}});
     $('modal').addEventListener('cancel',()=>{S.importStopped=true;S.modalAction=null;});
     document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!$('modal').open){document.body.classList.remove('nav-open');document.querySelector('.mobile-menu').setAttribute('aria-expanded','false');}});
     window.addEventListener('hashchange',()=>{if(S.session)go(location.hash.slice(1));});
-    translate();api('session').then(openApp).catch(error=>{showLogin();if(error.code!=='unauthorized')$('login-status').textContent=t(error.code||error.message);});
+    translate();api('session').then(openApp).catch(error=>{showLogin();if(error.code!=='unauthorized')$('login-status').textContent=uiError(error);});
   })();
 `;
 

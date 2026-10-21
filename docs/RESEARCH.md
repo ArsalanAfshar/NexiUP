@@ -1,6 +1,6 @@
 # Implementation evidence and original-bot inventory
 
-Research dates: **2026-10-20 UTC / 2026-10-21 Asia/Tehran**, including the 2.1 web/ProxyIP follow-up. Source inspection is not a network deployment test.
+Research dates: **2026-10-20 UTC / 2026-10-21 Asia/Tehran**, including the 2.1 web/ProxyIP and 2.1.1 deployed-error follow-ups. Source inspection is not a network deployment test.
 
 ## Original bot: `77e421f59f1c354c3a2cf507568790e0d7902a29`
 
@@ -86,3 +86,15 @@ The current Workers size rule was also rechecked against the official GitHub doc
 - The Arabic variable font from `@fontsource-variable/vazirmatn` **5.3.0** was inspected under complete SIL OFL-1.1 terms and embedded unmodified (46,308 bytes). Full notices and byte hash are in `THIRD_PARTY.md`; no font is loaded from a CDN.
 
 آزمون مرورگر، API و سوکت ساختگی را نباید معادل تأیید IP عمومی، کشور خروجی واقعی، اینترنت ایران یا ظرفیت Free دانست. فهرست/سرویس بیرونی فقط با رضایت صریح و بدون دریافت کد رابط استفاده می‌شود؛ هیچ داده کشور/IP به‌عنوان فهرست سالمِ تولید در مخزن قرار نگرفته است.
+
+## 2.1.1 follow-up: deployed Cloudflare 1101
+
+- User reports both installation methods produce hosted 1101 despite local success and checked configuration. **No hosted exception/stack or authenticated Cloudflare account access was available.** A local passing run cannot identify the production cause; no deployment was performed.
+- Official errors reference: [pinned source, `4849d13f34154c2dbc55f69eb72fa82fedea7dd3`](https://github.com/cloudflare/cloudflare-docs/blob/4849d13f34154c2dbc55f69eb72fa82fedea7dd3/src/content/docs/workers/observability/errors.mdx). 1101 covers uncaught JavaScript exceptions and “The script will never generate a response”; unresolved promises and WebSocket close handling are documented cases. CPU-limit failures are separately listed as 1102. Size alone is not a diagnosis of this report.
+- Official live logs: [pinned source, `7e3642576493205c05f68870b24b26fce42fbcee`](https://github.com/cloudflare/cloudflare-docs/blob/7e3642576493205c05f68870b24b26fce42fbcee/src/content/docs/workers/observability/logs/real-time-logs.mdx). Dashboard path is Workers & Pages → Worker → Logs → Live; Wrangler tail is an alternative. Full events can contain request URL/headers, so only the fixed-field NexiUP record should be shared, not a raw tail dump. High-volume live logs can be sampled.
+- Concrete 2.1.0 source findings: `runtime(env,execution)` preceded the request `try` and eagerly acquired `env.DB`; the outer catch read `e.retry` without guarding null/undefined or property access. Before-patch tests reproduced uncaught entry failures, including a secondary error inside the catch. They model failure modes, **not the actual account's exception**.
+- `ready()` swallowed all D1 errors as missing migrations. It now distinguishes genuine missing application tables from operational failures, while an owner-only read-only preflight checks current tables/version/seeding without trusting the warm readiness cache. Five migration groups and existing financial/provisioning semantics are unchanged.
+- Implementation choices: lazy D1 binding, protected request/scheduled initialization, private fault identity, safe 5xx references, no raw error reflection, metadata-only opt-in logs, eight-second read/preflight deadlines and no new timeout/retry on mutating statements. Module/platform failures and already-sent responses cannot be caught/replaced by this boundary.
+- The raw source and Wrangler bundle were both run directly in local workerd with native D1 for `hub`, `node`, `all`, missing/wrong bindings, real owner authentication and explicit null/undefined/getter/unresolved-read injection. These are local native checks, not a Cloudflare deployment or proof the user's 1101 is resolved. Results and hashes are in [VERIFICATION.md](VERIFICATION.md).
+
+**فارسی:** گزارش 1101 واقعی را با موفقیت لوکال رد نکردیم. مسیرهای مهارنشدهٔ کد بازتولید و اصلاح شدند، ولی بدون استثنای حساب تولید، علت قطعی اعلام نمی‌شود. گزارش خواندنی مالک و لاگ امنِ اختیاری اضافه شده‌اند؛ هیچ لاگ خام/راز/URL منتشر یا دیتابیس حذف نمی‌شود. خواندن زمان‌دار است، نه نوشتن مالیِ در جریان؛ raw و bundle در workerd محلی آزموده شده‌اند، نه اینترنت/حساب واقعی.

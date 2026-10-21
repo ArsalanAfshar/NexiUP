@@ -6,6 +6,8 @@ workers_dev = true
 
 [vars]
 ROLE = "all"
+# Optional sanitized application error events; leave off except during investigation.
+NEXIUP_DIAGNOSTICS = "false"
 # Set ADMIN_IDS in the dashboard. Never put secrets here.
 
 [[d1_databases]]

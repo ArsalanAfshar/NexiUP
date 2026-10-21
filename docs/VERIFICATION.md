@@ -1,6 +1,6 @@
 # Verification record / گزارش راستی‌آزمایی
 
-Version **2.1.0**. Date: **2026-10-21 Asia/Tehran** (execution began 2026-10-20 UTC). Repository: `ArsalanAfshar/NexiUP`. Working branch: `arena/4a2b629b-nexiup`.
+Version **2.1.1**. Date: **2026-10-21 Asia/Tehran**. Repository: `ArsalanAfshar/NexiUP`. Working branch: `arena/4a2b629b-nexiup`.
 
 This records reproducible **local** checks, not production deployment, an independent security audit, Cloudflare Free capacity certification or Iranian-network success.
 
@@ -12,10 +12,12 @@ This records reproducible **local** checks, not production deployment, an indepe
 |---|---|
 | `node --check worker.js` | PASS, Node **22.22.3** |
 | `npm run typecheck` | PASS: TypeScript **5.9.3**, Workers types **5.20261019.1**, `checkJs` on the production file |
-| `npm run verify` / built-in tests | **98 passed, 0 failed, 0 skipped**; runner approximately **5.5 s**; no runtime npm dependencies |
+| `npm run verify` / built-in tests | **124 passed, 0 failed, 0 skipped**; runner approximately **5.5 s**; no runtime npm dependencies |
+| Deployment/error regressions | **26 passed** in `tests/deployment.test.mjs`; original uncaught binding/null/undefined paths failed before the patch |
+| Raw + bundled deployment matrix | **18 native local scenarios passed**, directly in workerd without a dev/auto-login proxy; missing/wrong bindings, fresh D1, real owner login/API for `all`, `hub`, `node`, and injected getter/null/undefined/unresolved-read faults |
 | Single-Worker native smoke | PASS: five migration groups **plus final seeding**, native local D1 triggers, authenticated account creation, three Xray variants, embedded dashboard, **5,603-byte PNG QR**, exact additive usage |
 | Two-Worker native smoke | PASS: separate hub/node D1, panel-key-authenticated HTTP burst, exactly one remote account, three main-domain variants, PNG + metadata to a Telegram fake |
-| Real-browser integration | PASS: Playwright **1.64.1**, Chromium **153.0.0**, local HTTPS/workerd/D1; synthetic fixture data; desktop/mobile and FA/EN workflows |
+| Real-browser integration | PASS: Playwright **1.64.1**, Chromium **153.0.0**, local HTTPS/workerd/D1; synthetic fixture data; read-only setup diagnostics, safe failure-reference display, desktop/mobile and FA/EN workflows |
 | Independent QR scan | jsQR **1.4.0** recovered exact synthetic subscription URLs from current PNG pixels; built-in independent PNG reader also passes |
 | Wrangler dry-run | PASS, Wrangler **4.151.3**; **no deployment** |
 | Legal notices | NexiUP MIT, Nayuki MIT and Vazirmatn **OFL-1.1** notices all present in source and optional bundle; complete font notice also served inside the UI CSS |
@@ -25,30 +27,53 @@ Default tests use Node built-ins (`node:test`, SQLite, assertions, crypto, strea
 
 مجموعه پیش‌فرض از ابزارهای داخلی Node و SQLite واقعی استفاده می‌کند؛ پاسخ موفق از پیش‌ساخته جای تراکنش و شرط SQL را نگرفته است. شبکه/سوکت ساختگی مشخص‌اند؛ تست native نیز workerd واقعی محلی دارد. فایل تولید فقط handler Worker را export می‌کند.
 
+## Reported hosted 1101 — evidence boundaries / مرز شواهد خطای 1101
+
+The user reports that both installation methods fail on Cloudflare while local execution succeeds, after checking configuration. **This account-specific failure has not been reproduced or diagnosed from hosted logs.** No authenticated Cloudflare connector/deployment access or hosted exception/stack was available. This report therefore does not mark the real incident resolved.
+
+Before editing 2.1.0 (`ff1509e`), regression calls reproduced an escaping `env.DB` getter failure before the request `try`, and `null`/`undefined` rejection causing the catch itself to throw while reading `retry`. These are concrete source defects but **not evidence of which exception occurred in the user's account**. Source inspection did not establish a module-startup defect. Official 1101/error and live-log references are pinned in [RESEARCH.md](RESEARCH.md).
+
+### What the 2.1.1 tests establish
+
+- Public `/`, `/health`, `/admin`, `/setup` do not acquire D1. Missing environment/binding, invalid binding types and throwing accessors are covered. Health explicitly says `database_checked:false`, not database readiness.
+- Request and scheduled initialization stay inside recovery boundaries. Null, undefined, strings, numbers, hostile getters/prototypes and a failing logger cannot turn error handling into another unhandled exception. Only locally created faults are trusted; the last-resort response uses literals.
+- Failed D1 calls produce safe structured failure codes; a real missing application table still requires setup, but an unrelated D1 outage does not get mislabeled as a missing migration. Newer schema versions are not silently downgraded.
+- Read-only `POST /setup` diagnostics authenticates before D1 access, requires HTTPS/acceptable Origin, accepts the role's setup/master owner or a dedicated web owner for this read-only action only, and neither migrates nor calls external services. It checks tables/version/seeding even when the regular readiness cache was already warm. Four guarded statements and **zero writes** were measured on a ready fixture.
+- Individual SELECT reads and the overall preflight have eight-second deadlines. The native matrix waits through a **real eight-second unresolved read** in each artifact. Late reads cannot start further preflight queries after the overall deadline. D1 execution itself is not canceled. Tests verify that writes/batches get **no new deadline or automatic retry**.
+- Error references appear in safe JSON/headers and the web login. Application logging defaults off; explicit opt-in emits fixed categories, version, random request ID and numeric source positions only. Tests inject secret-looking messages, paths and URLs and verify none appear in responses/logs. Full provider log envelopes may still contain request information; do not share them unredacted.
+- The raw source and optional Wrangler bundle both pass missing/wrong-binding cases and fresh **native D1** authenticated initialization/login/API flows in `all`, `hub`, `node`. Fault injection is explicitly test-only; the actual application handler is tested without the synthetic preview/automatic login wrapper.
+- All **five migration groups** compare identically with 2.1.0. No schema migration, identity reset, database deletion or key rotation was added. QR code/license and the embedded font bytes are unchanged. The previous 98 business/web/proxy regressions still pass, alongside 26 new ones.
+
+The full browser suite also reran successfully with real local HTTPS/workerd/D1 and real cookie authentication. It exercises the new setup diagnostic button without writes. The preview deliberately lacks a Telegram bot token, and the report correctly remains `ready:false` despite a ready database. A separately marked, client-only injected 503 verifies reference display and password-field clearing; the real login and existing business workflows then run normally.
+
+**Cannot establish here:** that the affected hostname serves this artifact, the hosted exception's cause, platform/module-startup behavior on that account, actual D1/Workers quotas/CPU, or Telegram/node/ISP success. A JavaScript catch cannot intercept module-instantiation/platform termination or replace an already-sent streaming/WebSocket response. If the new `/health` also remains a Cloudflare 1101 page, owner-side version/route and platform exception evidence is needed; do not keep deleting/recreating D1.
+
+**فارسی:** این گزارش، رفع قطعی حادثهٔ حساب واقعی نیست. خطاهای مهارنشدهٔ مشخص در کد قبلی بازتولید و اصلاح شدند؛ هر دو خروجی خام/bundle و هر سه نقش در workerd محلی با D1 واقعی آزموده شدند. بررسی خواندنی، چهار دستور و صفر نوشتن دارد و موفقیت تلگرام/نود را جعل نمی‌کند. ۱۲۴ تست، مرورگر و smokeهای native موفق‌اند؛ همه پنج گروه مهاجرت، هویت حساب‌ها و داده‌ها دست‌نخورده‌اند. برای تشخیص حادثهٔ میزبان، نشان نسخه و گزارش امن لازم است، نه تکرار نصب یا حذف دیتابیس.
+
 ## Exact size measurements / اندازه دقیق
 
 Node `gzipSync` defaults (gzip level 6); 1 KiB = 1,024 bytes:
 
 | Artifact | Uncompressed | gzip |
 |---|---:|---:|
-| Paste-ready `worker.js` | **485,234 bytes** (473.86 KiB) | **175,243 bytes** (171.14 KiB) |
-| Optional Wrangler upload module | **517,219 bytes** (505.10 KiB) | **174,449 bytes** (170.36 KiB) |
+| Paste-ready `worker.js` | **496,735 bytes** (485.09 KiB) | **179,541 bytes** (175.33 KiB) |
+| Optional Wrangler upload module | **530,359 bytes** (517.93 KiB) | **178,285 bytes** (174.11 KiB) |
 
 ```text
 wrangler 4.151.3
-Total Upload: 505.10 KiB / gzip: 170.36 KiB
+Total Upload: 517.93 KiB / gzip: 174.11 KiB
 --dry-run: exiting now.
 ```
 
-Current documented Workers Free size limit is **64 MiB uncompressed (67,108,864 bytes)**, with **no compressed-size limit**. This bundle is **0.77%** of that uncompressed ceiling. Being below the size cap does not prove CPU/memory/D1/traffic feasibility. Source needs no build; bundling is optional. An unmodified 46,308-byte Arabic variable font is embedded as a data URI and accounts for part of the size increase; it causes no external font request.
+Current documented Workers Free size limit is **64 MiB uncompressed (67,108,864 bytes)**, with **no compressed-size limit**. This bundle is **0.79%** of that uncompressed ceiling. Being below the size cap does not prove CPU/memory/D1/traffic feasibility. Source needs no build; bundling is optional. An unmodified 46,308-byte Arabic variable font is embedded as a data URI and accounts for part of the size increase; it causes no external font request.
 
-سقف مستند Free، **۶۴ MiB غیرفشرده** و بدون سقف اندازه فشرده است. bundle حدود **۰٫۷۷٪** آن است؛ این اندازه به‌معنی رعایت CPU/D1 یا تضمین رایگان‌ماندن نیست. فونت فارسی ۴۶٬۳۰۸بایتی داخل فایل است و دانلود بیرونی ندارد.
+سقف مستند Free، **۶۴ MiB غیرفشرده** و بدون سقف اندازه فشرده است. bundle حدود **۰٫۷۹٪** آن است؛ این اندازه به‌معنی رعایت CPU/D1 یا تضمین رایگان‌ماندن نیست. فونت فارسی ۴۶٬۳۰۸بایتی داخل فایل است و دانلود بیرونی ندارد.
 
 SHA-256:
 
 ```text
-worker.js       4c8065fac0c31362889e5d011108c0e2b126eb197954b4fcd101f61cd765de1a
-Wrangler module 8d11e1a3e1e859c7b20dcae8ac9b98ef82d7c01f48c828c4431a144b146549b0
+worker.js       b2e2a7048522248a6769e6039893d907dfd4ad59df58c809fc1629322661ee30
+Wrangler module 186f44064e4e10b6aae68efc6a298b47ff3afd254865981ef83754383128cf57
 ```
 
 Size rule evidence: [official limits](https://developers.cloudflare.com/workers/platform/limits/#worker-size), and [pinned official source](https://github.com/cloudflare/cloudflare-docs/blob/da69fa833be0a8dc9d9ed6d9429c8ee0c4efbd8e/src/content/docs/workers/platform/limits.mdx). Other limits/source pins are in [RESEARCH.md](RESEARCH.md).
@@ -59,11 +84,12 @@ Measured by the runtime's own statement guard in SQLite fixtures:
 
 | Operation fixture | D1 statements | External fetches |
 |---|---:|---:|
+| Owner deployment preflight, initialized database | **4** | **0** (also **0 writes**) |
 | Complete 20-row import helper | **9** | 0 |
 | Apply four endpoints to local fallback | **11** | 0 |
 | Remote account issuance with four bases, ProxyIP defaults and five configured owners | **23** | **4** |
 
-The first two exclude HTTP session/CSRF entry checks; all are below the runtime guard of **46 statements**, itself below D1's 50. They are bounded regression fixtures, **not an exhaustive worst-case proof**. They do not measure billed rows/index writes or hosted CPU. Catalog summaries may scan up to 2,000 records. Default diagnostics budget is 500 attempts/day, but import frequency, the rest of the bot and other account Workers share Free quotas. There are still no per-frame tunnel writes.
+The import/application helper rows exclude HTTP session/CSRF entry checks; all are below the runtime guard of **46 statements**, itself below D1's 50. They are bounded regression fixtures, **not an exhaustive worst-case proof**. They do not measure billed rows/index writes or hosted CPU. Catalog summaries may scan up to 2,000 records. The default ProxyIP probe budget is 500 attempts/day, but import frequency, the rest of the bot and other account Workers share Free quotas. There are still no per-frame tunnel writes.
 
 این شمارش، دستور SQL است، نه تعداد ردیف قابل‌صورتحساب یا اندازه‌گیری CPU تولید. نقش ورود HTTP، ایندکس، دفعات واردسازی و بار دیگر حساب باید جدا پایش شوند؛ هیچ تضمین ظرفیت Free از این جدول نتیجه نمی‌شود.
 
@@ -136,6 +162,8 @@ Optional local native/browser tooling (not needed for dashboard deployment):
 npm install --no-save --package-lock=false miniflare@5.20261019.1-beta wrangler@4.151.3 playwright@1.64.1
 node tests/workerd-smoke.mjs
 node tests/remote-workerd-smoke.mjs
+WRANGLER_SEND_METRICS=false npx wrangler deploy --dry-run --outdir .work/bundle
+node tests/deployment-workerd-smoke.mjs worker.js .work/bundle/worker.js
 npx playwright install --with-deps chromium
 node tests/browser-smoke.mjs
 WRANGLER_SEND_METRICS=false npx wrangler deploy --dry-run
@@ -159,7 +187,7 @@ PREVIEW_AUTO_LOGIN=1 node tests/preview.mjs
 
 ## Not verified / تأییدنشده
 
-1. **No real Cloudflare deployment or Telegram delivery.** Bot token/webhook, actual rendering/delivery/rate limits and customer workflows need an owner-controlled staging deployment. Dry-run does not verify live bindings/secrets exist.
+1. **No confirmation that the reported hosted 1101 is resolved; no real Cloudflare deployment or Telegram delivery.** Bot token/webhook, actual rendering/delivery/rate limits and customer workflows need an owner-controlled staging deployment. Dry-run does not verify live bindings/secrets exist.
 2. **No live public catalog or checker validation.** Preset URLs are source-observed only. Availability, content size, data freshness, global country coverage, permission to use candidates and provider terms are unverified. Both integrations remain off by default.
 3. **No live ProxyIP TCP/TLS reachability, exit-country or ISP proof.** Socket/HTTP trace fixtures check implementation boundaries; source labels and Worker colo are not exit proof. No real Iranian network, Irancell/Hamrah client route, ECH DNS resolution or arbitrary-service compatibility was tested.
 4. **No actual stock-Nahan server integration or client GUI import.** Pinned source/API/schema and representative fixtures do not certify arbitrary Nahan commits or Android/iOS/Windows client versions. Inspected v2rayNG URI import ignores `cs`; full Xray JSON remains the lossless fallback.
@@ -173,6 +201,7 @@ PREVIEW_AUTO_LOGIN=1 node tests/preview.mjs
 
 ## Final review / بازبینی نهایی
 
+- Production source SHA/version and the raw/bundled matrix are recorded above; both READMEs include in-place upgrade and safe hosted-diagnostic instructions. Main remains the original code, so obtain this release from the working branch, not by assuming the default branch changed.
 - No owner tutorial UUID/host/proxy/card examples were installed as production values. Synthetic TEST-NET records appear only in test/preview fixtures with an explicit banner.
 - Control secrets remain environment-backed; web sessions are hashed in D1. Node keys cannot equal configured web/setup/master secrets. No query-string control credentials or raw receipt/configuration/error-body logging was introduced.
 - New tests and forms use shared business validators. Operator defaults and legacy routes survive migration; no previously issued account identity is duplicated for operator variants.

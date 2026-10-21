@@ -74,7 +74,7 @@ test('Trojan formats use passwords, not VLESS-only fields', () => {
 });
 test('schema migrations are lazy, versioned, repeatable and under D1 statement limit', async t => {
   const x=await f(t);assert.equal(x.DB.row('SELECT MAX(version) AS n FROM schema_version').n,MIGRATIONS.length);
-  const r=x.r();const out=await migrate(r);assert.equal(out.ready,true);assert.ok(r.queries<46);assert.equal(VERSION,'2.1.0');
+  const r=x.r();const out=await migrate(r);assert.equal(out.ready,true);assert.ok(r.queries<46);assert.equal(VERSION,'2.1.1');
 });
 test('profile activation/rollback revisions are monotonic; invalid save leaves current intact', async t => {
   const x=await f(t);const p=clonedProfiles()[0];p.fingerprint='chrome';

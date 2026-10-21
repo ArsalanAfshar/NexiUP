@@ -1,4 +1,4 @@
-# NexiUP · 2.1
+# NexiUP · 2.1.1
 
 **[راهنمای کامل فارسی](README_FA.md)** · [Research and original-bot inventory](docs/RESEARCH.md) · [Verification](docs/VERIFICATION.md) · [Licenses](THIRD_PARTY.md)
 
@@ -9,6 +9,35 @@ A single-file Telegram subscription-sales hub and **original Nahan-users-API-com
 > **Deployment status:** implemented and locally tested, not certified for production. No live Telegram bot, Cloudflare account deployment, Iranian mobile connection, or Android/iOS/Windows GUI import was tested here. Free-plan feasibility depends on measured CPU, requests, D1 writes and actual workload—not just script size.
 
 > **New in 2.1:** fix JavaScript type diagnostics; open `/admin` for secure web administration and country-organized ProxyIP import/testing/apply/rollback. Recommended web secret: `WEB_ADMIN_KEY`; fallback rules and first login are in §8. No pre-verified production IP inventory is bundled.
+
+> **Get the correct file:** this revision is on branch **`arena/4a2b629b-nexiup`**: [open its `worker.js`](https://github.com/ArsalanAfshar/NexiUP/blob/arena/4a2b629b-nexiup/worker.js). **Main is intentionally unchanged.** Do not assume a default-branch download contains 2.1.1; check the file/version and the deployed `/health` marker.
+
+## Deployed error 1101 — patch 2.1.1
+
+A successful local run does **not** rule out a hosted failure. Cloudflare documents 1101 for uncaught JavaScript exceptions and requests that cannot finish; it is not automatically evidence of a missing migration. The account-specific cause reported for 2.1.0 has **not** been established: no hosted exception, stack or deployment access was available.
+
+This patch fixes reproduced uncaught paths: runtime/binding initialization before the request's `try`, and an error handler that itself threw on `null`/`undefined` rejections. Binding access is now lazy and validated, unknown rejections are handled safely, and D1 service failures are no longer all labelled as missing migrations.
+
+**Upgrade in place; do not recreate the database:**
+
+1. Back up D1, replace the **entire** `worker.js` with **2.1.1**, and deploy the active Worker version. Keep the existing D1 binding, secrets, routes and identities. All five migration groups are unchanged from 2.1.0.
+2. Open **`/health`** on the affected Worker origin. Expect `version:"2.1.1"`, `status:"alive"`, `database_checked:false` and `X-NexiUP-Version: 2.1.1`. This checks the active handler, **not** D1, Telegram, node connectivity or production readiness. `/`, `/admin` and `/setup` also open without touching D1.
+3. Open **`/setup` → Check deployment — read only**. Use `SETUP_KEY` on hub/all or `MASTER_KEY` on node; a configured `WEB_ADMIN_KEY` also grants this **read-only** action, not the setup mutation actions. The same authenticated API is `POST /setup` with `{"action":"diagnostics"}`. No keys belong in the URL.
+
+| Result | Meaning / safe next action |
+|---|---|
+| `d1_binding_missing` / `d1_binding_invalid` / `d1_binding_unavailable` | Binding `DB` is absent, not D1-shaped, or could not be acquired. Inspect the **active deployment's** binding; a text variable containing a database ID is not a D1 binding. |
+| `d1_unavailable` | A D1 operation failed. Do not assume migrations or database recreation will fix it. Check service/account status and the safe error reference. |
+| `d1_read_timeout` | A read/preflight exceeded its 8-second wall-time deadline. It is not a successful readiness check. |
+| Schema `migration_required` / `seed_required` | Use authenticated **Initialize D1** against the existing database until `ready:true`; never delete it to initialize. |
+| Schema `incomplete` / `newer_than_worker` / `invalid_version` | Existing schema metadata is inconsistent or belongs to another Worker version. Preserve/export data and review the matching code/schema; do not reset or blindly downgrade. |
+| Configuration check `false` | Only that minimum environment check failed. Even all checks passing does **not** verify external credentials, Telegram, routing, proxies or ISP reachability. |
+
+The preflight runs at most **four guarded SELECT statements**, bypasses the readiness cache, has an **8-second total deadline**, and performs **no writes, seeding or external requests**. SELECT reads have individual 8-second deadlines too; these do not cancel D1 execution. Mutating operations are deliberately **not** wrapped in a blanket timeout or automatic retry that could report failure while a payment/provisioning write later commits.
+
+**If an error remains:** 5xx errors caught by the request boundary include safe `version`/`request_id` fields and matching headers; the web login displays the reference. Temporarily set the text variable **`NEXIUP_DIAGNOSTICS="true"`**, deploy it, then use **Workers & Pages → Worker → Logs → Live** and reproduce the failing request. NexiUP emits only `event:"nexiup_runtime_error"`, version, random request ID, fixed surface/error code and optional numeric `worker.js` line/column. It never logs the exception message/full stack, URL, headers, keys, SQL, receipt or configuration. Handled errors may have an `ok` invocation outcome despite an HTTP 5xx; find the console record, not only the uncaught-exception filter. Turn the flag off afterwards. Full Cloudflare live-log events can still contain request URLs/headers: **do not publish the whole event**; extract only the safe NexiUP record. Line numbers refer to the deployed source or bundle.
+
+If even `/health` still returns Cloudflare's 1101 page without the new version marker, investigate the active version/route and the platform's exception; JavaScript request catches cannot intercept module-instantiation/platform failures or replace a response already sent. Keep only the exception type, numeric source position, time and Ray ID when sharing platform evidence; redact URLs, credentials and payloads. This patch is not a claim that the unidentified hosted incident has been resolved. [Evidence and reproduced checks](docs/VERIFICATION.md).
 
 ## 1. What is included
 
@@ -78,7 +107,7 @@ Verified **2026-10-20** against live official documentation. Workers limits were
 | Internal-service subrequests | 1,000/invocation | Not a substitute for D1's stricter 50-query limit. |
 | D1 statements | 50/invocation | Runtime guard at 46, counting each batch statement; staged migrations and paginated jobs. Long tunnels close before exhausting their budget. |
 | Simultaneous outgoing connections | 6/invocation | Node attempts and Telegram deliveries are sequential; no large `Promise.all` fan-out. |
-| Script size | **64 MiB uncompressed; no compressed-size limit** | Dry-run bundle approximately **505 KiB**, gzip approximately **170 KiB**. The old 3 MB compressed estimate is no longer the published limit. Exact measurements: `docs/VERIFICATION.md`. |
+| Script size | **64 MiB uncompressed; no compressed-size limit** | Dry-run bundle approximately **518 KiB**, gzip approximately **174 KiB**. The old 3 MB compressed estimate is no longer the published limit. Exact measurements: `docs/VERIFICATION.md`. |
 | Startup | 1 second | No startup I/O; local workerd startup succeeded. Production startup timing not measured. |
 | Cron triggers | 5/account | One on the hub/all Worker; none required on nodes. |
 | Workers | 100/account | Registry does not bypass this or account-wide quotas. |
@@ -126,6 +155,7 @@ Wrangler is optional development tooling, not a runtime dependency. Disable its 
 | Name | Kind | Roles | Meaning |
 |---|---|---|---|
 | `DB` | D1 binding | All | The Worker's database. No `KV`, `IOT_DB`, R2, Queue or Durable Object binding is required. |
+| `NEXIUP_DIAGNOSTICS` | Optional text variable | All | Off by default (`"false"`). Exact text `"true"` enables sanitized application exception events; no raw error/URL/secret logging. Turn off after investigation. |
 | `ROLE` | Variable | All | `hub`, `node`, or `all` (default). |
 | `ADMIN_IDS` | Variable or Secret | hub/all | Comma-separated positive numeric **private-user** IDs; up to five recipients. Owner IDs cannot be removed by Telegram admins. |
 | `BOT_TOKEN` | Secret | hub/all | Token obtained from BotFather. |
@@ -439,7 +469,7 @@ One `* * * * *` cron partitions UTC minutes modulo six:
 
 This conservative default offers about **20 operation attempts and 20 delivery-job visits/hour**, not a high-volume sales guarantee. An operation can need multiple visits; one order can generate several admin/customer jobs. Queue latency can be minutes or longer. Protected `/setup` process-next controls can advance one operation/job per request; never run an unbounded cron loop to compensate. Measure CPU and queue depth before changing schedules/batch sizes.
 
-Diagnostics shows a D1 read wall-time check, webhook/main-origin match, pending Telegram updates and operation/delivery counts without echoing credentials or raw remote error text. `/health` is only a liveness/version route, not a database-capacity test.
+Operational diagnostics in the Telegram admin menu shows a D1 read wall-time check, webhook/main-origin match, pending Telegram updates and operation/delivery counts without echoing credentials or raw remote error text. `/health` is only a liveness/version route, not a database-capacity test.
 
 Usage menu queries optional Cloudflare GraphQL analytics for **account-wide UTC-day requests** against 100,000 and queues daily-deduplicated warnings at 70% and 90%. It labels adaptive/delayed data as an estimate. Without API credentials it says “not configured”, not “0 used”. Account limits include other projects. D1 row use must also be checked in the Cloudflare dashboard; this bot screen is not a D1 billing meter.
 
@@ -455,7 +485,9 @@ Choose customers/node from actual usage, concurrency, isolate count and daily wr
 
 ## 18. Upgrading and original-v1 cutover
 
-**2.0 → 2.1:** back up D1, replace the entire single Worker file, then run authenticated `/setup` initialization until **`ready:true`**, or sign in to `/admin`. Version five alone is not proof that final seeding completed. The additive migration preserves existing users, balances, orders, nodes, accounts and profiles; old operator values are not reset. Public/node paths fail closed until ready. The web API uses `/admin/web-api/` so a pre-existing node `api_route=admin` continues to work. Source/checker integrations remain off until explicit opt-in. Review the new owner-secret/session behavior before reopening traffic.
+**2.1.0 → 2.1.1:** replace code in place after a backup; there is **no new migration or data reset**. Keep the same bindings/secrets and check the active version at `/health`, then use read-only `/setup` deployment checks. Application error references and opt-in sanitized logs help distinguish runtime/binding/schema failures. The account-specific reported 1101 cause still requires hosted evidence.
+
+**2.0 → 2.1:** back up D1, replace the entire single Worker file, then run authenticated `/setup` initialization until **`ready:true`**, or sign in to `/admin`. Version five alone is not proof that final seeding completed. The additive migration preserves existing users, balances, orders, nodes, accounts and profiles; old operator values are not reset. Data-dependent public/node paths fail closed until ready; liveness and public bootstrap pages do not require D1. The web API uses `/admin/web-api/` so a pre-existing node `api_route=admin` continues to work. Source/checker integrations remain off until explicit opt-in. Review the new owner-secret/session behavior before reopening traffic.
 
 
 For v2 upgrades: private D1 export → review diff/licenses → paste updated complete `worker.js` → run protected `/setup` initialization → check health, one test issuance, QR/fallback, renewal, and cron. Do not rotate/delete keys or change the main domain unintentionally. For rollback restore the old code only when schema-compatible; otherwise restore a tested D1 snapshot too.
@@ -488,6 +520,7 @@ The node prevents common literal private-host targets, but this is not a replace
 
 | Symptom | Check / remedy |
 |---|---|
+| Cloudflare **1101** | See the 2.1.1 section at the top: verify active version, run read-only preflight, use safe error references/live exception evidence. Do not delete D1 or assume a passing local test clears the incident. |
 | Web login / `web_admin_secret_required_min_32` | Use HTTPS and the correct owner key; remove an accidentally empty `WEB_ADMIN_KEY` or set a strong one. Panel keys do not grant owner access. |
 | `csrf_failed` / `origin_forbidden` | Reopen the panel directly on its HTTPS origin and sign in again; check reverse-proxy Host/Origin handling. Do not disable CSRF. |
 | Source fetch failed / body too large | External fetch must be opted into; endpoint availability, response format and 1 MiB bound are not guaranteed. Use a smaller authorized import; the last catalog is retained. |
@@ -521,11 +554,13 @@ npm ci                   # optional development typings/compiler
 npm run verify           # syntax + checkJs/TypeScript + tests
 ```
 
-**98 tests pass** using Node's built-in test runner and a D1-shaped real-SQLite fake: conditional state transitions, wallet/coupon concurrency, per-user test slots and success-time cooldowns, API shapes, failover/quarantine, renewal/reset, webhook/admin authorization, profile versioning/encoding/formats, per-config fallback/429, PNG-pixel QR decoding and VLESS/Trojan stream fakes with no per-frame writes. No test framework/package installation is needed for this suite. The test-only loader exposes private helpers and stubs `cloudflare:sockets`; the deployable file exports only its Worker handler.
+**124 tests pass** using Node's built-in test runner and a D1-shaped real-SQLite fake: conditional state transitions, wallet/coupon concurrency, per-user test slots and success-time cooldowns, API shapes, failover/quarantine, renewal/reset, webhook/admin authorization, profile versioning/encoding/formats, per-config fallback/429, PNG-pixel QR decoding and VLESS/Trojan stream fakes with no per-frame writes. No test framework/package installation is needed for this suite. The test-only loader exposes private helpers and stubs `cloudflare:sockets`; the deployable file exports only its Worker handler.
+
+The additional `tests/deployment.test.mjs` covers 26 deployment/error regressions, including hostile/primitive rejections, lazy binding acquisition, authenticated read-only preflight, cache-bypassing schema checks, deadlines and mutation safety. `tests/deployment-workerd-smoke.mjs` passes **18 local native scenarios** across the raw source and Wrangler bundle, without a dev/auto-login proxy: missing/wrong bindings, fresh D1 and real login/API flows for all three roles, plus explicit fault injection and real 8-second unresolved-read recovery. These tests do **not** identify or certify the reported hosted incident.
 
 Optional `tests/workerd-smoke.mjs` ran on Miniflare **5.20261019.1-beta** / workerd: actual Worker startup, native local D1 migrations/triggers, authenticated panel creation, three Xray variants, HTML panel and PNG output passed. The optional **two-Worker** `tests/remote-workerd-smoke.mjs` also passed with separate native D1 databases: a hub made authenticated HTTP calls to the local node, provisioned one account, rendered three variants on its main domain, and sent PNG plus metadata to a Telegram fake. A separate jsQR **1.4.0** decode recovered the exact URL from PNG pixels. Wrangler **4.151.3** dry-run passed. Wrangler/Miniflare/jsQR/Playwright are optional development tools, not runtime dependencies. TypeScript 5.9.3 and Workers types 5.20261019.1 are pinned **devDependencies** for reproducible `checkJs`; the screenshot menu/QR type errors are fixed without disabling source checking.
 
-The optional **`tests/browser-smoke.mjs`** also passed in Chromium 153 against real local HTTPS/workerd/D1: secure cookie login/CSRF/logout, desktop/mobile RTL/LTR, validated plan/account creation, isolated profile changes/rollback, receipt/order workflows, queue filters, safe ProxyIP import/filter/apply/rollback and XSS escaping. There were no external asset requests or browser JS/CSP errors. Native probe-parser/socket tests use synthetic streams, not live relay or geography certification.
+The optional **`tests/browser-smoke.mjs`** also passed in Chromium 153 against real local HTTPS/workerd/D1: read-only deployment preflight, displayed safe failure references, secure cookie login/CSRF/logout, desktop/mobile RTL/LTR, validated plan/account creation, isolated profile changes/rollback, receipt/order workflows, queue filters, safe ProxyIP import/filter/apply/rollback and XSS escaping. There were no external asset requests or browser JS/CSP errors. Native probe-parser/socket tests use synthetic streams, not live relay or geography certification.
 
 See `docs/VERIFICATION.md` for measurements and the unverified list. No real receipts, credentials or illustrative owner UUID/hosts/proxy IPs were deployed or copied as defaults.
 
@@ -556,6 +591,7 @@ See `docs/VERIFICATION.md` for measurements and the unverified list. No real rec
 9. **Chosen repository handling:** the connected checkout is already `ArsalanAfshar/NexiUP` (public). Work stays on `arena/4a2b629b-nexiup`, not a new `nexiup` branch/repository. Main and existing visibility are unchanged; no credentials are committed.
 10. **Chosen for web compatibility/security:** an original owner-only bilingual panel at `/admin`, separate `/admin/web-api/` namespace, hashed short sessions and Origin/CSRF enforcement; existing custom node routes are preserved. Node master keys are never acquired or sent by a hub-side ProxyIP policy.
 11. **Chosen for honest diagnostics:** empty initial catalog; explicit off-by-default source/checker; claimed versus observed country; target/time-scoped TLS/trace evidence; TCP and provider reports cannot masquerade as verified routing. Local fallback affects inheriting accounts; remote policies affect future accounts only. The workflow is independently implemented, with no GPL/unlicensed UI copied.
-12. **Needs confirmation before production:** node/proxy geography and reachability, operator/client-version compatibility, bank/owner/prices/Terms, acceptable queue delay and quota lag, measured Free CPU/D1 capacity, exclusive stock-node writes, and completeness of any v1 data cutover. A literal upstream fork also needs a documented license grant.
+12. **Chosen for deployed failure handling:** public bootstrap/liveness is independent of D1; initialization is inside an awaited request boundary, unknown exceptions are never reflected, and only app-created faults are trusted. Preflight is owner-authenticated, read-only, cache-bypassing and bounded; error logging is opt-in and metadata-only. No blanket timeout/retry is added to in-flight mutations. Local fault reproduction is **not** proof of the reported hosted cause, and module/platform failures remain outside the boundary.
+13. **Needs confirmation before production:** node/proxy geography and reachability, operator/client-version compatibility, bank/owner/prices/Terms, acceptable queue delay and quota lag, measured Free CPU/D1 capacity, exclusive stock-node writes, and completeness of any v1 data cutover. A literal upstream fork also needs a documented license grant.
 
 NexiUP-owned code and the attributed embedded QR encoder are MIT. The embedded, unmodified Vazirmatn Arabic font is **SIL OFL-1.1**, with its full notice in `worker.js` and `docs/licenses/Vazirmatn-OFL.txt`. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md). Use must comply with Cloudflare Terms and applicable local law; educational use, **no warranty**.

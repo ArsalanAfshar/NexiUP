@@ -18,7 +18,21 @@ try{
   page.on('pageerror',e=>errors.push(e.message));
   page.on('console',m=>{if(m.type()==='error'&&!/Failed to load resource/.test(m.text()))errors.push(m.text());});
   page.on('request',r=>{const u=new URL(r.url());if(u.protocol==='https:'&&u.origin!==base)outside.push(u.origin);});
+  // New deployment preflight is usable without a session and performs no writes.
+  const auditBefore=(await preview.db.prepare('SELECT COUNT(*) AS n FROM nx_audit').first()).n;
+  await page.goto(base+'/setup');await page.fill('#key',preview.bindings.WEB_ADMIN_KEY);await page.click('#diagnostics');
+  await page.waitForFunction(()=>document.getElementById('result').textContent.includes('database'));
+  const diagnostic=JSON.parse(await page.locator('#result').textContent());assert.equal(diagnostic.read_only,true);assert.equal(diagnostic.database.status,'ok');assert.equal(diagnostic.schema.status,'ready');
+  assert.equal(diagnostic.ready,false);assert.equal(diagnostic.configuration.checks.bot_token_present,false); // Intentional preview, not a working Telegram deployment.
+  assert.equal((await preview.db.prepare('SELECT COUNT(*) AS n FROM nx_audit').first()).n,auditBefore);assert.ok(!JSON.stringify(diagnostic).includes(preview.bindings.WEB_ADMIN_KEY));
   await page.goto(base+'/admin');await page.waitForSelector('#login-screen:not([hidden])');await page.evaluate(()=>document.fonts.ready);
+  // Client-only synthetic failure verifies that a safe server reference survives
+  // translation and that the owner key is still erased on failed login.
+  const reference='f'.repeat(24);
+  await page.route('**/admin/web-api/login',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'d1_unavailable',version:diagnostic.version,request_id:reference})}));
+  await page.fill('#admin-key',preview.bindings.WEB_ADMIN_KEY);await page.click('#login-button');await page.waitForFunction(id=>document.getElementById('login-status').textContent.includes(id),reference);
+  assert.equal(await page.inputValue('#admin-key'),'');assert.ok((await page.locator('#login-status').textContent()).includes(diagnostic.version));
+  await page.unroute('**/admin/web-api/login');
   await page.screenshot({path:'.work/browser-login.png',fullPage:true,animations:'disabled'});
   assert.ok(await page.evaluate(()=>document.fonts.check('12px Vazirmatn','فارسی')));
   await page.fill('#admin-key',preview.bindings.WEB_ADMIN_KEY);await page.click('#login-button');await page.waitForSelector('.hero');
@@ -56,6 +70,6 @@ try{
   await page.click('[data-action="legacy-tools"]');await page.waitForSelector('#modal a[target="_blank"]');assert.equal(await page.locator('#modal a[target="_blank"]').getAttribute('href'),'/sync/dash');await page.click('#modal [data-action="close-modal"]');
   await page.setViewportSize({width:1440,height:1080});await page.click('[data-action="logout"]');await page.waitForSelector('#login-screen:not([hidden])');assert.equal((await context.cookies()).filter(c=>c.name==='__Host-nexiup-admin').length,0);res=await context.request.get(base+'/admin/web-api/overview');assert.equal(res.status(),401);
   assert.deepEqual(errors,[]);assert.deepEqual(outside,[]);
-  console.log('Browser smoke PASS: real HTTPS/HttpOnly session, CSRF, bilingual RTL/LTR, desktop/mobile, isolated profile edits/rollback, validated plan/account creation, order rejection, ProxyIP import/filter/apply/rollback, XSS escaping, logout.');
+  console.log('Browser smoke PASS: read-only deployment preflight, safe error-reference display, real HTTPS/HttpOnly session, CSRF, bilingual RTL/LTR, desktop/mobile, isolated profile edits/rollback, validated plan/account creation, order rejection, ProxyIP import/filter/apply/rollback, XSS escaping, logout.');
   console.log('No external asset requests or browser JavaScript/CSP errors. All displayed records were synthetic; no real ProxyIP was tested.');
 }finally{await browser?.close();await preview.close();await rm(directory,{recursive:true,force:true});}
