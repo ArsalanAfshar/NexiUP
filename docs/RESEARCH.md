@@ -98,3 +98,40 @@ The current Workers size rule was also rechecked against the official GitHub doc
 - The raw source and Wrangler bundle were both run directly in local workerd with native D1 for `hub`, `node`, `all`, missing/wrong bindings, real owner authentication and explicit null/undefined/getter/unresolved-read injection. These are local native checks, not a Cloudflare deployment or proof the user's 1101 is resolved. Results and hashes are in [VERIFICATION.md](VERIFICATION.md).
 
 **فارسی:** گزارش 1101 واقعی را با موفقیت لوکال رد نکردیم. مسیرهای مهارنشدهٔ کد بازتولید و اصلاح شدند، ولی بدون استثنای حساب تولید، علت قطعی اعلام نمی‌شود. گزارش خواندنی مالک و لاگ امنِ اختیاری اضافه شده‌اند؛ هیچ لاگ خام/راز/URL منتشر یا دیتابیس حذف نمی‌شود. خواندن زمان‌دار است، نه نوشتن مالیِ در جریان؛ raw و bundle در workerd محلی آزموده شده‌اند، نه اینترنت/حساب واقعی.
+
+## 2026-10-23 — uploaded Worker comparison and Mesh 3.0
+
+### Reference provenance and actual differences
+
+User attachment: `_worker (4).js`, **5,142,235 bytes / 33,144 lines**, SHA-256 **`1e84d11af0544654bf56a06fa833e77184a57193288a9ffccf62c031a9fb7d65`**. It was inspected as untrusted input, not executed or published. The final block comment is **4,827,384 bytes (~93.9%)**. It is non-executable padding, not an established remedy for 1101. No explicit license grant was found. No source/UI/TLS stack/dataset or padding from it was copied into NexiUP.
+
+| Observed item | Supplied file | Previous NexiUP 2.1.1 | Consequence / evidence boundary |
+|---|---|---|---|
+| Storage | No D1; management KV access is conditional | D1 for business/node state; public boot was made lazy in 2.1.1 | Fewer required bindings can change which paths fail. This alone does not diagnose the user's hosted exception. |
+| TCP acquisition | No static import; uses `request.fetcher.connect` inside a request-specific factory | Static documented `cloudflare:sockets` import, including hub role | Current Workers types expose `Request.fetcher`; local workerd reported both connector functions available, and the standard connector made a controlled local TCP connection. Absence of an import is not proven to cure 1101. Mesh manager has no TCP module; Mesh node imports the documented module after admission. |
+| Binary WebSocket input | Explicit `serverSock.binaryType = 'arraybuffer'` near line 1296 | Converted `event.data` with `new Uint8Array(...)` but did not select binaryType | **A concrete compatibility bug was reproduced in native workerd.** New dates deliver Blob by default, and naive conversion yields zero bytes. Both new node 3.0.0 and preserved legacy 2.1.2 explicitly select ArrayBuffer before accept. |
+| Close lifecycle | Explicit server-side close handling | Explicit closure already existed | Correct closing matters for pending WebSocket tasks; it was not the identified missing setting in this comparison. |
+| Management scope | Shared configured identity/remote-page/KV-oriented features, not this global multi-account D1 ledger | Legacy bot/provisioning/individual-node accounting | Mesh is an independent central ledger + stateless-node design, not a relabelled copy or a claim of all upstream features. |
+
+### Pinned compatibility evidence and reproduction
+
+- Official [WebSocket standard binary type](https://github.com/cloudflare/cloudflare-docs/blob/95acdad1252a1e5ad72d7522cc6b54adb68d4022/src/content/compatibility-flags/websocket-standard-binary-type.md): default switches to **Blob** on **2026-03-17**; explicit `binaryType='arraybuffer'` overrides it regardless of compatibility date, and the docs set it **before `accept()`**.
+- Official [workerd compatibility declaration](https://github.com/cloudflare/workerd/blob/d4969086a3b4eda91109bf7d05fb2c91200e4b53/src/workerd/io/compatibility-date.capnp), `websocketBinaryTypeDefault`: flag `websocket_standard_binary_type`, date `2026-03-17`; the Durable Object hibernatable callback exception does not apply to these ordinary Workers.
+- The primary [TCP API documentation](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/) recommends importing `connect` from `cloudflare:sockets`; `Request.fetcher` is also present in the installed official Workers types **5.20261019.1**. Do not mislabel its presence in the reference as proof that the standard module is broken.
+- `tests/websocket-compat-smoke.mjs` runs three real native cases: 2026-03-16 without an override → ArrayBuffer/3 bytes; 2026-03-17 without an override → Blob/0 bytes in naive conversion; 2026-10-20 with explicit override → ArrayBuffer/3 bytes.
+- During the new end-to-end test, before the correction, the node received **Blob**, opened **zero** manager connections/leases/TCP sockets and reached its handshake deadline. After the correction, the same modern compatibility date carried real WebSocket/TCP bytes. ArrayBuffer-only test fakes had hidden this difference; both legacy and Mesh fakes now default to Blob and assert the explicit property before accept.
+- `tests/legacy-websocket-smoke.mjs` independently verifies the preserved 2.1.2 transport with native WebSocket, D1 and local TCP: 12 upload and 12 download bytes persisted.
+
+### Nahan is a separate, still-unconfirmed hosted report
+
+GitHub main was rechecked at **`67c9a038da4b0812bc4c8b630a6144967d102880`**, version 3.0.4; no detected license grant. Its `_worker.js` **already sets `webSocket.binaryType = "arraybuffer"`** near line 7818. Therefore this discovered NexiUP defect must **not** be presented as the explanation for the user's Nahan failure. No hosted exception/stack/account access or Iranian-network test was available. Mesh does not call Nahan APIs or depend on its deployment.
+
+### Independent architecture decisions
+
+The manager alone owns `nx3_` tables, environment-backed owner/node secret references, sessions, accounts, allowed-node membership, usage epochs, monotonic per-node/day totals, permission leases, credit reservations, profile revisions and idempotent owner actions. New nodes have no D1/KV and no stored master key. One credential becomes usable on every permitted node through central admission; there is no unreliable multi-database account fan-out. A D1 transaction reserves against a **shared** total/day pool before forwarding; unused credits require an authenticated, sealed final report to be refunded. Unknown credits remain conservatively charged, never inferred as verified delivered bytes. Partial final chunks, stale epochs, lost responses, concurrent grants/refunds, UTC rollover, global connection admission and missing enforcement triggers have explicit tests.
+
+Owner pairing creates a challenge that the manager must actually observe from the node's authenticated ping; echoing HTTP 200/metadata cannot falsely qualify. Node authentication cannot administer/list accounts. No Authorization-following redirects, remote UI, auto-code deployment, default live proxy/UUID or per-frame D1 writes were added. The legacy bot/payment/usage system remains separate; there is no automatic billing/identity/URL migration. Trusted operator-run nodes, provider clocks, reconnect/reservation acceptance and measured production resource budgets are explicit assumptions, not hidden guarantees.
+
+Native raw/bundled tests use one manager and two real workerd nodes, native local D1 and actual WebSockets/TCP. Only the TCP destination is redirected by a **test-only adapter** to an owned sandbox echo server; no public relay, Cloudflare-hosted production account or ISP success is claimed. One node admits 6 bytes and another 14 against a shared 20-byte daily allowance; an extra byte/new TCP is refused. Complete results are in [MESH_VERIFICATION.md](MESH_VERIFICATION.md).
+
+**فارسی:** تفاوت واقعیِ دریافت Blob با ArrayBuffer در خود workerd بازتولید شد؛ فایل پیوست تنظیم درست را داشت و نسخهٔ قبلی NexiUP نداشت. نهان بررسی‌شده هم از قبل آن را دارد، پس علت خرابی حساب نهان هنوز نامعلوم است. کامنت حجیم و نبود import را درمان قطعی 1101 نمی‌نامیم. جفت Mesh مستقل، مدیر D1 و نود بدون دیتابیس، سهمیه مشترک و تست native واقعی با مقصد echo محلی دارد؛ این شواهد جای لاگ/دیپلوی/اپراتور واقعی نیست.

@@ -6,9 +6,10 @@ import worker, { panelCreate, sha224, GIB } from '../worker.js';
 import { fixture } from './helpers.mjs';
 
 class Socket extends EventEmitter {
-  accept() {}
+  constructor(){super();this.binaryType='blob';}
+  accept(){assert.equal(this.binaryType,'arraybuffer','binaryType must be set BEFORE accept');}
   addEventListener(type, cb) { this.on(type, cb); }
-  send(data) { this.peer.emit('message', { data: data instanceof Uint8Array ? data.buffer.slice(data.byteOffset, data.byteOffset+data.byteLength) : data }); }
+  send(data) { const raw=data instanceof Uint8Array ? data.buffer.slice(data.byteOffset,data.byteOffset+data.byteLength) : data;this.peer.emit('message',{data:typeof raw==='string'||this.peer.binaryType==='arraybuffer'?raw:new Blob([raw])}); }
   close() { if(this.closed)return;this.closed=true;this.emit('close',{});this.peer.closed=true;this.peer.emit('close',{}); }
 }
 function cloudflareFakes(t) {
@@ -16,7 +17,7 @@ function cloudflareFakes(t) {
     constructor(body,init={}) {const upgrade=init.status===101;super(body,upgrade?{...init,status:200}:init);if(upgrade){Object.defineProperty(this,'status',{value:101});this.webSocket=init.webSocket;}}
   });
   const previous=globalThis.WebSocketPair;
-  globalThis.WebSocketPair=class {constructor(){const a=new Socket(),b=new Socket();a.peer=b;b.peer=a;this[0]=a;this[1]=b;}};
+  globalThis.WebSocketPair=class {constructor(){const a=new Socket(),b=new Socket();a.binaryType='arraybuffer';a.peer=b;b.peer=a;this[0]=a;this[1]=b;}};
   t.after(()=>{if(previous)globalThis.WebSocketPair=previous;else delete globalThis.WebSocketPair;delete globalThis.__testConnect;});
   const connections=[];
   globalThis.__testConnect=address=>{

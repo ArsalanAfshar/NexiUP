@@ -1,4 +1,7 @@
-# Verification record / گزارش راستی‌آزمایی
+# Historical 2.1.1 verification record / گزارش تاریخی ۲٫۱٫۱
+
+> **Historical artifact, not the current file hash.** The current release is Mesh 3.0.0 plus preserved legacy 2.1.2. See [MESH_VERIFICATION.md](MESH_VERIFICATION.md) for current results, raw/bundled native WS/TCP tests, the Blob compatibility finding and hashes.
+> **این گزارش تاریخی است.** نسخهٔ فعلی Mesh ۳٫۰٫۰ و جزء قدیمی ۲٫۱٫۲ است؛ hash/آزمون فعلی در گزارش جدید آمده است.
 
 Version **2.1.1**. Date: **2026-10-21 Asia/Tehran**. Repository: `ArsalanAfshar/NexiUP`. Working branch: `arena/4a2b629b-nexiup`.
 

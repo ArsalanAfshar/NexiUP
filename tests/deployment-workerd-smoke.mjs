@@ -10,7 +10,7 @@ const { Miniflare, convertV4MiniflareOptions } = await import(process.env.MINIFL
 const secret=()=>randomBytes(24).toString('hex');
 const bindings={ROLE:'all',MASTER_KEY:secret(),SETUP_KEY:secret(),WEB_ADMIN_KEY:secret(),CALLBACK_SECRET:secret(),WEBHOOK_SECRET:secret(),ADMIN_IDS:'901',BOT_TOKEN:'12345:synthetic_token_only'};
 const origin='https://deployment.example.test';
-const expected=JSON.parse(await readFile(new URL('../package.json',import.meta.url),'utf8')).version;
+const expected=(await readFile(new URL('../worker.js',import.meta.url),'utf8')).match(/const VERSION = '([^']+)'/)[1]; // Legacy artifact, independent of the Mesh release version.
 const sources=process.argv.slice(2).length?process.argv.slice(2).map(p=>resolve(p)):[fileURLToPath(new URL('../worker.js',import.meta.url))];
 const options=scriptPath=>({name:'deployment-check',modules:true,scriptPath,compatibilityDate:'2026-10-20',compatibilityFlags:['global_fetch_strictly_public'],bindings,
   outboundService:()=>{throw new Error('Deployment preflight must not contact external services');}});

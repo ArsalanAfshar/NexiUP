@@ -1,0 +1,17 @@
+# Give EACH deployment a distinct Worker name and NODE_ID.
+name = "nexiup-node"
+main = "node-worker.js"
+compatibility_date = "2026-10-20"
+compatibility_flags = ["global_fetch_strictly_public"]
+workers_dev = true
+
+[vars]
+NODE_ID = ""
+MANAGER_URL = ""
+NEXIUP_DIAGNOSTICS = "false"
+# Fill the two values above; do not deploy an example domain or identity.
+# Store NODE_KEY as a 32–256-character random Worker Secret.
+# No D1, KV, cron, master key or Nahan installation belongs on this node.
+
+[observability]
+enabled = false

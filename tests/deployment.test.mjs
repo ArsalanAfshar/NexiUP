@@ -153,6 +153,6 @@ test('the last-resort boundary never rethrows even if a trusted error is corrupt
   const res=requestFailure(failure,req('/setup'),config(),undefined);assert.equal(res.status,500);assert.deepEqual(await res.json(),{error:'internal_error'});
 });
 test('setup diagnostics UI is self-contained, syntactically valid and readiness-driven',async()=>{
-  const response=setupPage(),markup=await response.text();assert.match(markup,/id="diagnostics"/);assert.match(markup,/Check deployment/);assert.match(markup,/2\.1\.1/);assert.match(markup,/if\(d\.ready\)return/);
+  const response=setupPage(),markup=await response.text();assert.match(markup,/id="diagnostics"/);assert.match(markup,/Check deployment/);assert.match(markup,/2\.1\.2/);assert.match(markup,/if\(d\.ready\)return/);
   const script=markup.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1];assert.doesNotThrow(()=>new Script(script));assert.ok(!script.includes('localStorage'));assert.ok(!script.includes('sessionStorage'));
 });

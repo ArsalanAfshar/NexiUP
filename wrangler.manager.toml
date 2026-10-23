@@ -1,0 +1,23 @@
+name = "nexiup-manager"
+main = "manager-worker.js"
+compatibility_date = "2026-10-20"
+compatibility_flags = ["global_fetch_strictly_public"]
+workers_dev = true
+
+[vars]
+NEXIUP_DIAGNOSTICS = "false"
+# OWNER_KEY and one distinct NODE_KEY_<NAME> per node are Worker Secrets.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nexiup-manager"
+# Replace before deployment. Only the manager needs D1.
+database_id = "REPLACE_WITH_YOUR_MANAGER_D1_DATABASE_ID"
+
+# Optional bounded housekeeping, not required for live quota enforcement.
+[triggers]
+crons = ["17 * * * *"]
+
+# Full request URLs can contain subscription bearer tokens.
+[observability]
+enabled = false

@@ -1,5 +1,5 @@
 /*!
- * NexiUP 2.1.1 — Telegram sales hub, web control panel and compatible node.
+ * NexiUP 2.1.2 — Telegram sales hub, web control panel and compatible node.
  * Copyright (c) 2026 NexiUP Contributors. MIT; see LICENSE and THIRD_PARTY.md.
  * One ES module; paste directly into Cloudflare Workers. No runtime npm dependencies.
  * Nahan source is NOT vendored: its inspected license grant was incomplete.
@@ -8,7 +8,7 @@
  */
 import { connect } from 'cloudflare:sockets';
 
-const VERSION = '2.1.1';
+const VERSION = '2.1.2';
 const knownFaults = new WeakSet();
 
 /** @typedef {{ label: string, action?: string, id?: string | number, url?: string }} MenuButton */
@@ -860,7 +860,10 @@ async function tunnel(r,request,panel) {
   const users=await tunnelUsers(r);
   if(liveWebSockets>=64)fail('isolate_busy',503);
   liveWebSockets++;
-  const pair=new WebSocketPair(),client=pair[0],ws=pair[1];ws.accept();
+  const pair=new WebSocketPair(),client=pair[0],ws=pair[1];
+  // Modern compatibility dates deliver Blob by default. Protocol parsers below
+  // consume bytes, so do not rely on the old implicit ArrayBuffer default.
+  ws.binaryType='arraybuffer';ws.accept();
   let header=new Uint8Array(),auth=null,counted=false,socket=null,writer=null,queue=Promise.resolve(),queued=0,closed=false,responsePrefix=null,dnsBuffer=new Uint8Array(),dnsCount=0,periodic,lifetime,handshakeTimer;
   const close=()=>{
     if(closed)return;closed=true;liveWebSockets=Math.max(0,liveWebSockets-1);clearInterval(periodic);clearTimeout(lifetime);clearTimeout(handshakeTimer);

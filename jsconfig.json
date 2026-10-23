@@ -11,6 +11,6 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["worker.js"],
+  "include": ["worker.js", "manager-worker.js", "node-worker.js"],
   "exclude": ["node_modules", ".work", ".wrangler"]
 }
